@@ -1,0 +1,105 @@
+# Third-party runtime components ClojureCraft downloads on first start.
+#
+# Every artifact is pinned by URL, size, and SHA-256. The installer refuses anything that does not
+# match, so changing a version here is a deliberate application release change.
+
+schema_version = 1
+
+[llama_cpp]
+release = "b12138"
+commit = "f7b41cca4fecc8164c7ea45bfb55dfff7633842f"
+homepage = "https://github.com/ggml-org/llama.cpp"
+license = "MIT"
+# Path of the server binary inside the extracted archive.
+server_path = "llama-b12138/llama-server"
+
+[[llama_cpp.assets]]
+platform = "macos-aarch64"
+backend = "metal"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-macos-arm64.tar.gz"
+size = 16670361
+sha256 = "ef898f71f6f5d773565b84670eb0e6b9acf24a64d4c045e2e99fa24a9c9f7e8c"
+
+[[llama_cpp.assets]]
+platform = "macos-aarch64"
+backend = "cpu"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-macos-arm64.tar.gz"
+size = 16670361
+sha256 = "ef898f71f6f5d773565b84670eb0e6b9acf24a64d4c045e2e99fa24a9c9f7e8c"
+
+[[llama_cpp.assets]]
+platform = "linux-x86_64"
+backend = "cpu"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-ubuntu-x64.tar.gz"
+size = 23077553
+sha256 = "25509d3d9721926394361a78f8f242ac5213a5ba46b13c96a704bc77358f5760"
+
+[[llama_cpp.assets]]
+platform = "linux-x86_64"
+backend = "vulkan"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-ubuntu-vulkan-x64.tar.gz"
+size = 35887578
+sha256 = "ea50605733977eb6fdce6ce3510012d2d07bf7af76550190703e6e204162eb10"
+
+# The CUDA build links against the CUDA runtime; the matching "cudart" archive supplies it so
+# users only need the NVIDIA driver. Its libraries must sit next to libggml-cuda.so, whose
+# RUNPATH is $ORIGIN.
+[[llama_cpp.assets]]
+platform = "linux-x86_64"
+backend = "cuda"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-ubuntu-cuda-13.4-x64.tar.gz"
+size = 169879754
+sha256 = "435a1812c0802dad722cb14b1f9b10d4dc4e6c45d1d8e5116a9c2818e01bdc0b"
+extra = [
+  { url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/cudart-llama-b12138-bin-ubuntu-cuda-13.4-x64.tar.gz", size = 440232650, sha256 = "4a98772d1aebbb1ba060f139fd0a584214c8a14b733af937b98e3db023e22747", extract_to = "llama-b12138", strip_components = 1 },
+]
+
+[[llama_cpp.assets]]
+platform = "linux-x86_64"
+backend = "rocm"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b12138/llama-b12138-bin-ubuntu-rocm-10.0-x64.tar.gz"
+size = 255632397
+sha256 = "6214dade3d22077d296221a147680d09cc191479be32bb4d788517646b5ad17b"
+
+[jre]
+vendor = "Eclipse Temurin"
+version = "25.0.5+8"
+homepage = "https://adoptium.net"
+license = "GPL-2.0-with-classpath-exception"
+
+[[jre.assets]]
+platform = "linux-x86_64"
+url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.5_8.tar.gz"
+size = 61736206
+sha256 = "6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6"
+java_path = "jdk-25.0.5+8-jre/bin/java"
+
+[[jre.assets]]
+platform = "macos-aarch64"
+url = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_aarch64_mac_hotspot_25.0.5_8.tar.gz"
+size = 56298727
+sha256 = "72ebd76b502c849e88dea39afae51baf5f82f2b5b1b6389c28ea707b20451bce"
+java_path = "jdk-25.0.5+8-jre/Contents/Home/bin/java"
+
+[clojure]
+version = "1.12.6"
+homepage = "https://clojure.org"
+license = "EPL-1.0"
+
+[[clojure.jars]]
+name = "clojure-1.12.6.jar"
+url = "https://repo1.maven.org/maven2/org/clojure/clojure/1.12.6/clojure-1.12.6.jar"
+size = 4229040
+sha256 = "21b578db389a8e74b286ce79c4a7f86ec641e26d88b12f18d69030916b0e18ca"
+
+[[clojure.jars]]
+name = "spec.alpha-0.5.238.jar"
+url = "https://repo1.maven.org/maven2/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.jar"
+size = 636643
+sha256 = "94cd99b6ea639641f37af4860a643b6ed399ee5a8be5d717cff0b663c8d75077"
+
+[[clojure.jars]]
+name = "core.specs.alpha-0.4.74.jar"
+url = "https://repo1.maven.org/maven2/org/clojure/core.specs.alpha/0.4.74/core.specs.alpha-0.4.74.jar"
+size = 4306
+sha256 = "eb73ac08cf49ba840c88ba67beef11336ca554333d9408808d78946e0feb9ddb"

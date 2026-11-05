@@ -1,0 +1,262 @@
+//! Installation and lookup of the concrete runtime components.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use clojurecraft_hardware::Backend;
+
+use crate::download::{Cancel, DownloadError, Progress, download_verified};
+use crate::install::{ComponentDir, InstallError, Installed, extract_tar_gz, extract_tar_gz_stripped};
+use crate::manifest::{Artifact, Manifest};
+use crate::paths::DataDirs;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentError {
+    #[error("no pinned {component} build for {platform}{backend}")]
+    Unavailable {
+        component: &'static str,
+        platform: String,
+        backend: String,
+    },
+    #[error(transparent)]
+    Download(#[from] DownloadError),
+    #[error(transparent)]
+    Install(#[from] InstallError),
+}
+
+pub const LLAMA_CPP: &str = "llama.cpp";
+pub const JRE: &str = "jre";
+pub const CLOJURE: &str = "clojure";
+
+fn component(dirs: &DataDirs, name: &str) -> ComponentDir {
+    ComponentDir::new(dirs.runtimes().join(name))
+}
+
+/// File name for a downloaded artifact: the last URL segment, prefixed by its hash so two
+/// releases with the same file name never share a download.
+fn download_path(dirs: &DataDirs, a: &Artifact) -> PathBuf {
+    let name = a.url.rsplit('/').next().unwrap_or("artifact");
+    dirs.downloads().join(format!("{}-{name}", &a.sha256[..12]))
+}
+
+fn fetch_all(
+    dirs: &DataDirs,
+    artifacts: &[&Artifact],
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(&str, Progress),
+) -> Result<Vec<PathBuf>, ComponentError> {
+    let mut paths = Vec::new();
+    for a in artifacts {
+        let dest = download_path(dirs, a);
+        let label = a.url.rsplit('/').next().unwrap_or_default().to_owned();
+        download_verified(a, &dest, cancel, |p| progress(&label, p))?;
+        paths.push(dest);
+    }
+    Ok(paths)
+}
+
+/// Runs `program args` and requires success; returns combined output for diagnostics.
+fn smoke(program: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(program)
+        .args(args)
+        .env_clear()
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(text)
+    } else {
+        Err(format!(
+            "{} exited with {}: {text}",
+            program.display(),
+            out.status
+        ))
+    }
+}
+
+pub fn llama_version_id(manifest: &Manifest, backend: Backend) -> String {
+    format!(
+        "{}-{}",
+        manifest.llama_cpp.release,
+        backend.label().to_lowercase().replace('/', "-")
+    )
+}
+
+/// Downloads, verifies, smoke-tests, and activates the pinned llama.cpp build for `backend`.
+pub fn install_llama(
+    manifest: &Manifest,
+    dirs: &DataDirs,
+    platform: &str,
+    backend: Backend,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(&str, Progress),
+) -> Result<Installed, ComponentError> {
+    let asset = manifest
+        .llama_asset(platform, backend)
+        .ok_or_else(|| ComponentError::Unavailable {
+            component: LLAMA_CPP,
+            platform: platform.to_owned(),
+            backend: format!(" with {}", backend.label()),
+        })?;
+    let artifacts: Vec<&Artifact> = std::iter::once(&asset.artifact)
+        .chain(asset.extra.iter().map(|e| &e.artifact))
+        .collect();
+    let archives = fetch_all(dirs, &artifacts, cancel, progress)?;
+    let server = manifest.llama_cpp.server_path.clone();
+    let installed = component(dirs, LLAMA_CPP).install_with(
+        &llama_version_id(manifest, backend),
+        |staging| {
+            extract_tar_gz(&archives[0], staging)?;
+            for (extra, archive) in asset.extra.iter().zip(&archives[1..]) {
+                extract_tar_gz_stripped(archive, &staging.join(&extra.extract_to), extra.strip_components)?;
+            }
+            Ok(())
+        },
+        |dir| {
+            let server = dir.join(&server);
+            smoke(&server, &["--version"])?;
+            if backend.uses_gpu() {
+                let devices = smoke(&server, &["--list-devices"])?;
+                if parse_device_list(&devices).is_empty() {
+                    return Err(format!(
+                        "the {} build found no usable device:\n{devices}",
+                        backend.label()
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(installed)
+}
+
+/// Device lines from `llama-server --list-devices` output, e.g. `CUDA0: NVIDIA ... (8192 MiB, ...)`.
+pub fn parse_device_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .skip_while(|l| !l.starts_with("Available devices"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "(none)" && l.contains(':'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The active llama.cpp server binary, if installed.
+pub fn llama_server(manifest: &Manifest, dirs: &DataDirs) -> Option<(Installed, PathBuf)> {
+    let active = component(dirs, LLAMA_CPP).active()?;
+    let server = active.dir.join(&manifest.llama_cpp.server_path);
+    server.is_file().then_some((active, server))
+}
+
+pub fn install_jre(
+    manifest: &Manifest,
+    dirs: &DataDirs,
+    platform: &str,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(&str, Progress),
+) -> Result<Installed, ComponentError> {
+    let asset = manifest
+        .jre_asset(platform)
+        .ok_or_else(|| ComponentError::Unavailable {
+            component: JRE,
+            platform: platform.to_owned(),
+            backend: String::new(),
+        })?;
+    let version = manifest.jre.version.replace('+', "_");
+    if let Some(active) = component(dirs, JRE).active().filter(|a| a.version == version) {
+        return Ok(active);
+    }
+    let archives = fetch_all(dirs, &[&asset.artifact], cancel, progress)?;
+    let java = asset.java_path.clone();
+    Ok(component(dirs, JRE).install(&version, &archives, |dir| {
+        smoke(&dir.join(&java), &["-version"]).map(|_| ())
+    })?)
+}
+
+/// The active Java runtime: `(java executable, java home)`.
+pub fn java(manifest: &Manifest, dirs: &DataDirs, platform: &str) -> Option<(PathBuf, PathBuf)> {
+    let active = component(dirs, JRE).active()?;
+    let rel = &manifest.jre_asset(platform)?.java_path;
+    let java = active.dir.join(rel);
+    // java_path is <home>/bin/java.
+    let home = java.parent()?.parent()?.to_owned();
+    java.is_file().then_some((java, home))
+}
+
+pub fn install_clojure(
+    manifest: &Manifest,
+    dirs: &DataDirs,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(&str, Progress),
+) -> Result<Installed, ComponentError> {
+    if let Some(active) = component(dirs, CLOJURE)
+        .active()
+        .filter(|a| a.version == manifest.clojure.version)
+    {
+        return Ok(active);
+    }
+    let artifacts: Vec<&Artifact> = manifest.clojure.jars.iter().map(|j| &j.artifact).collect();
+    let files = fetch_all(dirs, &artifacts, cancel, progress)?;
+    let names: Vec<String> = manifest.clojure.jars.iter().map(|j| j.name.clone()).collect();
+    let installed = component(dirs, CLOJURE).install_with(
+        &manifest.clojure.version,
+        |staging| {
+            for (src, name) in files.iter().zip(&names) {
+                let dest = staging.join(name);
+                std::fs::copy(src, &dest).map_err(|source| InstallError::Io { path: dest, source })?;
+            }
+            Ok(())
+        },
+        |staging| {
+            names
+                .iter()
+                .all(|n| staging.join(n).is_file())
+                .then_some(())
+                .ok_or_else(|| "a Clojure jar is missing".to_owned())
+        },
+    )?;
+    Ok(installed)
+}
+
+/// The installed Clojure jars, in classpath order.
+pub fn clojure_jars(manifest: &Manifest, dirs: &DataDirs) -> Option<Vec<PathBuf>> {
+    let active = component(dirs, CLOJURE).active()?;
+    let jars: Vec<PathBuf> = manifest
+        .clojure
+        .jars
+        .iter()
+        .map(|j| active.dir.join(&j.name))
+        .collect();
+    jars.iter().all(|j| j.is_file()).then_some(jars)
+}
+
+/// The llama.cpp server of a specific installed backend build, active or not.
+pub fn llama_server_for(manifest: &Manifest, dirs: &DataDirs, backend: Backend) -> Option<PathBuf> {
+    let dir = dirs
+        .runtimes()
+        .join(LLAMA_CPP)
+        .join(llama_version_id(manifest, backend));
+    let server = dir.join(&manifest.llama_cpp.server_path);
+    server.is_file().then_some(server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_device_list;
+
+    #[test]
+    fn device_list_parsing() {
+        let some = "ggml_cuda_init: found 1 CUDA devices\nAvailable devices:\n  CUDA0: NVIDIA GeForce RTX 3070 (8192 MiB, 7000 MiB free)\n";
+        assert_eq!(
+            parse_device_list(some),
+            vec!["CUDA0: NVIDIA GeForce RTX 3070 (8192 MiB, 7000 MiB free)"]
+        );
+        assert!(parse_device_list("Available devices:\n  (none)\n").is_empty());
+        assert!(parse_device_list("load_backend: failed\n").is_empty());
+    }
+}

@@ -1,0 +1,5 @@
+/target
+# Local runtime downloads, models, and indexes never live in the repository.
+/.clojurecraft-dev/
+*.gguf
+*.part

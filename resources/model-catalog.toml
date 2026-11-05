@@ -1,0 +1,170 @@
+# Curated coding models offered during setup.
+#
+# Every file is pinned to a repository revision, size, and SHA-256 (the Hugging Face LFS object id).
+# Memory figures derived from this file are estimates:
+#   kv_bytes_per_token = attention_layers * kv_heads * head_dim * 2 (K and V) * 2 (f16 cache)
+# taken from each model's published configuration.
+#
+# status:
+#   "smoke-tested" - loaded and generated with the pinned llama.cpp release on a reference machine
+#   "unverified"   - metadata checked only; must be smoke-tested before it is offered to users
+
+schema_version = 1
+default_context = 16384
+
+[[models]]
+id = "qwen2.5-coder-1.5b-instruct"
+name = "Qwen2.5-Coder 1.5B Instruct"
+family = "Qwen2.5-Coder"
+repo = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+revision = "f86cb2c1fa58255f8052cc32aeede1b7482d4361"
+license = "Apache-2.0"
+architecture = "qwen2"
+parameters_b = 1.5
+active_parameters_b = 1.5
+max_context = 32768
+kv_bytes_per_token = 28672
+quality_rank = 10
+status = "smoke-tested"
+summary = "Smallest option; runs on any machine, including CPU-only. Useful for simple transformations."
+
+[[models.quants]]
+name = "Q4_K_M"
+files = [{ path = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", size = 1117320768, sha256 = "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046" }]
+
+[[models.quants]]
+name = "Q8_0"
+files = [{ path = "qwen2.5-coder-1.5b-instruct-q8_0.gguf", size = 1894532160, sha256 = "507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47" }]
+
+[[models]]
+id = "qwen2.5-coder-7b-instruct"
+name = "Qwen2.5-Coder 7B Instruct"
+family = "Qwen2.5-Coder"
+repo = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+revision = "13fb94bfda8c8cf22497dc57b78f391a9acb426a"
+license = "Apache-2.0"
+architecture = "qwen2"
+parameters_b = 7.6
+active_parameters_b = 7.6
+max_context = 32768
+kv_bytes_per_token = 57344
+quality_rank = 30
+status = "smoke-tested"
+summary = "Good default for 8 GB GPUs."
+
+[[models.quants]]
+name = "Q4_K_M"
+files = [{ path = "qwen2.5-coder-7b-instruct-q4_k_m.gguf", size = 4683073536, sha256 = "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c" }]
+
+[[models.quants]]
+name = "Q6_K"
+files = [{ path = "qwen2.5-coder-7b-instruct-q6_k.gguf", size = 6254198784, sha256 = "46291ddea1bfb608fe63d9a1907eea6918bda87a7626593edc4bf97c5fd73f9d" }]
+
+[[models.quants]]
+name = "Q8_0"
+files = [{ path = "qwen2.5-coder-7b-instruct-q8_0.gguf", size = 8098525184, sha256 = "b36a4e1c3ddf2ba6fd5501b926128e5fc6430881caaff07e9629bd18f06f685f" }]
+
+[[models]]
+id = "qwen2.5-coder-14b-instruct"
+name = "Qwen2.5-Coder 14B Instruct"
+family = "Qwen2.5-Coder"
+repo = "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF"
+revision = "d0a692ef765eefbf2fabb130b3cb2e8917e3d225"
+license = "Apache-2.0"
+architecture = "qwen2"
+parameters_b = 14.7
+active_parameters_b = 14.7
+max_context = 32768
+kv_bytes_per_token = 196608
+quality_rank = 40
+status = "unverified"
+summary = "Stronger dense model for 12-16 GB GPUs."
+
+[[models.quants]]
+name = "Q4_K_M"
+files = [{ path = "qwen2.5-coder-14b-instruct-q4_k_m.gguf", size = 8988110272, sha256 = "c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940" }]
+
+[[models.quants]]
+name = "Q6_K"
+files = [{ path = "qwen2.5-coder-14b-instruct-q6_k.gguf", size = 12124683712, sha256 = "302a079369ad8b66c8e8ec1bfa62d109c64d8015e9bfd52d9c6cf4c6c9f36b5f" }]
+
+[[models]]
+id = "devstral-small-2-24b-instruct"
+name = "Devstral Small 2 24B Instruct"
+family = "Devstral"
+repo = "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF"
+revision = "6e458b8add42681bfd023de5eab93637694aaf82"
+license = "Apache-2.0"
+license_note = "License of the upstream mistralai/Devstral-Small-2-24B-Instruct-2512 weights; confirm the GGUF repository terms before release."
+architecture = "mistral3"
+parameters_b = 24.0
+active_parameters_b = 24.0
+max_context = 262144
+kv_bytes_per_token = 163840
+quality_rank = 55
+status = "unverified"
+summary = "Dense 24B coding model for 16-24 GB GPUs and 32 GB+ Apple Silicon."
+
+[[models.quants]]
+name = "Q4_K_M"
+files = [{ path = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf", size = 14334446752, sha256 = "d14ba9edee1bb4c4996a726deb81e49ae81800a3216f0774634238c380aee496" }]
+
+[[models.quants]]
+name = "Q6_K"
+files = [{ path = "Devstral-Small-2-24B-Instruct-2512-Q6_K.gguf", size = 19346476192, sha256 = "b04b3e19730d7a1e19530f40b947b69c028b090cb7c58c1515cf1fc2ece5f821" }]
+
+[[models]]
+id = "qwen3-coder-30b-a3b-instruct"
+name = "Qwen3-Coder 30B-A3B Instruct"
+family = "Qwen3-Coder"
+repo = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+revision = "b17cb02dd882d5b6ab62fc777ad2995f19668350"
+license = "Apache-2.0"
+architecture = "qwen3moe"
+parameters_b = 30.5
+active_parameters_b = 3.3
+max_context = 262144
+kv_bytes_per_token = 98304
+quality_rank = 60
+status = "unverified"
+summary = "Mixture-of-experts: 30B quality with 3B active parameters, so it stays fast with partial GPU offload or on CPU."
+
+[[models.quants]]
+name = "Q3_K_M"
+files = [{ path = "Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf", size = 14711850144, sha256 = "30c83da425db2324444b6a6cecaf4c410038a2ec73a78de2436879dc0316a371" }]
+
+[[models.quants]]
+name = "IQ4_XS"
+files = [{ path = "Qwen3-Coder-30B-A3B-Instruct-IQ4_XS.gguf", size = 16378076320, sha256 = "26cd4fef3ada9de84c6c59c4b93f9bc5df4d69a71e18cfe8a17369c2f8374ce7" }]
+
+[[models.quants]]
+name = "Q4_K_M"
+repo = "ggml-org/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+revision = "0ca51122012fe4a20dc82988ee58780b008ce4e3"
+files = [{ path = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", size = 17988419552, sha256 = "f6050b4da22869aa3fb9d94bb3314e9fc5a027d4741c1f97761c387d6b2b2335" }]
+
+[[models]]
+id = "qwen3-coder-next"
+name = "Qwen3-Coder-Next 80B-A3B"
+family = "Qwen3-Coder"
+repo = "Qwen/Qwen3-Coder-Next-GGUF"
+revision = "b82fb7382639d97b38fa7672e526c760c2fb358e"
+license = "Apache-2.0"
+architecture = "qwen3next"
+parameters_b = 80.0
+active_parameters_b = 3.0
+max_context = 262144
+# Hybrid attention: only one layer in four keeps a KV cache; recurrent state is in the overhead.
+kv_bytes_per_token = 24576
+quality_rank = 80
+status = "unverified"
+summary = "Largest option, for 64 GB+ unified memory or large GPU + RAM setups. Split into four files."
+
+[[models.quants]]
+name = "Q4_K_M"
+files = [
+  { path = "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf", size = 15524827040, sha256 = "6bcfc9f9c37901eeb92172e2ab871224dab36a453d263bcb2547f737409534da" },
+  { path = "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00002-of-00004.gguf", size = 14872168352, sha256 = "817def0691ee9d08bf3dc4444be7aed29c9e52091e8fa9d97901ce7e7f6f01d3" },
+  { path = "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00003-of-00004.gguf", size = 14503294496, sha256 = "23aa634d47dca9b4ca3ea249384e6f01951b24c83cdc076f37f6f43d6c99883f" },
+  { path = "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00004-of-00004.gguf", size = 3510702144, sha256 = "249c768cc5f130dc731567d6edcbdacc48e14dec9e02c5dbe2b2185d2c5bdb2b" },
+]

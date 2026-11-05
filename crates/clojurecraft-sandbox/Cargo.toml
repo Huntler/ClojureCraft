@@ -1,0 +1,29 @@
+[package]
+name = "clojurecraft-sandbox"
+description = "Runs untrusted programs in a restricted child process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "clojurecraft-sandbox"
+path = "src/bin/clojurecraft-sandbox.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustix = { version = "1", features = ["process", "thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
