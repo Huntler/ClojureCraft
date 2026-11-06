@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clojurecraft-credentials.workspace = true
 clojurecraft-hardware.workspace = true
+clojurecraft-inference.workspace = true
 clojurecraft-runtime.workspace = true
 clojurecraft-store.workspace = true
 clojurecraft-domain.workspace = true

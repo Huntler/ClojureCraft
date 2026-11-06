@@ -49,7 +49,9 @@ Notable obligations:
   RustCrypto `aes`, `cbc`, `hkdf` crates), `apple-native-keyring-store` and `security-framework`
   (macOS only). All MIT OR Apache-2.0.
 - `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) for free-space queries
-  (`statvfs`) without unsafe code.
+  (`statvfs`) and for signalling the llama.cpp server process, without unsafe code.
+- The local inference client (`clojurecraft-inference`) has its own small HTTP/1.1
+  implementation over Unix sockets; it adds no HTTP or TLS dependency.
 
 A machine-checked inventory (`cargo deny check licenses` with an allowlist) belongs in CI.
 

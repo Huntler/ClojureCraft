@@ -22,6 +22,7 @@ use clojurecraft_runtime::usage::{DiskUsage, clear_cached_archives, disk_usage};
 use clojurecraft_runtime::{Cancel, DataDirs, Manifest, Progress, platform_key};
 
 use crate::jobs::Event;
+use crate::model::ModelRuntime;
 
 /// Results of background inference work.
 pub enum InferenceEvent {
@@ -64,6 +65,8 @@ pub enum InferenceEvent {
     },
     TokenSaved(Result<(), String>),
     TokenRemoved(Result<(), String>),
+    /// Lifecycle and generation events of the inference service.
+    Service(Box<clojurecraft_inference::ServiceEvent>),
 }
 
 /// What is installed on disk, gathered off the UI thread.
@@ -168,6 +171,8 @@ pub struct InferenceState {
     pub token_state: TokenState,
     pub token_problem: Option<String>,
     pub notices: Vec<String>,
+    /// The loaded model and requests to it.
+    pub model: ModelRuntime,
 }
 
 impl InferenceState {
@@ -211,7 +216,9 @@ impl InferenceState {
             token_state: TokenState::Loading,
             token_problem: None,
             notices: Vec::new(),
+            model: ModelRuntime::default(),
         };
+        state.model = ModelRuntime::start(state.emit());
         state.detect();
         state.refresh();
         state.load_token();
@@ -568,6 +575,7 @@ impl InferenceState {
 
     pub fn remove_model(&mut self, key: &str) {
         let Some(dirs) = self.dirs.clone() else { return };
+        self.release_model(key);
         let store = ModelStore::new(dirs.models(), dirs.downloads());
         match store.remove(key) {
             Ok(_) => {
@@ -773,6 +781,7 @@ impl InferenceState {
     pub fn handle(&mut self, event: InferenceEvent) {
         match event {
             InferenceEvent::Detected(report) => self.detected = Some(*report),
+            InferenceEvent::Service(event) => self.handle_service(*event),
             InferenceEvent::Refreshed(snapshot) => {
                 self.snapshot = Some(*snapshot);
                 // A single installed model is selected automatically.
@@ -922,12 +931,12 @@ impl InferenceState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use clojurecraft_hardware::{CpuInfo, DetectionSource, GIB, GpuDevice, GpuVendor};
 
     use super::*;
 
-    fn state() -> InferenceState {
+    pub(crate) fn state() -> InferenceState {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut s = InferenceState {
             tx,
@@ -952,6 +961,7 @@ mod tests {
             token_state: TokenState::NotSaved,
             token_problem: None,
             notices: Vec::new(),
+            model: ModelRuntime::default(),
         };
         s.detected = Some(HardwareReport {
             os: "linux".into(),

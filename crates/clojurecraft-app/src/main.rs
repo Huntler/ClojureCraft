@@ -9,6 +9,8 @@ mod inference;
 mod jobs;
 mod keys;
 mod library;
+mod model;
+mod model_view;
 mod models_view;
 mod session;
 mod setup_view;

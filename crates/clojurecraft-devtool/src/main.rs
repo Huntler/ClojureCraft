@@ -21,7 +21,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use clojurecraft_clojure::{ClojureRuntime, EvalRequest, Limits};
 use clojurecraft_hardware::{Backend, default_budget};
-use clojurecraft_inference::{Cancel as InfCancel, LlamaServer, Message, ServerConfig, list_devices};
+use clojurecraft_inference::engine::Engine;
+use clojurecraft_inference::http::Control;
+use clojurecraft_inference::protocol::ChatRequest;
+use clojurecraft_inference::{
+    Cancel as InfCancel, LlamaEngine, LoadSpec, Message, StreamEvent, list_devices,
+};
 use clojurecraft_runtime::catalog::{Catalog, format_gib};
 use clojurecraft_runtime::{Cancel, DataDirs, Manifest, components, platform_key};
 
@@ -244,22 +249,36 @@ fn smoke_file(
         facts.context_length,
         facts.kv_bytes_per_token()
     );
-    let model = model.to_owned();
     let gpu_layers = if backend == Backend::Cpu { Some(0) } else { layers };
     println!(
         "starting {} with {label}, context {context}, gpu layers {gpu_layers:?}",
         backend.label()
     );
     let gpu_base = gpu_used_mib();
-    let mut srv = LlamaServer::start(&ServerConfig {
+    let spec = LoadSpec {
         server,
-        model,
+        model: model.to_owned(),
+        label: label.to_owned(),
+        backend: backend.label().to_owned(),
+        runtime: components::llama_version_id(&manifest, backend),
         context,
         gpu_layers,
-    })?;
-    let load = srv.wait_ready(Duration::from_secs(300), &InfCancel::default())?;
-    println!("  ready after {load:.1?} (pid {})", srv.pid());
-    println!("  unauthenticated request status: {}", srv.probe_without_key()?);
+        total_layers: facts.block_count,
+        model_max_context: facts.context_length,
+        threads: None,
+        load_timeout: Duration::from_secs(300),
+        memory: None,
+        skip_memory_check: true,
+        pid_file: None,
+    };
+    let mut session = LlamaEngine::default()
+        .load(&spec, &InfCancel::default(), &mut |p| println!("  {p:?}"))
+        .map_err(|(e, log)| anyhow!("{e}\n{log}"))?;
+    let info = session.info().clone();
+    println!(
+        "  ready after {:.1?} (pid {:?}, context {}, build {:?}, tool calls {})",
+        info.load_time, info.pid, info.context, info.build, info.supports_tools
+    );
 
     let gpu_peak = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -274,24 +293,47 @@ fn smoke_file(
             }
         })
     };
-    let messages = [Message::system(SYSTEM_PROMPT), Message::user(USER_PROMPT)];
+    let request = ChatRequest {
+        messages: vec![Message::system(SYSTEM_PROMPT), Message::user(USER_PROMPT)],
+        max_tokens: 600,
+        temperature: 0.2,
+        response_schema: None,
+        tools: vec![],
+        seed: None,
+    };
+    let control = || {
+        Control::new(
+            InfCancel::default(),
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(60)),
+        )
+    };
+    println!(
+        "  prompt tokens (model tokenizer): {}",
+        session.count_prompt(&request, &control())?
+    );
     println!("--- generation ---");
-    let completion = srv.chat(&messages, 600, 0.2, &InfCancel::default(), |t| {
-        print!("{t}");
-        let _ = std::io::stdout().flush();
+    let start = Instant::now();
+    let turn = session.chat(&request, &control(), &mut |e| {
+        if let StreamEvent::Content(t) = e {
+            print!("{t}");
+            let _ = std::io::stdout().flush();
+        }
     })?;
     println!("\n--- end ---");
     done.store(true, Ordering::SeqCst);
     let _ = sampler.join();
     println!(
-        "  tokens: prompt {:?}, completion {:?}; {:.1} tok/s (server-reported); wall {:.1?}",
-        completion.prompt_tokens,
-        completion.completion_tokens,
-        completion.tokens_per_second.unwrap_or(f64::NAN),
-        completion.elapsed
+        "  tokens: prompt {:?}, completion {:?}; {:.1} tok/s (server-reported); wall {:.1?}; finish {:?}",
+        turn.usage.prompt_tokens,
+        turn.usage.completion_tokens,
+        turn.usage.tokens_per_second.unwrap_or(f64::NAN),
+        start.elapsed(),
+        turn.finish
     );
-    let pid = srv.pid();
-    if let (Some(rss), Some(hwm)) = (proc_status_kib(pid, "VmRSS:"), proc_status_kib(pid, "VmHWM:")) {
+    if let Some(pid) = info.pid
+        && let (Some(rss), Some(hwm)) = (proc_status_kib(pid, "VmRSS:"), proc_status_kib(pid, "VmHWM:"))
+    {
         println!("  server RSS {} MiB, peak RSS {} MiB", rss / 1024, hwm / 1024);
     }
     if let Some(base) = gpu_base {
@@ -301,26 +343,31 @@ fn smoke_file(
             peak.saturating_sub(base)
         );
     }
-    run_generated(&completion.text);
+    run_generated(&turn.content);
 
     let cancel = InfCancel::default();
     let c2 = cancel.clone();
     let t = Instant::now();
-    let r = srv.chat(&messages, 600, 0.2, &cancel, move |_| c2.cancel());
+    let r = session.chat(&request, &Control::new(cancel, None, None), &mut move |_| {
+        c2.cancel()
+    });
     println!(
         "  cancellation: {:?} after {:.1?}",
         r.err().map(|e| e.to_string()),
         t.elapsed()
     );
-    let follow = srv.chat(
-        &[Message::user("Reply with the word ok.")],
-        8,
-        0.0,
-        &InfCancel::default(),
-        |_| {},
+    let follow = session.chat(
+        &ChatRequest {
+            messages: vec![Message::user("Reply with the word ok.")],
+            max_tokens: 8,
+            temperature: 0.0,
+            ..request.clone()
+        },
+        &control(),
+        &mut |_| {},
     )?;
-    println!("  server responsive after cancel: {:?}", follow.text.trim());
-    srv.stop();
+    println!("  server responsive after cancel: {:?}", follow.content.trim());
+    session.shutdown();
     Ok(())
 }
 

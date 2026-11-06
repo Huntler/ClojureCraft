@@ -22,6 +22,15 @@ Anything else is rejected. The list ships as `[compatibility] architectures` in
 `resources/model-catalog.toml`; catalog parsing fails if a catalog entry uses an architecture that
 is not listed.
 
+## Tool calls
+
+llama.cpp parses tool calls from the model's chat template. With b12138, Qwen2.5-Coder 7B and
+1.5B Instruct report template support for tools but write the call as ordinary text (a fenced
+`<tools>` block or bare JSON), so no tool call is recognised and the text arrives as the answer.
+Application features must therefore not depend on tool calling with the current smoke-tested
+models: retrieval is driven by the application, with structured output (JSON-schema constrained
+and validated) where the model has to choose. JSON-schema output works with both models.
+
 ## Mellum validation (2026-11-06)
 
 `JetBrains/Mellum2.1-12B-A2.5B-Thinking-GGUF` Q4_K_M (commit `4159d684`, 7.5 GiB, Apache-2.0),

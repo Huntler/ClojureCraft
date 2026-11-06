@@ -659,6 +659,7 @@ dependencies = [
  "clojurecraft-domain",
  "clojurecraft-edn",
  "clojurecraft-hardware",
+ "clojurecraft-inference",
  "clojurecraft-runtime",
  "clojurecraft-store",
  "eframe",
@@ -734,11 +735,12 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "ureq",
 ]
 
 [[package]]

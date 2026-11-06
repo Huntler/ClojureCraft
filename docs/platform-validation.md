@@ -81,6 +81,34 @@ about 0.53 s per evaluation including JVM start.
 The same boundary holds for ordinary programs (`/bin/sh`, `cat`, `yes`, `bash /dev/tcp`) in
 `crates/clojurecraft-sandbox/tests/linux_restrictions.rs`.
 
+### Local inference service — 2026-11-06
+
+`clojurecraft-devtool smoke-model qwen2.5-coder-7b-instruct Q4_K_M <backend> 8192`, which loads
+through the production engine (private Unix socket, per-session key). Prompt 119 tokens (counted
+with the model's tokenizer before sending, and equal to the server's count), temperature 0.2.
+Single observations.
+
+| Backend | Load | Generation | Server peak RSS | GPU memory delta (whole device) | Cancel latency | Generated code in sandbox |
+| --- | --- | --- | --- | --- | --- | --- |
+| CUDA | 6.2 s (cold file cache) | 78.7 tok/s | 4.7 GiB | 4.84 GiB | 13.5 ms | correct result |
+| Vulkan | 1.5 s | 77.8 tok/s | 4.6 GiB | 4.69 GiB | 13.8 ms | correct result |
+| CPU | — | 9.3 tok/s | 7.8 GiB | — | 108.6 ms | correct result |
+
+Peak RSS counts the memory-mapped model file. The CPU figure again exceeds the 8k-context estimate
+(about 5.5 GiB); see the earlier note on repacked CPU weights. Each run answered a follow-up request
+immediately after the cancellation.
+
+| Check | Result |
+| --- | --- |
+| Real out-of-memory load (7B, 131,072-token context, all layers on the 8 GiB RTX 3070) | Classified as "not enough GPU memory" with the line `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 7168.00 MiB on device 0: cudaMalloc failed: out of memory`; server exited and was cleaned up |
+| App: Load model from the implementation column | Loading → reading the model → Ready (1.3 s warm) with backend, context, load time, and tool support shown |
+| App: "Try the model" streaming | Text streams while the window stays responsive; Stop freezes the output and shows "Stopped."; "Ask again" replaced the running answer with no mixed output |
+| App: changing the context limit while loaded | "Settings changed since the model was loaded" with Reload |
+| App: closing the window with the model loaded | llama-server stopped; PID file and socket directory removed |
+| Server reachability | No TCP listener; socket directory `drwx------`; requests without or with a wrong key get HTTP 401; the key is in the server's environment, not its command line |
+| Killing llama-server with SIGKILL while the app runs (automatic restart) | not run here (killing the process was not permitted in this session); covered by automated tests with the mock engine and with a stand-in server process |
+| Tool calls with Qwen2.5-Coder 7B / 1.5B | The models write the call as text (a fenced `<tools>` block or bare JSON) instead of their template's tool-call markup, so llama.cpp returns plain content; see `docs/model-compatibility.md` |
+
 ## macOS
 
 Not yet run on hardware. The macOS-specific crates (`clojurecraft-hardware`,

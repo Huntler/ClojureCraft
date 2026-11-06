@@ -6,6 +6,8 @@ use egui::{RichText, Ui};
 
 use crate::inference::InferenceState;
 use crate::keys;
+use crate::model::RemedyAction;
+use crate::model_view;
 use crate::models_view::{self, ModelsPage};
 use crate::setup_view;
 use crate::theme;
@@ -168,6 +170,15 @@ pub fn settings(ui: &mut Ui, inference: &mut InferenceState, page: &mut ModelsPa
         }
         ui.add_space(6.0);
         models_view::generation(ui, inference);
+        section(ui, "Model");
+        if model_view::status(ui, inference, false) == RemedyAction::OpenSetup {
+            action = SettingsAction::OpenSetup;
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new("Try the model").strong());
+        if model_view::trial(ui, inference) == RemedyAction::OpenSetup {
+            action = SettingsAction::OpenSetup;
+        }
         section(ui, "Hardware and memory budget");
         setup_view::hardware(ui, inference);
         section(ui, "Inference backend");

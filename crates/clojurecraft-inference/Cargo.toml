@@ -1,20 +1,27 @@
 [package]
 name = "clojurecraft-inference"
-description = "Runs llama.cpp's server as a local child process and talks to it"
+description = "Local inference through a llama.cpp server child process: lifecycle, streaming, structured output, tools, and context accounting"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes a scripted in-memory engine for tests of code that drives the service.
+mock = []
+
 [dependencies]
 getrandom = "0.3"
 hex.workspace = true
+rustix = { version = "1", features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

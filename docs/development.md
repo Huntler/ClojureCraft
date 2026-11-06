@@ -47,5 +47,15 @@ Service, so it only runs when asked for:
 cargo test -p clojurecraft-credentials -- --ignored
 ```
 
+Code that drives the inference service can be tested without llama.cpp: the
+`clojurecraft-inference` crate's `mock` feature provides `mock::MockEngine`, a scripted engine
+(streamed pieces with pauses, tool calls, failures, hangs, and crashes). The crate's own tests also
+run its HTTP client and the llama.cpp engine against a scripted server on a Unix socket and a
+shell script standing in for `llama-server`.
+
+`smoke-model` and `smoke-file` load the model through the same engine the application uses
+(private Unix socket, per-session key) and report load time, prompt tokens counted with the
+model's tokenizer, generation speed, peak server RSS, GPU memory, and cancellation latency.
+
 Inference checks (`smoke-model`) are local and manual: they need real weights and, for GPU
 backends, a GPU. They are never part of automated CI.

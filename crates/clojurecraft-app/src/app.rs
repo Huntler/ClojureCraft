@@ -16,6 +16,8 @@ use crate::inference::InferenceState;
 use crate::jobs::{Event, Jobs};
 use crate::keys::{self, DUPLICATE, FIND, NEW_FUNCTION, RENAME, SAVE};
 use crate::library::{Command, Library, LibraryEvent};
+use crate::model::RemedyAction;
+use crate::model_view;
 use crate::models_view::ModelsPage;
 use crate::session::{self, OpenDocument};
 use crate::setup_view::{self, SetupAction, SetupPage};
@@ -798,6 +800,7 @@ impl eframe::App for ClojureCraftApp {
             .right();
         let right_max = (total - left - MIN_CENTER_WIDTH).clamp(300.0, 720.0);
         let mut open_setup = false;
+        let mut remedy = RemedyAction::None;
         let current = match self.view {
             View::Function(id) => self.docs.get(&id).map(|o| &o.doc),
             _ => None,
@@ -809,10 +812,26 @@ impl eframe::App for ClojureCraftApp {
             .frame(side)
             .show(ui, |ui| {
                 let missing = self.inference.missing();
+                if missing.is_empty() {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .stroke(theme::hairline())
+                        .corner_radius(theme::RADIUS)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            remedy = model_view::status(ui, &mut self.inference, true);
+                        });
+                }
                 if implementation::show(ui, &mut self.right_tab, current, &missing) {
                     open_setup = true;
                 }
             });
+        match remedy {
+            RemedyAction::OpenSetup => open_setup = true,
+            RemedyAction::OpenSettings => self.view = View::Settings,
+            RemedyAction::None => {}
+        }
         if open_setup {
             self.view = View::Setup;
         }
@@ -833,6 +852,8 @@ impl eframe::App for ClojureCraftApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Stops llama.cpp; it must not outlive the application.
+        self.inference.shutdown_model();
         if let Some(autosaver) = &self.autosaver
             && !autosaver.flush()
         {

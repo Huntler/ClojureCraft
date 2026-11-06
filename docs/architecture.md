@@ -14,7 +14,7 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-store` | SQLite library: drafts, immutable revisions, results, migrations, autosave |
 | `clojurecraft-hardware` | RAM, CPU feature, and GPU/VRAM detection; backend recommendation; default memory budget |
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates, GGUF header reading, Hugging Face resolution, model store, inference settings, disk usage |
-| `clojurecraft-inference` | `llama-server` child process lifecycle, loopback HTTP client, streaming, cancellation |
+| `clojurecraft-inference` | Replaceable inference interface; `llama-server` process on a private Unix socket; inference service (lifecycle, crash recovery, streaming, cancellation, timeouts); context policy; roles; structured output and tool validation |
 | `clojurecraft-sandbox` | OS-level restriction of untrusted processes (library + `clojurecraft-sandbox` helper binary) |
 | `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness) |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
@@ -59,14 +59,90 @@ Chosen over in-process bindings (`llama-cpp-2` and similar) because:
   grammar/JSON-schema constrained output, and tool-call parsing without reimplementation;
 - unloading a model to free memory is just stopping the process.
 
-Isolation of the server: bound to `127.0.0.1` on an ephemeral port, authenticated with a random
-256-bit per-session key passed through the environment (`LLAMA_API_KEY`, so it never appears in
-process listings), Web UI disabled. The pinned build also accepts a Unix-domain socket path for
-`--host`; switching to a socket in a private directory would remove even the loopback port and is
-the preferred hardening for the production client.
+Isolation of the server: it listens on a Unix-domain socket (`llama.sock`) inside a fresh
+directory with mode `0700` under `$XDG_RUNTIME_DIR` (or the temporary directory), so no TCP port is
+opened and other local users cannot connect; loopback TCP on an ephemeral port is used only if the
+socket path would exceed 100 bytes. Requests also need a random 256-bit per-session key passed
+through the environment (`LLAMA_API_KEY`, never on the command line). Environment variables
+llama.cpp reads as configuration (`LLAMA_*`, `HF_*`) are removed, so they cannot enable its
+built-in file tools or other features. Web UI and slot endpoints are disabled. The server's PID is
+recorded in `llama-server.pid` in the data directory; a server left behind by a crash of the
+application is stopped on the next load, but only if the recorded process is still that program.
 
 - Verified on Linux: CPU, Vulkan and CUDA builds with two models; see `docs/platform-validation.md`.
 - Unverified: Metal on macOS.
+
+### Inference service
+
+`clojurecraft-inference` separates the replaceable interface (`Engine` loads a model and returns a
+`Session`, which counts tokens and streams chat turns) from the production `LlamaEngine`. A
+scripted `MockEngine` (feature `mock`) implements the same interface for tests.
+
+**Server options.** One slot (`--parallel 1`), the configured context and GPU layers exactly
+(`--fit off`, so memory failures are reported rather than silently adjusted), no host prompt cache
+outside the budget (`--cache-ram 0`), no context shifting (earlier context is never discarded
+silently), the model's own Jinja chat template (`--jinja`), and reasoning text separated from the
+answer (`--reasoning-format deepseek`).
+
+**Transport.** A small HTTP/1.1 client (chunked and length-delimited bodies) polls the socket
+every 100 ms, so cancellation, the request deadline, and a 60 s idle limit take effect even while
+the server is silent during prompt processing; the server sends keep-alive comments every 10 s.
+Closing the connection makes llama.cpp abort the generation.
+
+**Service and lifecycle.** `InferenceService` runs one worker thread that owns the loaded model
+and handles load, unload, and generation commands in order; callers never block and receive typed
+`ServiceEvent`s. Model status is `Unloaded`, `Loading` (starting, then reading the model),
+`Ready` (context, build, tool support, load time), `Failed` (typed `LoadError`, remedies, log
+tail), or `Crashed`. The app adds "runtime missing" and "no model" from its install state. The
+worker checks the process every second while idle. After a crash the model is loaded again
+automatically, at most twice within ten minutes; after that the user decides. A crash during a
+request fails that request with `ServerCrashed` before recovery starts. Unload, a new load, and
+application exit cancel the work in progress. The server is stopped with SIGTERM, then SIGKILL
+after 3 s, and its socket directory and PID file are removed.
+
+**Request identity.** Every request has an identifier carried by all of its events. Cancelling
+takes effect immediately through a shared flag. A cancelled request emits no further output and
+always ends with `Err(Cancelled)`, even if the server finished at the same moment. The interface
+applies only events of the request it currently shows. Together, a cancelled or superseded
+request can never overwrite newer results.
+
+**Memory.** Before starting the server, the estimated need (GPU part and system-memory part of
+the offload split; everything in system memory for CPU and Apple unified memory) is compared with
+memory free right now (`nvidia-smi`/sysfs VRAM in use, `MemAvailable`). A shortfall stops the load
+with `InsufficientMemory` and the remedies below, including "Load anyway". The server log is
+classified after a failure: out of GPU or system memory (CUDA, Vulkan, ROCm, Metal messages), a
+backend that cannot initialise, an unsupported architecture, an unparsable chat template, or an
+unreadable model file. Out-of-memory remedies are concrete: three quarters of the current GPU
+layers, half the context (not below 4096), or a smaller quantization or model. Exit by signal 9 is
+reported as possibly stopped by the system for lack of memory.
+
+**Context policy.** Prompts are built from labelled sections, each required or optional with a
+drop order. Tokens are counted with the loaded model's tokenizer: the chat template is rendered by
+`/apply-template` and the result tokenized, tools included. The space reserved for the answer is
+the role's output limit, at most half the context. If the request does not fit, optional sections
+(retrieved documentation, earlier attempts) are left out whole, highest drop order first, and the
+result lists what was left out. Required sections (the user's specification, examples, contract,
+instructions) are never shortened or dropped. If they alone do not fit, the request is refused
+before anything is sent, with the token counts, the three largest parts, and the remedies "Increase
+the context to N" (when the model supports N) and "Shorten <parts>". A server-side context
+overflow is mapped to the same error.
+
+**Roles.** Interpretation, clarification, retrieval planning, generation, and explanation each
+have their own instructions, temperature, output limit, and time limit, and share one loaded
+model. Every role's instructions state that reference material, examples, and tool results are
+data, not instructions.
+
+**Structured output.** A `Schema` (a closed subset of JSON Schema: strings with length and
+enumerations, bounded integers, numbers, booleans, bounded arrays, closed objects) is sent as
+`response_format` for llama.cpp's grammar sampling. The answer is still parsed and validated
+(`Malformed` with the path of the first violation and the raw text). An answer cut off at the
+token limit is malformed.
+
+**Tools.** The model may call only the application-defined tools passed with a request. Arguments
+must be valid JSON matching the tool's schema before the tool runs. Each call has a 5 s limit and
+results are truncated to 8,000 characters. At most 4 calls per turn and 4 tool rounds per request
+are allowed. Refused and failed calls go back to the model as errors. llama.cpp's own built-in
+tools are never enabled. Tools are offered only when the model's chat template supports them.
 
 ### llama.cpp binaries: pinned upstream release assets, downloaded on first start
 
