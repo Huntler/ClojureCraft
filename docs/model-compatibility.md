@@ -22,6 +22,15 @@ Anything else is rejected. The list ships as `[compatibility] architectures` in
 `resources/model-catalog.toml`; catalog parsing fails if a catalog entry uses an architecture that
 is not listed.
 
+## Embedding model
+
+| GGUF architecture | Model | Status with b12138 |
+| --- | --- | --- |
+| `qwen3` (pooling `last`) | Qwen3-Embedding-0.6B Q8_0, pinned in `resources/knowledge-manifest.toml` | smoke-tested on Linux: CUDA (whole collection, 1,032 inputs, 26 s) and CPU (`--device none`, queries); Metal unverified |
+
+It is used only for documentation retrieval, from its own model store, and is never offered as a
+generator. Vectors are 1,024-dimensional and normalised by the application.
+
 ## Tool calls
 
 llama.cpp parses tool calls from the model's chat template. With b12138, Qwen2.5-Coder 7B and

@@ -41,6 +41,19 @@ pub struct ServerConfig {
     pub pid_file: Option<PathBuf>,
     /// Where the private socket directory is created; defaults to the per-user runtime directory.
     pub socket_base: Option<PathBuf>,
+    /// Serve embeddings instead of chat completions.
+    pub embedding: Option<EmbeddingMode>,
+}
+
+/// Options of a server that only computes embeddings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingMode {
+    /// llama.cpp pooling type, e.g. `last` or `mean`.
+    pub pooling: String,
+    /// Longest input in tokens; one input must fit in a single batch.
+    pub batch: u32,
+    /// Run on the CPU only, so the server never competes with the generator for GPU memory.
+    pub cpu_only: bool,
 }
 
 /// Command-line arguments for the server; `host` is the socket path or loopback address.
@@ -57,6 +70,31 @@ pub fn server_args(cfg: &ServerConfig, host: &str, port: Option<u16>) -> Vec<Str
     ]);
     if let Some(t) = cfg.threads {
         a.extend(["--threads".into(), t.to_string()]);
+    }
+    let common = [
+        // One request at a time, with the whole context available to it.
+        "--parallel",
+        "1",
+        // Use exactly the configured context and offload; report memory failures instead.
+        "--fit",
+        "off",
+        // No host-side prompt cache beyond the slot (it would use RAM outside the budget).
+        "--cache-ram",
+        "0",
+        "--no-webui",
+        "--no-slots",
+        "--log-colors",
+        "off",
+    ];
+    if let Some(e) = &cfg.embedding {
+        a.extend(["--embedding".into(), "--pooling".into(), e.pooling.clone()]);
+        a.extend(["--batch-size".into(), e.batch.to_string()]);
+        a.extend(["--ubatch-size".into(), e.batch.to_string()]);
+        if e.cpu_only {
+            a.extend(["--device".into(), "none".into()]);
+        }
+        a.extend(common.map(str::to_owned));
+        return a;
     }
     a.extend(
         [
@@ -407,6 +445,7 @@ mod tests {
             threads: None,
             pid_file: Some(base.join("server.pid")),
             socket_base: Some(base.to_owned()),
+            embedding: None,
         }
     }
 
@@ -428,6 +467,7 @@ mod tests {
             threads: Some(4),
             pid_file: None,
             socket_base: None,
+            embedding: None,
         };
         let a = server_args(&c, "/run/x/llama.sock", None).join(" ");
         for expected in [
@@ -452,6 +492,37 @@ mod tests {
                 .join(" ")
                 .contains("--port 5000")
         );
+    }
+
+    #[test]
+    fn embedding_servers_keep_the_safety_options_and_serve_only_embeddings() {
+        let c = ServerConfig {
+            server: "/s".into(),
+            model: "/e.gguf".into(),
+            context: 2048,
+            gpu_layers: Some(0),
+            threads: None,
+            pid_file: None,
+            socket_base: None,
+            embedding: Some(EmbeddingMode {
+                pooling: "last".into(),
+                batch: 2048,
+                cpu_only: true,
+            }),
+        };
+        let a = server_args(&c, "/run/x/llama.sock", None).join(" ");
+        for expected in [
+            "--embedding",
+            "--pooling last",
+            "--ubatch-size 2048",
+            "--device none",
+            "--parallel 1",
+            "--fit off",
+            "--no-webui",
+        ] {
+            assert!(a.contains(expected), "{expected} missing from {a}");
+        }
+        assert!(!a.contains("--jinja"), "{a}");
     }
 
     #[test]

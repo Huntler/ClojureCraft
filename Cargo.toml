@@ -21,6 +21,7 @@ clojurecraft-credentials = { path = "crates/clojurecraft-credentials" }
 clojurecraft-domain = { path = "crates/clojurecraft-domain" }
 clojurecraft-edn = { path = "crates/clojurecraft-edn" }
 clojurecraft-store = { path = "crates/clojurecraft-store" }
+clojurecraft-knowledge = { path = "crates/clojurecraft-knowledge" }
 
 anyhow = "1"
 directories = "6"

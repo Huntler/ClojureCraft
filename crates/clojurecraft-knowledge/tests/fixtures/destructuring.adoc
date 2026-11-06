@@ -1,0 +1,206 @@
+= Destructuring in Clojure
+Michael Zavarella
+2015-12-09
+:jbake-type: guides
+:toc: macro
+:icons: font
+
+ifdef::env-github,env-browser[:outfilesuffix: .adoc]
+
+toc::[]
+
+== Associative Destructuring
+
+<<xref/../../reference/special_forms#associative-destructuring,Associative destructuring>> is similar to sequential destructuring, but applied instead to associative (key-value) structures (including maps, records, vectors, etc). The associative bindings are concerned with concisely extracting values of the map by key.
+
+Let's first consider an example that extracts values from a map without destructuring:
+
+[source,clojure]
+----
+(def client {:name "Super Co."
+             :location "Philadelphia"
+             :description "The worldwide leader in plastic tableware."})
+
+(let [name (:name client)
+      location (:location client)
+      description (:description client)]
+  (println name location "-" description))
+;= Super Co. Philadelphia - The worldwide leader in plastic tableware.
+----
+
+Note that each line of the let binding is essentially the same - it extracts a value from the map by the name of the key, then binds it to a local with the same name.
+
+Below is a first example of doing the same thing with associative destructuring:
+
+[source,clojure]
+----
+(let [{name :name
+       location :location
+       description :description} client]
+  (println name location "-" description))
+;= Super Co. Philadelphia - The worldwide leader in plastic tableware.
+----
+
+The destructuring form is now a map rather than a vector, and instead of a symbol on the left side of the let, we have a map. The keys of the map are the symbols we want to bind in the let. The values of the destructuring map are the keys we will look up in the associative value. Here they are keywords (the most common case), but they could be any key value - numbers, strings, symbols, etc.
+
+Similar to sequential destructuring, if you try to bind a key that is not present in the map, the binding value will be nil.
+
+[source,clojure]
+----
+(let [{category :category} client]
+  (println category))
+;= nil
+----
+
+Associative destructuring, however, also allows you to supply a default value if the key is not present in the associative value with the `:or` key.
+
+[source,clojure]
+----
+(let [{category :category, :or {category "Category not found"}} client]
+  (println category))
+;= Category not found
+----
+
+To supply default values for keys that are not present in the input map, you can use the `:or` directive, whose value is a map of binding names or [since 1.13] keys to default values. Thus here `"Category not found"` will be used as the value for the binding category if the key `:category` is not in the input map (`client`). Note, `:or` entries should reference bindings and keys mentioned elsewhere.
+
+To capture the default values stated in the `:or` map for some purpose later in your code without restating them, you can use the `:defaults` directive [since 1.13], which binds a name to a map, created during destructuring, of keys to their default values.
+
+[source,clojure]
+----
+(let [{category :category, :or {category "Category not found"}, :defaults df} client]
+  (println df))
+;= {:category "Category not found"}
+----
+
+In sequential destructuring, you generally bind unneeded values with an `_`. Since associative destructuring doesn't require traversing the entire structure, you can simply omit any keys you don't plan on using from the destructuring form.
+
+If you need access to the entire map, you can use the `:as` key to bind the entire incoming value, just as in sequential destructuring.
+
+[source,clojure]
+----
+(let [{name :name :as all} client]
+  (println "The name from" all "is" name))
+;= The name from {:name Super Co., :location Philadelphia, :description The world wide leader in plastic table-ware.} is Super Co.
+----
+
+The `:as`, `:or`, and `:defaults` keywords can be combined in a single destructuring form:
+
+[source,clojure]
+----
+(def my-map {:a "A" :b "B" :c 3 :d 4})
+(let [{a :a, x :x, :or {x "Not found!"}, :as all, :defaults df} my-map]
+  (println "I got" a "from" all)
+  (println "Where is x?" x)
+  (println "Defaults are" df))
+;= I got A from {:a "A" :b "B" :c 3 :d 4}
+;= Where is x? Not found!
+;= Defaults are {:x "Not found!"}
+----
+
+You might have noticed that our original example still contains redundant information (the local binding name and the key name) in the associative destructuring form. The `:keys` key can be used to further remove the duplication:
+
+[source,clojure]
+----
+(let [{:keys [name location description]} client]
+  (println name location "-" description))
+;= Super Co. Philadelphia - The worldwide leader in plastic tableware.
+----
+
+This example is exactly the same as the prior version - it binds `name` to `(:name client)`, `location` to `(:location client)`, and `description` to `(:description client)`.
+
+The `:keys` key is for associative values with keyword keys, but there are also `:strs` and `:syms` for string and symbol keys respectively. In all of these cases the vector contains symbols which are the local binding names.
+
+[source,clojure]
+----
+(def string-keys {"first-name" "Joe" "last-name" "Smith"})
+
+(let [{:strs [first-name last-name]} string-keys]
+  (println first-name last-name))
+;= Joe Smith
+
+(def symbol-keys {'first-name "Jane" 'last-name "Doe"})
+
+(let [{:syms [first-name last-name]} symbol-keys]
+  (println first-name last-name))
+;= Jane Doe
+----
+
+If you want it to be an error to supply a map that is missing certain keys (rather than get `nil` or default values), you can [since 1.13] use the checked versions of the binding directives  (`:keys!`, `:strs!`, and `:syms!`) that throw an exception if the required keys are not present.
+
+[source,clojure]
+----
+(let [{:strs! [first-name last-name dob]} string-keys]
+  (println first-name last-name))
+;= throws Missing required key: "dob"
+----
+
+If you have keys you want to require but don't need to bind, you can list them after `&`, [since 1.13] which will check for the presence of the listed keys but not create bindings.
+
+[source,clojure]
+----
+(let [{:keys! [fred ethel lucy & :ricky]} m] ...
+
+(let [{:strs! [fred ethel lucy & "ricky"]} m] ...
+
+(let [{:syms! [fred ethel lucy & 'ricky]} m] ...
+----
+
+You can also document additional optional keys that you are not binding in the (`:keys`, `:strs`, and `:syms`) directives using `&`.
+
+When you receive an input map, you often don't know exactly what it contains. To manage that uncertainty, Clojure developers often lock down the set of legal keys that their input maps accept, which creates brittle connections across system boundaries. When you need to know the keys you're dealing with or passing data to something that's intolerant of additional keys, while remaining flexible about what a process accepts, you can use `:select` [since 1.13]. The `:select` directive names a map that is a subset of the input map augmented by the defaults, limited to the the keys mentioned in the destructuring form.
+
+[source,clojure]
+----
+(def small-map {:a 5})
+(let [{:keys [a b & :c], :as m, :or {a 42 b 3 :c "unknown"}, :select sel, :defaults df} small-map]
+  (println sel))
+
+;= {:c "unknown", :b 3, :a 5}
+----
+
+To get a map like the input map with defaults substituted for missing keys, use the `:all` directive. [since 1.13] `:all` traverses deeply through nested maps.
+
+[source,clojure]
+----
+(let [{:keys [a & :b] :as m :or {:a 42 :b 3} :all all-m} {}]
+  [a all-m])
+
+
+-> [42 {:a 42, :b 3}]
+----
+
+When using `:all`, defaults are applied at every nested level that contains an `:or` directive.
+
+[source,clojure]
+----
+(let [nested-map {:a 1, :nested {:aa 10}}
+
+      {:keys [a & :b] :as m :or {:a 42 :b 3} :all all-m
+       {:keys [aa bb] :or {:bb 30}} :nested}
+      nested-map]
+  all-m)
+
+
+-> {:a 1, :b 3, :nested {:bb 30, :aa 10}}
+----
+
+Associative destructuring can be nested and combined with sequential destructuring as needed.
+
+[source,clojure]
+----
+(def multiplayer-game-state
+  {:joe {:class "Ranger"
+         :weapon "Longbow"
+         :score 100}
+   :jane {:class "Knight"
+          :weapon "Greatsword"
+          :score 140}
+   :ryan {:class "Wizard"
+          :weapon "Mystic Staff"
+          :score 150}})
+
+(let [{{:keys [class weapon]} :joe} multiplayer-game-state]
+  (println "Joe is a" class "wielding a" weapon))
+;= Joe is a Ranger wielding a Longbow
+----
+

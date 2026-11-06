@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 
 pub const HARNESS_SOURCE: &str = include_str!("../../../resources/clojure/harness.clj");
 
+/// Prints the documentation of the supported standard-library namespaces as JSON.
+pub const API_DOCS_SOURCE: &str = include_str!("../../../resources/clojure/api-docs.clj");
+
 /// The JVM's exit status for `-XX:+ExitOnOutOfMemoryError`.
 const JVM_OOM_EXIT: i32 = 3;
 
@@ -119,18 +122,27 @@ impl EvalRequest {
     }
 }
 
+/// The result of running a script shipped with the application.
+#[derive(Clone, Debug)]
+pub struct ScriptOutcome {
+    pub status: EvalStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub elapsed: Duration,
+}
+
 impl ClojureRuntime {
-    /// Writes the harness under a content-addressed name so concurrent versions never collide.
-    fn harness_path(&self) -> io::Result<PathBuf> {
-        let hash = hex::encode(Sha256::digest(HARNESS_SOURCE.as_bytes()));
-        let path = self.work_dir.join(format!("harness-{}.clj", &hash[..16]));
-        if fs::read_to_string(&path).ok().as_deref() != Some(HARNESS_SOURCE) {
+    /// Writes a script under a content-addressed name so concurrent versions never collide.
+    fn script_path(&self, stem: &str, source: &str) -> io::Result<PathBuf> {
+        let hash = hex::encode(Sha256::digest(source.as_bytes()));
+        let path = self.work_dir.join(format!("{stem}-{}.clj", &hash[..16]));
+        if fs::read_to_string(&path).ok().as_deref() != Some(source) {
             fs::create_dir_all(&self.work_dir)?;
             // Unique per writer, so concurrent evaluations never rename a half-written file.
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
-            fs::write(&tmp, HARNESS_SOURCE)?;
+            fs::write(&tmp, source)?;
             fs::rename(&tmp, &path)?;
         }
         Ok(path)
@@ -176,15 +188,39 @@ impl ClojureRuntime {
         ]
     }
 
-    pub fn evaluate(&self, req: &EvalRequest, limits: &Limits) -> Result<EvalOutcome, EvalError> {
-        let harness = self.harness_path()?;
+    /// Runs one of the application's own scripts (`source`) in the same sandbox and with the same
+    /// limits as candidate code. A script is considered completed when it exits successfully.
+    pub fn run_script(
+        &self,
+        stem: &str,
+        source: &str,
+        stdin: &[u8],
+        limits: &Limits,
+    ) -> Result<ScriptOutcome, EvalError> {
+        let script = self.script_path(stem, source)?;
+        let (status, stdout, stderr, elapsed) = self.run_sandboxed(&script, stdin, limits, |_| true)?;
+        Ok(ScriptOutcome {
+            status,
+            stdout,
+            stderr,
+            elapsed,
+        })
+    }
+
+    fn run_sandboxed(
+        &self,
+        script: &Path,
+        stdin: &[u8],
+        limits: &Limits,
+        completed: impl Fn(&str) -> bool,
+    ) -> Result<(EvalStatus, String, String, Duration), EvalError> {
         let outcome: Outcome = run(&RunRequest {
             helper: self.sandbox_helper.clone(),
-            policy: self.policy(&harness, limits),
+            policy: self.policy(script, limits),
             program: self.java.clone(),
-            args: self.jvm_args(&harness, limits),
+            args: self.jvm_args(script, limits),
             env: vec![("LANG".into(), "C.UTF-8".into())],
-            stdin: req.to_edn().into_bytes(),
+            stdin: stdin.to_vec(),
             wall_timeout: limits.wall,
             max_stdout: limits.max_output_bytes,
             max_stderr: 64 * 1024,
@@ -192,7 +228,7 @@ impl ClojureRuntime {
         let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
         let status = match outcome.termination {
-            Termination::Exited(0) if stdout.trim_start().starts_with('{') => EvalStatus::Completed,
+            Termination::Exited(0) if completed(&stdout) => EvalStatus::Completed,
             Termination::Exited(JVM_OOM_EXIT) => EvalStatus::MemoryLimitExceeded,
             Termination::Exited(c) => EvalStatus::Crashed(format!("exit status {c}")),
             Termination::Signaled(s) => EvalStatus::Crashed(format!("killed by signal {s}")),
@@ -200,6 +236,15 @@ impl ClojureRuntime {
             Termination::OutputLimitExceeded => EvalStatus::OutputLimitExceeded,
             Termination::SandboxSetupFailed => EvalStatus::SandboxUnavailable(stderr.clone()),
         };
+        Ok((status, stdout, stderr, outcome.elapsed))
+    }
+
+    pub fn evaluate(&self, req: &EvalRequest, limits: &Limits) -> Result<EvalOutcome, EvalError> {
+        let harness = self.script_path("harness", HARNESS_SOURCE)?;
+        let (status, stdout, stderr, elapsed) =
+            self.run_sandboxed(&harness, req.to_edn().as_bytes(), limits, |out| {
+                out.trim_start().starts_with('{')
+            })?;
         let response = if status == EvalStatus::Completed {
             stdout
         } else {
@@ -209,7 +254,7 @@ impl ClojureRuntime {
             status,
             response,
             stderr,
-            elapsed: outcome.elapsed,
+            elapsed,
         })
     }
 }

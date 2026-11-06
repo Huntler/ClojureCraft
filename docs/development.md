@@ -57,5 +57,24 @@ shell script standing in for `llama-server`.
 (private Unix socket, per-session key) and report load time, prompt tokens counted with the
 model's tokenizer, generation speed, peak server RSS, GPU memory, and cancellation latency.
 
+Documentation retrieval can be exercised from the command line with the same code the application
+uses (`knowledge-build` needs the Java runtime and Clojure; embeddings need the llama.cpp runtime):
+
+```sh
+./target/debug/clojurecraft-devtool fetch-embedding-model          # optional, 610 MiB
+./target/debug/clojurecraft-devtool knowledge-build [text|cpu|gpu] # default gpu
+./target/debug/clojurecraft-devtool knowledge-search "count how often each value occurs" [--all]
+./target/debug/clojurecraft-devtool knowledge-eval                 # hit@1, hit@5, MRR per ranking
+```
+
+`knowledge-eval` runs the queries in `crates/clojurecraft-devtool/retrieval-eval.toml` against the
+installed collection with exact + full text, semantic only, and the combined ranking. Re-run it
+after changing chunking, weights, sources, or the embedding model, and record the result in
+`docs/architecture.md`.
+
+The application runs the API extraction through the sandbox helper next to its own executable, so
+build the whole workspace (`cargo build --workspace`) before `cargo run` when installing the
+documentation from the app.
+
 Inference checks (`smoke-model`) are local and manual: they need real weights and, for GPU
 backends, a GPU. They are never part of automated CI.

@@ -1,5 +1,4 @@
-//! Centre-column pages other than the function editor: welcome, trash, knowledge sources, and
-//! settings.
+//! Centre-column pages other than the function editor: welcome, trash, and settings.
 
 use clojurecraft_store::FunctionSummary;
 use egui::{RichText, Ui};
@@ -108,47 +107,6 @@ pub fn display_name(name: &str) -> &str {
     } else {
         name
     }
-}
-
-pub fn knowledge(ui: &mut Ui, inference: &InferenceState) {
-    page_title(
-        ui,
-        "Knowledge sources",
-        "Clojure documentation used to ground generated code. It is stored and searched locally.",
-    );
-    egui::Grid::new("knowledge")
-        .num_columns(2)
-        .spacing([16.0, 8.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Clojure documentation").color(theme::MUTED));
-            ui.label(RichText::new("not installed").color(theme::WARN));
-            ui.end_row();
-            if let Some(snapshot) = &inference.snapshot {
-                ui.label(RichText::new("Java runtime").color(theme::MUTED));
-                installed(ui, snapshot.java, None);
-                ui.end_row();
-                ui.label(RichText::new("Clojure").color(theme::MUTED));
-                installed(ui, snapshot.clojure, None);
-                ui.end_row();
-            }
-        });
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new(
-            "Installing, updating, and browsing the documentation collection happens here. \
-             Specifications can be written without it.",
-        )
-        .color(theme::MUTED),
-    );
-}
-
-fn installed(ui: &mut Ui, ok: bool, detail: Option<String>) {
-    let (text, color) = if ok {
-        ("installed", theme::ACCENT_INK)
-    } else {
-        ("not installed", theme::WARN)
-    };
-    ui.label(RichText::new(detail.unwrap_or_else(|| text.to_owned())).color(color));
 }
 
 pub enum SettingsAction {

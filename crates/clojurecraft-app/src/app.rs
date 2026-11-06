@@ -15,6 +15,8 @@ use crate::implementation::{self, Tab};
 use crate::inference::InferenceState;
 use crate::jobs::{Event, Jobs};
 use crate::keys::{self, DUPLICATE, FIND, NEW_FUNCTION, RENAME, SAVE};
+use crate::knowledge::KnowledgeState;
+use crate::knowledge_view;
 use crate::library::{Command, Library, LibraryEvent};
 use crate::model::RemedyAction;
 use crate::model_view;
@@ -75,6 +77,7 @@ pub struct ClojureCraftApp {
     loading: HashSet<FunctionId>,
     open_errors: HashMap<FunctionId, (String, bool)>,
     inference: InferenceState,
+    knowledge: KnowledgeState,
     setup_page: SetupPage,
     models_page: ModelsPage,
     toasts: Vec<Toast>,
@@ -95,6 +98,7 @@ impl ClojureCraftApp {
         let secrets = Arc::new(SecretRegistry::new());
         let library = Library::start(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
         let inference = InferenceState::new(jobs.sender(), cc.egui_ctx.clone(), secrets);
+        let knowledge = KnowledgeState::new(jobs.sender(), cc.egui_ctx.clone());
         let first_run = inference.settings.setup == SetupState::NotStarted;
         let reopen = cc
             .storage
@@ -115,6 +119,7 @@ impl ClojureCraftApp {
             loading: HashSet::new(),
             open_errors: HashMap::new(),
             inference,
+            knowledge,
             setup_page: SetupPage::default(),
             models_page: ModelsPage::default(),
             toasts: Vec::new(),
@@ -127,6 +132,17 @@ impl ClojureCraftApp {
         }
     }
 
+    /// Whether a documentation build may compute embeddings on the GPU: only with a GPU backend
+    /// and while no generator model holds GPU memory.
+    fn gpu_free(&self) -> bool {
+        use clojurecraft_inference::ModelStatus;
+        self.inference.backend().uses_gpu()
+            && matches!(
+                self.inference.model.status,
+                ModelStatus::Unloaded | ModelStatus::Failed { .. }
+            )
+    }
+
     // ---- events ---------------------------------------------------------------------------
 
     fn handle_events(&mut self) {
@@ -134,6 +150,7 @@ impl ClojureCraftApp {
             match event {
                 Event::Library(event) => self.library_event(event),
                 Event::Inference(event) => self.inference.handle(*event),
+                Event::Knowledge(event) => self.knowledge.handle(*event),
             }
         }
         for notice in std::mem::take(&mut self.inference.notices) {
@@ -553,7 +570,12 @@ impl ClojureCraftApp {
                 Some(TrashAction::Purge(f)) => self.dialog = Some(Dialog::Purge(f)),
                 None => {}
             },
-            View::Knowledge => views::knowledge(ui, &self.inference),
+            View::Knowledge => {
+                let cx = knowledge_view::PageContext {
+                    gpu_free: self.gpu_free(),
+                };
+                knowledge_view::page(ui, &mut self.knowledge, &cx);
+            }
             View::Settings => {
                 if let SettingsAction::OpenSetup =
                     views::settings(ui, &mut self.inference, &mut self.models_page)
@@ -800,6 +822,7 @@ impl eframe::App for ClojureCraftApp {
             .right();
         let right_max = (total - left - MIN_CENTER_WIDTH).clamp(300.0, 720.0);
         let mut open_setup = false;
+        let mut open_knowledge = false;
         let mut remedy = RemedyAction::None;
         let current = match self.view {
             View::Function(id) => self.docs.get(&id).map(|o| &o.doc),
@@ -823,8 +846,10 @@ impl eframe::App for ClojureCraftApp {
                             remedy = model_view::status(ui, &mut self.inference, true);
                         });
                 }
-                if implementation::show(ui, &mut self.right_tab, current, &missing) {
-                    open_setup = true;
+                match implementation::show(ui, &mut self.right_tab, current, &missing, &mut self.knowledge) {
+                    implementation::ColumnAction::OpenSetup => open_setup = true,
+                    implementation::ColumnAction::OpenKnowledge => open_knowledge = true,
+                    implementation::ColumnAction::None => {}
                 }
             });
         match remedy {
@@ -834,6 +859,9 @@ impl eframe::App for ClojureCraftApp {
         }
         if open_setup {
             self.view = View::Setup;
+        }
+        if open_knowledge {
+            self.view = View::Knowledge;
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(20.0))
@@ -854,6 +882,7 @@ impl eframe::App for ClojureCraftApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Stops llama.cpp; it must not outlive the application.
         self.inference.shutdown_model();
+        self.knowledge.shutdown();
         if let Some(autosaver) = &self.autosaver
             && !autosaver.flush()
         {

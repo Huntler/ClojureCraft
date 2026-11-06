@@ -1,0 +1,149 @@
+# Retrieval evaluation for `clojurecraft-devtool knowledge-eval`.
+#
+# Each query describes a transformation the way a user might. `expect` lists acceptable answers:
+# a symbol (`frequencies`, `clojure.set/index`) or a page section id prefix (`page:guides/...`).
+# A query counts as found at the rank of its first acceptable hit.
+
+[[query]]
+text = "count how often each value occurs"
+expect = ["frequencies"]
+
+[[query]]
+text = "group records by the value of one of their keys"
+expect = ["group-by"]
+
+[[query]]
+text = "add up the amounts of all orders"
+expect = ["reduce", "apply", "transduce"]
+
+[[query]]
+text = "keep only the entries whose price is greater than ten"
+expect = ["filter", "filterv", "keep"]
+
+[[query]]
+text = "drop nil values from a list"
+expect = ["remove", "keep", "some?"]
+
+[[query]]
+text = "rename the keys of a map"
+expect = ["clojure.set/rename-keys"]
+
+[[query]]
+text = "change a value deep inside a nested map"
+expect = ["update-in", "assoc-in"]
+
+[[query]]
+text = "read a value from nested maps by following a path of keys"
+expect = ["get-in"]
+
+[[query]]
+text = "sort people by age, oldest first"
+expect = ["sort-by", "page:guides/comparators"]
+
+[[query]]
+text = "join strings with a comma between them"
+expect = ["clojure.string/join"]
+
+[[query]]
+text = "split a sentence into words on whitespace"
+expect = ["clojure.string/split"]
+
+[[query]]
+text = "pair up a list of keys with a list of values into a map"
+expect = ["zipmap"]
+
+[[query]]
+text = "merge maps, adding up the values of keys present in several"
+expect = ["merge-with"]
+
+[[query]]
+text = "apply a function to every value of a map, keeping the keys"
+expect = ["update-vals", "reduce-kv"]
+
+[[query]]
+text = "turn nested lists into one flat sequence"
+expect = ["flatten", "mapcat", "concat"]
+
+[[query]]
+text = "remove duplicates but keep the original order"
+expect = ["distinct", "dedupe"]
+
+[[query]]
+text = "find the item with the highest score"
+expect = ["max-key"]
+
+[[query]]
+text = "cut a list into chunks of three items"
+expect = ["partition", "partition-all", "partitionv", "partitionv-all"]
+
+[[query]]
+text = "group consecutive elements that have the same category"
+expect = ["partition-by"]
+
+[[query]]
+text = "take elements from the start while they are below a limit"
+expect = ["take-while"]
+
+[[query]]
+text = "pair each element with its position"
+expect = ["map-indexed", "keep-indexed"]
+
+[[query]]
+text = "check whether any element satisfies a condition"
+expect = ["some"]
+
+[[query]]
+text = "elements that appear in both sets"
+expect = ["clojure.set/intersection"]
+
+[[query]]
+text = "parse an integer from text"
+expect = ["parse-long"]
+
+[[query]]
+text = "convert string keys to keywords throughout a nested structure"
+expect = ["clojure.walk/keywordize-keys"]
+
+[[query]]
+text = "pull named values out of a map argument in the function parameters"
+expect = ["page:guides/destructuring"]
+
+[[query]]
+text = "pass a value through a series of transformation steps"
+expect = ["->", "->>", "page:guides/threading_macros"]
+
+[[query]]
+text = "compose transformations without building intermediate sequences"
+expect = ["page:reference/transducers", "transduce", "eduction"]
+
+[[query]]
+text = "custom ordering for sorting with a comparison function"
+expect = ["page:guides/comparators", "compare", "comparator", "sort"]
+
+[[query]]
+text = "generate an endless sequence lazily"
+expect = ["iterate", "repeat", "cycle", "lazy-seq", "range", "page:reference/lazy"]
+
+[[query]]
+text = "is a vector equal to a list with the same elements"
+expect = ["page:guides/equality", "="]
+
+[[query]]
+text = "everything except the last element"
+expect = ["butlast", "drop-last", "pop"]
+
+[[query]]
+text = "convert a sequence into a vector"
+expect = ["vec", "into"]
+
+[[query]]
+text = "difference between two nested data structures"
+expect = ["clojure.data/diff"]
+
+[[query]]
+text = "a map from id to record for a list of records"
+expect = ["clojure.set/index", "group-by", "zipmap", "into", "reduce"]
+
+[[query]]
+text = "upper-case every name"
+expect = ["clojure.string/upper-case", "map", "mapv"]

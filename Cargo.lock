@@ -655,12 +655,15 @@ name = "clojurecraft-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clojurecraft-clojure",
  "clojurecraft-credentials",
  "clojurecraft-domain",
  "clojurecraft-edn",
  "clojurecraft-hardware",
  "clojurecraft-inference",
+ "clojurecraft-knowledge",
  "clojurecraft-runtime",
+ "clojurecraft-sandbox",
  "clojurecraft-store",
  "eframe",
  "egui",
@@ -675,6 +678,7 @@ dependencies = [
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
  "hex",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
@@ -698,9 +702,12 @@ dependencies = [
  "clojurecraft-clojure",
  "clojurecraft-hardware",
  "clojurecraft-inference",
+ "clojurecraft-knowledge",
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -740,6 +747,25 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "clojurecraft-knowledge"
+version = "0.1.0"
+dependencies = [
+ "clojurecraft-clojure",
+ "clojurecraft-domain",
+ "clojurecraft-inference",
+ "clojurecraft-runtime",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
  "tracing",
 ]
 

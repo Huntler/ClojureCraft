@@ -1,0 +1,180 @@
+# Clojure documentation ClojureCraft downloads and indexes for local retrieval.
+#
+# API entries come from the metadata of the installed, pinned Clojure runtime, so they always
+# describe exactly that version. Reference and guide pages come from the clojure.org source
+# repository, pinned to one commit; every page is pinned by size and SHA-256 and rejected if it
+# differs. Changing anything here is an application release change and makes installed
+# collections offer an update.
+
+schema_version = 1
+# Identifies this selection of sources and the way they are chunked.
+revision = "2026.11.1"
+
+[api]
+name = "Clojure API reference"
+# {ns} and {name} are replaced by the namespace and the var name.
+url_template = "https://clojure.github.io/clojure/{ns}-api.html#{ns}/{name}"
+special_form_url = "https://clojure.org/reference/special_forms"
+license = "EPL-1.0"
+attribution = "Docstrings from the Clojure source code. Copyright (c) Rich Hickey. Eclipse Public License 1.0."
+
+[site]
+name = "clojure.org reference and guides"
+repository = "clojure/clojure-site"
+commit = "d664fff7d2967bbb74157082796d28e1731d1d35"
+license = "EPL-1.0"
+attribution = "clojure.org content. Copyright (c) Rich Hickey and contributors. Eclipse Public License 1.0."
+
+[[site.pages]]
+path = "content/reference/data_structures.adoc"
+url = "https://clojure.org/reference/data_structures"
+kind = "reference"
+size = 23263
+sha256 = "d54178668d167518cc55cfb14ed379a87b85ca14849030c76822957afe24d194"
+
+[[site.pages]]
+path = "content/reference/sequences.adoc"
+url = "https://clojure.org/reference/sequences"
+kind = "reference"
+size = 13009
+sha256 = "bd6f322b955d1f92965dabb6c23f89a3d20f6e64553f2abfbabfdccd28d153e8"
+
+[[site.pages]]
+path = "content/reference/transducers.adoc"
+url = "https://clojure.org/reference/transducers"
+kind = "reference"
+size = 12091
+sha256 = "81278439d4cf8585d2923c876b244d2b63a9d496f41132d22f7a15f9f6218389"
+
+[[site.pages]]
+path = "content/reference/special_forms.adoc"
+url = "https://clojure.org/reference/special_forms"
+kind = "reference"
+size = 20614
+sha256 = "423632e7a67314ff2f4a292ccf2cfb9f49bf523d23e07f9cf8c76d152056c6c4"
+
+[[site.pages]]
+path = "content/reference/lazy.adoc"
+url = "https://clojure.org/reference/lazy"
+kind = "reference"
+size = 9242
+sha256 = "5edc611bcdb1413f1b15c5cf32deda4cc3e2233a998418bf8bcdde495cad4c87"
+
+[[site.pages]]
+path = "content/reference/other_functions.adoc"
+url = "https://clojure.org/reference/other_functions"
+kind = "reference"
+size = 6183
+sha256 = "12d565f56fa71009988010ce463c983efd58ac3b0c90c92244132e234d995572"
+
+[[site.pages]]
+path = "content/reference/transients.adoc"
+url = "https://clojure.org/reference/transients"
+kind = "reference"
+size = 6490
+sha256 = "1c3ddc61bb5d188c67908d99f8065dbd62cbc7b084f03383c37ecee6689295e4"
+
+[[site.pages]]
+path = "content/reference/reader.adoc"
+url = "https://clojure.org/reference/reader"
+kind = "reference"
+size = 21044
+sha256 = "67f2b736ebb9b1a32c4074388b031268f7e19d185b217e30d6ebf0b2cdef0096"
+
+[[site.pages]]
+path = "content/guides/comparators.adoc"
+url = "https://clojure.org/guides/comparators"
+kind = "guide"
+size = 29315
+sha256 = "3983f06077b03160ed3d0351b26d92d1b590be7b20dc2ccc81e4f84fbb3b794d"
+
+[[site.pages]]
+path = "content/guides/destructuring.adoc"
+url = "https://clojure.org/guides/destructuring"
+kind = "guide"
+size = 25529
+sha256 = "fbc4c32aee3392b43d1c4d064dc5f4b2365f61cc60d82f7f1bd9dee9a6a6a2ec"
+
+[[site.pages]]
+path = "content/guides/equality.adoc"
+url = "https://clojure.org/guides/equality"
+kind = "guide"
+size = 29416
+sha256 = "f8730e2d2425e59a71fc7b345ccd9edb3552f8cb0b98a5dd1edd59198afe42a4"
+
+[[site.pages]]
+path = "content/guides/higher_order_functions.adoc"
+url = "https://clojure.org/guides/higher_order_functions"
+kind = "guide"
+size = 5240
+sha256 = "588d96b6ae1d58ddaff539be61c4ca95914ac922b630025e98bff2137c731fb1"
+
+[[site.pages]]
+path = "content/guides/threading_macros.adoc"
+url = "https://clojure.org/guides/threading_macros"
+kind = "guide"
+size = 9801
+sha256 = "6b9fd416525293ef610f6440c8ef21292e00f4e307101bc67ba46a827976a68f"
+
+[[site.pages]]
+path = "content/guides/weird_characters.adoc"
+url = "https://clojure.org/guides/weird_characters"
+kind = "guide"
+size = 30618
+sha256 = "3e8f28bdebcf6e921f4a2956e21def342c9f74da67a3c59acc6a6d6756d38a94"
+
+[[site.pages]]
+path = "content/guides/learn/functions.adoc"
+url = "https://clojure.org/guides/learn/functions"
+kind = "guide"
+size = 13352
+sha256 = "211f8b36ec5c59264058ddef034d6d4767175c364d5e0c400286b40804e7fb19"
+
+[[site.pages]]
+path = "content/guides/learn/hashed_colls.adoc"
+url = "https://clojure.org/guides/learn/hashed_colls"
+kind = "guide"
+size = 10403
+sha256 = "f5cd0d02624e38cee2e8d80c2e18c5d6086ce56fb254ced1f176cfbc36534d56"
+
+[[site.pages]]
+path = "content/guides/learn/sequential_colls.adoc"
+url = "https://clojure.org/guides/learn/sequential_colls"
+kind = "guide"
+size = 3242
+sha256 = "840da35ee4baf670b92cbd6a31185256199f4d3eb71c08f80b4fc953d062a4fc"
+
+[[site.pages]]
+path = "content/guides/learn/flow.adoc"
+url = "https://clojure.org/guides/learn/flow"
+kind = "guide"
+size = 7581
+sha256 = "17027a39380ebda51c2cecebd126a7dfa3e3dc016ed52dc6e3bfe94f1142a260"
+
+[[site.pages]]
+path = "content/guides/learn/syntax.adoc"
+url = "https://clojure.org/guides/learn/syntax"
+kind = "guide"
+size = 13839
+sha256 = "6b595743e2a9db9f6294dd577389a3105c213bf63b06fdef2abca1bb88aa52a5"
+
+# Embedding model for semantic search. Optional: without it, retrieval uses exact symbol lookup and
+# full-text search only. Runs through the installed llama.cpp runtime.
+[embedding]
+id = "qwen3-embedding-0.6b"
+name = "Qwen3-Embedding 0.6B"
+repo = "Qwen/Qwen3-Embedding-0.6B-GGUF"
+revision = "370f27d7550e0def9b39c1f16d3fbaa13aa67728"
+license = "Apache-2.0"
+architecture = "qwen3"
+quant = "Q8_0"
+dimensions = 1024
+pooling = "last"
+# Longest input in tokens. Longer chunks are shortened for embedding only; their full text stays
+# searchable and is what retrieval returns.
+max_tokens = 2048
+query_instruction = "Given a description of a data transformation or a question about Clojure, retrieve Clojure documentation that helps implement or answer it"
+# "smoke-tested": loaded and used to build and search a collection with the pinned llama.cpp release
+# on a reference machine (Linux CUDA and CPU, 2026-11-06); "unverified" otherwise.
+status = "smoke-tested"
+file = { path = "Qwen3-Embedding-0.6B-Q8_0.gguf", size = 639150592, sha256 = "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439" }

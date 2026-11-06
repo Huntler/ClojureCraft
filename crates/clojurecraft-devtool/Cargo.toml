@@ -12,9 +12,12 @@ anyhow.workspace = true
 clojurecraft-clojure.workspace = true
 clojurecraft-hardware.workspace = true
 clojurecraft-inference.workspace = true
+clojurecraft-knowledge.workspace = true
 clojurecraft-runtime.workspace = true
 clojurecraft-sandbox.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

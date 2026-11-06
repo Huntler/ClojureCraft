@@ -16,10 +16,11 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates, GGUF header reading, Hugging Face resolution, model store, inference settings, disk usage |
 | `clojurecraft-inference` | Replaceable inference interface; `llama-server` process on a private Unix socket; inference service (lifecycle, crash recovery, streaming, cancellation, timeouts); context policy; roles; structured output and tool validation |
 | `clojurecraft-sandbox` | OS-level restriction of untrusted processes (library + `clojurecraft-sandbox` helper binary) |
-| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness) |
+| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness); trusted scripts in the same sandbox |
+| `clojurecraft-knowledge` | Versioned Clojure documentation: pinned sources, API extraction, chunking, SQLite/FTS5 index, embeddings, merged retrieval, atomic collection updates, prompt formatting |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
 
-Later boundaries (documentation retrieval, export, benchmarking, updates)
+Later boundaries (export, benchmarking, updates)
 get their own crates when they are implemented. Long-running work runs on background threads that
 report typed events over a channel; the UI drains the channel each frame and never blocks
 (`clojurecraft-app/src/jobs.rs`).
@@ -32,7 +33,9 @@ Data lives outside the repository in the platform data directory, overridable wi
 
 with `downloads/` (archives and resumable `.part` files), `runtimes/<component>/<version>/`,
 `models/<catalog-id>/<quant>/` and `models/hf/<owner>/<name>/<commit12>/<quant>/` (each with a
-`model.json` record), `harness/`, `library/library.sqlite3` (saved functions, history, results),
+`model.json` record), `harness/`, `knowledge/` (`collections/<version>/` with `index.sqlite3` and `collection.json`,
+`downloads/` for verified source pages, `models/` for the embedding model), `library/library.sqlite3`
+(saved functions, history, results),
 `settings.json` (inference settings), and `ui-state.ron` (window geometry, column widths, text
 size, last open function). Access tokens are never stored here.
 
@@ -245,10 +248,9 @@ by extending the allowlist, with tests.
 Chosen for transactional writes with WAL journaling (crash safety for drafts and revisions),
 schema migrations, and the built-in FTS5 full-text index for documentation. The documentation
 corpus is small (thousands of chunks), so embedding vectors can be stored in SQLite and searched
-by exact cosine similarity in memory, avoiding a separate vector-index dependency. Embeddings will
-be produced by a small GGUF embedding model through `llama-server --embedding` (for example
-Qwen3-Embedding-0.6B), reusing the inference runtime. The function library is implemented (see
-below); the documentation index is not yet.
+by exact cosine similarity in memory, avoiding a separate vector-index dependency. Embeddings are
+produced by Qwen3-Embedding-0.6B through `llama-server --embedding`, reusing the inference runtime
+(see "Documentation retrieval").
 
 ### Domain model and persistence
 
@@ -305,6 +307,99 @@ download URLs. A process-wide `SecretRegistry` holds every secret the applicatio
 API keys, access tokens). Drafts and revisions containing a registered secret are refused;
 machine-produced results are redacted (registered secrets and `hf_…` token shapes) before
 storage. The same guard is intended for exports.
+
+### Documentation retrieval
+
+**Sources** (pinned in `resources/knowledge-manifest.toml`, revision `2026.11.1`):
+
+- API documentation of `clojure.core`, `clojure.string`, `clojure.set`, `clojure.walk`,
+  `clojure.edn`, `clojure.zip`, and `clojure.data` (the namespaces the harness allows), read from
+  var metadata of the installed, pinned Clojure runtime by `resources/clojure/api-docs.clj`, run in
+  the same sandbox as candidate code. It therefore always describes exactly the configured Clojure
+  version (1.12.6: 732 documented vars and special forms). Each entry keeps its arglists, kind,
+  `:added` version, and deprecation.
+- 19 clojure.org reference and guide pages relevant to data transformation (data structures,
+  sequences, transducers, special forms, laziness, destructuring, equality, comparators, threading
+  macros, …) from `clojure/clojure-site` at commit `d664fff7`, each pinned by size and SHA-256 and
+  downloaded from `raw.githubusercontent.com` with the verified, resumable downloader.
+
+Both are EPL-1.0. Every chunk keeps its source URL (API page anchor or page section anchor),
+title, symbol, namespace, `since` version, and its source's license, attribution, and revision.
+
+**Chunking.** API documentation: one chunk per symbol (usage forms, kind, version, docstring).
+Pages: an AsciiDoc subset is converted to text (links, cross references, tables, admonitions,
+listing blocks; comments and pass-through HTML dropped) and split by section. Sections longer than
+2,400 characters are split between paragraphs; a code block always stays with the paragraph that
+introduces it and with a short explanation after it, so a single example may exceed the limit.
+Links to API pages are kept as `mentions` and indexed. The result is 1,032 chunks.
+
+**Index.** One immutable SQLite database per collection: chunks, sources, an FTS5 table (Porter
+stemming; columns symbol, title, mentions, text with BM25 weights 8/4/2/1), and f32 vectors.
+Readers open it with `immutable=1`.
+
+**Retrieval.** Every query runs three retrievers. *Exact*: a query that is one symbol (`group-by`,
+`str/join` with common aliases resolved, `clojure.set/union`, `` `keep` ``, `(if …)`) puts that
+symbol first; code-like symbols inside a longer query are boosted. *Full text*: the query's words
+(stopwords removed, hyphenated symbols also as phrases) OR-ed in FTS5. *Semantic*: cosine
+similarity against all vectors, with Qwen3-Embedding's query instruction. With vectors, candidates
+are ranked by similarity + 1.0 for a named symbol, + 0.15 for a mentioned one, and up to + 0.08
+for matching words; without vectors, exact and full-text ranks are merged by reciprocal rank
+fusion. Filters: symbols added after the configured Clojure version are left out, and symbols the
+harness refuses (`slurp`, `eval`, …, read from the harness source so the lists cannot diverge)
+are excluded unless explicitly requested; their text says they are not available.
+
+Measured with `clojurecraft-devtool knowledge-eval` (36 paraphrased transformation descriptions,
+`crates/clojurecraft-devtool/retrieval-eval.toml`, top 10):
+
+| Ranking | hit@1 | hit@5 | MRR |
+| --- | --- | --- | --- |
+| exact + full text | 30.6 % | 50.0 % | 0.389 |
+| semantic only | 50.0 % | 91.7 % | 0.700 |
+| reciprocal rank fusion, equal weights | 44.4 % | 66.7 % | 0.552 |
+| similarity + bonuses (chosen) | 61.1 % | 91.7 % | 0.747 |
+
+Full text alone fails on paraphrases ("count how often each value occurs" does not contain
+"frequencies"); rank fusion lets its noise displace good semantic matches, so similarity scores are
+kept. **Reranking** (a cross-encoder) is not implemented: with hit@5 at 92 % and the generator
+receiving several excerpts, the remaining gain does not justify another model in memory; to be
+revisited if generation quality shows retrieval misses.
+
+**Embedding model.** Qwen3-Embedding-0.6B Q8_0 (Apache-2.0, 610 MiB, pinned commit and SHA-256,
+installed in its own model store so it never appears as a generator). It runs in a separate
+`llama-server` in embedding mode (`--embedding --pooling last`, same private socket, key, and
+environment scrubbing as the generator; no chat template). Building on the GPU takes 26 s for the
+whole collection on the RTX 3070; the GPU is used only while no generator model is loaded, with an
+automatic fall back to the CPU. Searches always use the CPU with a 512-token batch (peak RSS
+0.83 GiB, of which 0.6 GiB are mapped weights; first search including start ≈ 0.7–0.9 s, later
+searches ≈ 0.15–0.2 s), started on the first search and stopped after five idle minutes and at
+exit. Without the model, search uses exact and full-text retrieval and says so.
+
+**Collections and updates.** A collection's directory name records what it was built from
+(`<manifest revision>-f<format>-clojure-<version>-<text|emb-sha12>`). Builds run in a
+`.build-*` directory, are verified (integrity check, chunk and vector counts, dimensions), moved
+into `.staging-*`, checked again, renamed into place, and activated by atomically replacing
+`active.json`. The previous collection is kept for "Use the previous collection"; older ones are
+removed. A failed or cancelled build removes its directory and leaves the active collection in use.
+An update is offered when the manifest revision, the runtime's Clojure version, or the index format
+differs, when the embedding model is installed but the collection has no vectors, or when it was
+built with another embedding model. Building installs the pinned Java runtime and Clojure first if
+they are missing.
+
+**Reference data.** Retrieved text is presented to models only through
+`clojurecraft_knowledge::prompt`: one optional section labelled as reference material, each excerpt
+between numbered `[excerpt N]` delimiters with title, kind, URL, and license; delimiter-like text
+inside excerpts is neutralised. The section is optional in the context policy (dropped whole, never
+shortened). Generated implementations record the excerpts used as `DocumentationRef` (URL, title,
+symbol, namespace, Clojure version, collection version).
+
+**Interface.** The Knowledge sources page shows the active collection (version, Clojure version,
+contents, semantic search, build date, size), update reasons, install/update/rebuild with phase
+progress and cancellation, failures with "Try again" and (for embedding failures) "Build without
+semantic search", rollback, sources with licenses and attribution, the embedding model (download
+with progress, cancel, resume, repair, remove), and a search browser whose results expand to the
+full text with link, license, revision, and attribution. The right column's Sources tab lists the
+documentation recorded for the implementation and searches documentation related to the
+specification (description and steps).
 
 ### Main workspace
 
@@ -492,3 +587,9 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
 8. Model catalog entries are recommended only when `smoke-tested`; Qwen2.5-Coder 1.5B and 7B are
    the only ones so far, so machines with large budgets are still recommended a 7B model.
 9. Per-model GPU layer and context settings are global, not per model.
+10. The application finds the sandbox helper next to its own executable. `cargo run` builds only
+    the application; run `cargo build --workspace` once so the helper exists. Packaging must place
+    it next to the binary.
+11. The embedding model has been validated on Linux (CUDA and CPU) only; Metal is untested.
+12. The retrieval evaluation set is small (36 queries) and written by us; it guides weights but is
+    not a benchmark. It should grow with real specifications once generation exists.

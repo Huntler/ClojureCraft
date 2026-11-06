@@ -1,0 +1,476 @@
+{
+ "clojure_version": "1.12.6",
+ "entries": [
+  {
+   "ns": "clojure.core",
+   "name": "if",
+   "kind": "special-form",
+   "arglists": [
+    "(if test then else?)"
+   ],
+   "doc": "Evaluates test. If not the singular values nil or false,\n  evaluates and yields then, otherwise, evaluates and yields else. If\n  else is not supplied it defaults to nil.",
+   "added": null,
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "assoc-in",
+   "kind": "function",
+   "arglists": [
+    "[m [k & ks] v]"
+   ],
+   "doc": "Associates a value in a nested associative structure, where ks is a\n  sequence of keys and v is the new value and returns a new nested structure.\n  If any levels do not exist, hash-maps will be created.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "distinct",
+   "kind": "function",
+   "arglists": [
+    "[]",
+    "[coll]"
+   ],
+   "doc": "Returns a lazy sequence of the elements of coll with duplicates removed.\n  Returns a stateful transducer when no collection is provided.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "eval",
+   "kind": "function",
+   "arglists": [
+    "[form]"
+   ],
+   "doc": "Evaluates the form data structure (not text!) and returns the result.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "filter",
+   "kind": "function",
+   "arglists": [
+    "[pred]",
+    "[pred coll]"
+   ],
+   "doc": "Returns a lazy sequence of the items in coll for which\n  (pred item) returns logical true. pred must be free of side-effects.\n  Returns a transducer when no collection is provided.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "frequencies",
+   "kind": "function",
+   "arglists": [
+    "[coll]"
+   ],
+   "doc": "Returns a map from distinct items in coll to the number of times\n  they appear.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "get-in",
+   "kind": "function",
+   "arglists": [
+    "[m ks]",
+    "[m ks not-found]"
+   ],
+   "doc": "Returns the value in a nested associative structure,\n  where ks is a sequence of keys. Returns nil if the key\n  is not present, or the not-found value if supplied.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "group-by",
+   "kind": "function",
+   "arglists": [
+    "[f coll]"
+   ],
+   "doc": "Returns a map of the elements of coll keyed by the result of\n  f on each element. The value at each key will be a vector of the\n  corresponding elements, in the order they appeared in coll.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "into",
+   "kind": "function",
+   "arglists": [
+    "[]",
+    "[to]",
+    "[to from]",
+    "[to xform from]"
+   ],
+   "doc": "Returns a new coll consisting of to with all of the items of\n  from conjoined. A transducer may be supplied.\n  (into x) returns x. (into) returns [].",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "keep",
+   "kind": "function",
+   "arglists": [
+    "[f]",
+    "[f coll]"
+   ],
+   "doc": "Returns a lazy sequence of the non-nil results of (f item). Note,\n  this means false return values will be included.  f must be free of\n  side-effects.  Returns a transducer when no collection is provided.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "keys",
+   "kind": "function",
+   "arglists": [
+    "[map]"
+   ],
+   "doc": "Returns a sequence of the map's keys, in the same order as (seq map).",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "let",
+   "kind": "macro",
+   "arglists": [
+    "[bindings & body]"
+   ],
+   "doc": "binding => binding-form init-expr\n  binding-form => name, or destructuring-form\n  destructuring-form => map-destructure-form, or seq-destructure-form\n\n  Evaluates the exprs in a lexical context in which the symbols in\n  the binding-forms are bound to their respective init-exprs or parts\n  therein.\n\n  See https://clojure.org/reference/special_forms#binding-forms for\n  more information about destructuring.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "map",
+   "kind": "function",
+   "arglists": [
+    "[f]",
+    "[f coll]",
+    "[f c1 c2]",
+    "[f c1 c2 c3]",
+    "[f c1 c2 c3 & colls]"
+   ],
+   "doc": "Returns a lazy sequence consisting of the result of applying f to\n  the set of first items of each coll, followed by applying f to the\n  set of second items in each coll, until any one of the colls is\n  exhausted.  Any remaining items in other colls are ignored. Function\n  f should accept number-of-colls arguments. Returns a transducer when\n  no collection is provided.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "mapcat",
+   "kind": "function",
+   "arglists": [
+    "[f]",
+    "[f & colls]"
+   ],
+   "doc": "Returns the result of applying concat to the result of applying map\n  to f and colls.  Thus function f should return a collection. Returns\n  a transducer when no collections are provided",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "max-key",
+   "kind": "function",
+   "arglists": [
+    "[k x]",
+    "[k x y]",
+    "[k x y & more]"
+   ],
+   "doc": "Returns the x for which (k x), a number, is greatest.\n\n  If there are multiple such xs, the last one is returned.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "merge-with",
+   "kind": "function",
+   "arglists": [
+    "[f & maps]"
+   ],
+   "doc": "Returns a map that consists of the rest of the maps conj-ed onto\n  the first.  If a key occurs in more than one map, the mapping(s)\n  from the latter (left-to-right) will be combined with the mapping in\n  the result by calling (f val-in-result val-in-latter).",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "min-key",
+   "kind": "function",
+   "arglists": [
+    "[k x]",
+    "[k x y]",
+    "[k x y & more]"
+   ],
+   "doc": "Returns the x for which (k x), a number, is least.\n\n  If there are multiple such xs, the last one is returned.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "parse-long",
+   "kind": "function",
+   "arglists": [
+    "[s]"
+   ],
+   "doc": "Parse string of decimal digits with optional leading -/+ and return a\n  Long value, or nil if parse fails",
+   "added": "1.11",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "partition-by",
+   "kind": "function",
+   "arglists": [
+    "[f]",
+    "[f coll]"
+   ],
+   "doc": "Applies f to each value in coll, splitting it each time f returns a\n   new value.  Returns a lazy seq of partitions.  Returns a stateful\n   transducer when no collection is provided.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "partitionv",
+   "kind": "function",
+   "arglists": [
+    "[n coll]",
+    "[n step coll]",
+    "[n step pad coll]"
+   ],
+   "doc": "Returns a lazy sequence of vectors of n items each, at offsets step\n  apart. If step is not supplied, defaults to n, i.e. the partitions\n  do not overlap. If a pad collection is supplied, use its elements as\n  necessary to complete last partition upto n items. In case there are\n  not enough padding elements, return a partition with less than n items.",
+   "added": "1.12",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "reduce",
+   "kind": "function",
+   "arglists": [
+    "[f coll]",
+    "[f val coll]"
+   ],
+   "doc": "f should be a function of 2 arguments. If val is not supplied,\n  returns the result of applying f to the first 2 items in coll, then\n  applying f to that result and the 3rd item, etc. If coll contains no\n  items, f must accept no arguments as well, and reduce returns the\n  result of calling f with no arguments.  If coll has only 1 item, it\n  is returned and f is not called.  If val is supplied, returns the\n  result of applying f to val and the first item in coll, then\n  applying f to that result and the 2nd item, etc. If coll contains no\n  items, returns val and f is not called.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "remove",
+   "kind": "function",
+   "arglists": [
+    "[pred]",
+    "[pred coll]"
+   ],
+   "doc": "Returns a lazy sequence of the items in coll for which\n  (pred item) returns logical false. pred must be free of side-effects.\n  Returns a transducer when no collection is provided.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "select-keys",
+   "kind": "function",
+   "arglists": [
+    "[map keyseq]"
+   ],
+   "doc": "Returns a map containing only those entries in map whose key is in keys",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "slurp",
+   "kind": "function",
+   "arglists": [
+    "[f & opts]"
+   ],
+   "doc": "Opens a reader on f and reads all its contents, returning a string.\n  See clojure.java.io/reader for a complete list of supported arguments.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "sort-by",
+   "kind": "function",
+   "arglists": [
+    "[keyfn coll]",
+    "[keyfn comp coll]"
+   ],
+   "doc": "Returns a sorted sequence of the items in coll, where the sort\n  order is determined by comparing (keyfn item).  If no comparator is\n  supplied, uses compare.  comparator must implement\n  java.util.Comparator.  Guaranteed to be stable: equal elements will\n  not be reordered.  If coll is a Java array, it will be modified.  To\n  avoid this, sort a copy of the array.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "update-in",
+   "kind": "function",
+   "arglists": [
+    "[m ks f & args]"
+   ],
+   "doc": "'Updates' a value in a nested associative structure, where ks is a\n  sequence of keys and f is a function that will take the old value\n  and any supplied args and return the new value, and returns a new\n  nested structure.  If any levels do not exist, hash-maps will be\n  created.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "update-keys",
+   "kind": "function",
+   "arglists": [
+    "[m f]"
+   ],
+   "doc": "m f => {(f k) v ...}\n\n  Given a map m and a function f of 1-argument, returns a new map whose\n  keys are the result of applying f to the keys of m, mapped to the\n  corresponding values of m.\n  f must return a unique key for each key of m, else the behavior is undefined.",
+   "added": "1.11",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "update-vals",
+   "kind": "function",
+   "arglists": [
+    "[m f]"
+   ],
+   "doc": "m f => {k (f v) ...}\n\n  Given a map m and a function f of 1-argument, returns a new map where the keys of m\n  are mapped to result of applying f to the corresponding values of m.",
+   "added": "1.11",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "vals",
+   "kind": "function",
+   "arglists": [
+    "[map]"
+   ],
+   "doc": "Returns a sequence of the map's values, in the same order as (seq map).",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "when-let",
+   "kind": "macro",
+   "arglists": [
+    "[bindings & body]"
+   ],
+   "doc": "bindings => binding-form test\n\n  When test is true, evaluates body with binding-form bound to the value of test",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.core",
+   "name": "zipmap",
+   "kind": "function",
+   "arglists": [
+    "[keys vals]"
+   ],
+   "doc": "Returns a map with the keys mapped to the corresponding vals.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.string",
+   "name": "join",
+   "kind": "function",
+   "arglists": [
+    "[coll]",
+    "[separator coll]"
+   ],
+   "doc": "Returns a string of all elements in coll, as returned by (seq coll),\n   separated by an optional separator.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.string",
+   "name": "split",
+   "kind": "function",
+   "arglists": [
+    "[s re]",
+    "[s re limit]"
+   ],
+   "doc": "Splits string on a regular expression.  Optional argument limit is\n  the maximum number of parts. Not lazy. Returns vector of the parts.\n  Trailing empty strings are not returned - pass limit of -1 to return all.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.string",
+   "name": "upper-case",
+   "kind": "function",
+   "arglists": [
+    "[s]"
+   ],
+   "doc": "Converts string to all upper-case.",
+   "added": "1.2",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.set",
+   "name": "index",
+   "kind": "function",
+   "arglists": [
+    "[xrel ks]"
+   ],
+   "doc": "Returns a map of the distinct values of ks in the xrel mapped to a\n  set of the maps in xrel with the corresponding values of ks.",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.set",
+   "name": "rename-keys",
+   "kind": "function",
+   "arglists": [
+    "[map kmap]"
+   ],
+   "doc": "Returns the map with the keys in kmap renamed to the vals in kmap",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  },
+  {
+   "ns": "clojure.set",
+   "name": "union",
+   "kind": "function",
+   "arglists": [
+    "[]",
+    "[s1]",
+    "[s1 s2]",
+    "[s1 s2 & sets]"
+   ],
+   "doc": "Return a set that is the union of the input sets",
+   "added": "1.0",
+   "deprecated": null,
+   "dynamic": false
+  }
+ ]
+}

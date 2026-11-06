@@ -80,8 +80,6 @@ pub struct Snapshot {
     pub problems: Vec<(String, Vec<FileProblem>)>,
     pub unreadable: Vec<String>,
     pub usage: DiskUsage,
-    pub java: bool,
-    pub clojure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -426,7 +424,6 @@ impl InferenceState {
         let (Some(dirs), Some(manifest)) = (self.dirs.clone(), self.manifest.clone()) else {
             return;
         };
-        let platform = self.platform.clone();
         let emit = self.emit();
         thread::spawn(move || {
             let builds = components::llama_builds(&manifest, &dirs);
@@ -449,8 +446,6 @@ impl InferenceState {
                 unreadable: unreadable.iter().map(ToString::to_string).collect(),
                 models,
                 usage: disk_usage(&dirs),
-                java: components::java(&manifest, &dirs, &platform).is_some(),
-                clojure: components::clojure_jars(&manifest, &dirs).is_some(),
             })));
         });
     }

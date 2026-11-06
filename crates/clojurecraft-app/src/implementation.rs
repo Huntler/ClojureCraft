@@ -1,11 +1,23 @@
 //! The right column: the current implementation and its result, step, and source views.
 
 use clojurecraft_domain::FunctionDocument;
+use clojurecraft_knowledge::Query;
 use egui::{Id, RichText, Ui};
 
 use crate::edn_view;
 use crate::inference::Missing;
+use crate::knowledge::{KnowledgeState, Slot};
+use crate::knowledge_view;
 use crate::theme;
+
+/// Longest query built from a specification; retrieval needs the gist, not every word.
+const SPEC_QUERY_CHARS: usize = 1200;
+
+pub enum ColumnAction {
+    None,
+    OpenSetup,
+    OpenKnowledge,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
@@ -29,9 +41,15 @@ impl Tab {
     }
 }
 
-/// Shows the column; returns true when the user asked to open setup.
-pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>, missing: &[Missing]) -> bool {
-    let mut open_setup = false;
+/// Shows the column; returns what the user asked to open.
+pub fn show(
+    ui: &mut Ui,
+    tab: &mut Tab,
+    doc: Option<&FunctionDocument>,
+    missing: &[Missing],
+    knowledge: &mut KnowledgeState,
+) -> ColumnAction {
+    let mut action = ColumnAction::None;
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().button_padding.x = 6.0;
@@ -60,14 +78,14 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>, missing:
                         .color(theme::MUTED),
                 );
                 if ui.button("Open setup").clicked() {
-                    open_setup = true;
+                    action = ColumnAction::OpenSetup;
                 }
             });
         ui.add_space(6.0);
     }
     let Some(doc) = doc else {
         empty(ui, "Open or create a function to see its implementation.");
-        return open_setup;
+        return action;
     };
     egui::ScrollArea::vertical()
         .id_salt("right-column")
@@ -76,9 +94,13 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>, missing:
             Tab::Implementation => implementation(ui, doc),
             Tab::Result => result(ui, doc),
             Tab::Steps => steps(ui, doc),
-            Tab::Sources => sources(ui, doc),
+            Tab::Sources => {
+                if sources(ui, doc, knowledge) {
+                    action = ColumnAction::OpenKnowledge;
+                }
+            }
         });
-    open_setup
+    action
 }
 
 fn empty(ui: &mut Ui, text: &str) {
@@ -143,18 +165,39 @@ fn steps(ui: &mut Ui, doc: &FunctionDocument) {
     );
 }
 
-fn sources(ui: &mut Ui, doc: &FunctionDocument) {
-    let docs = doc
+/// The text searched for a function's related documentation: description, then steps.
+fn spec_query(doc: &FunctionDocument) -> String {
+    let mut text = doc.description.trim().to_owned();
+    for step in &doc.steps {
+        let t = step.text.trim();
+        if !t.is_empty() {
+            text.push('\n');
+            text.push_str(t);
+        }
+    }
+    let mut end = text.len().min(SPEC_QUERY_CHARS);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+/// Documentation used by the implementation, and a search for documentation related to the
+/// specification. Returns true when the user asked to open the knowledge page.
+fn sources(ui: &mut Ui, doc: &FunctionDocument, knowledge: &mut KnowledgeState) -> bool {
+    let used = doc
         .implementation
         .as_ref()
         .and_then(|i| i.generation.as_ref())
         .map(|g| g.documentation.as_slice())
         .unwrap_or_default();
-    if docs.is_empty() {
-        empty(ui, "No documentation was used for this implementation.");
-        return;
+    ui.add_space(8.0);
+    ui.label(RichText::new("Used for this implementation").strong());
+    if used.is_empty() {
+        ui.label(RichText::new("No documentation was used for this implementation.").color(theme::MUTED));
     }
-    for d in docs {
+    for d in used {
         ui.label(RichText::new(&d.title).strong());
         let symbol = match (&d.namespace, &d.symbol) {
             (Some(ns), Some(sym)) => format!("{ns}/{sym} · "),
@@ -163,12 +206,36 @@ fn sources(ui: &mut Ui, doc: &FunctionDocument) {
         };
         ui.label(
             RichText::new(format!(
-                "{symbol}Clojure {} · {}",
-                d.clojure_version, d.source_url
+                "{symbol}Clojure {} · collection {} · {}",
+                d.clojure_version, d.collection_revision, d.source_url
             ))
             .small()
             .color(theme::MUTED),
         );
         ui.add_space(6.0);
     }
+    ui.add_space(12.0);
+    ui.label(RichText::new("Related documentation").strong());
+    let Some(active) = knowledge.active().map(|a| a.info.clojure_version.clone()) else {
+        ui.label(
+            RichText::new("Install the Clojure documentation to find related functions and guides.")
+                .color(theme::MUTED),
+        );
+        return ui.button("Open knowledge sources").clicked();
+    };
+    let text = spec_query(doc);
+    let slot = Slot::Function(doc.id);
+    let enabled = !text.trim().is_empty();
+    let r = ui
+        .add_enabled(enabled, egui::Button::new("Search for this specification"))
+        .on_disabled_hover_text("Write a description or steps first.");
+    if r.clicked() {
+        let mut q = Query::new(text);
+        q.clojure_version = Some(active);
+        q.limit = 8;
+        knowledge.search(slot, q);
+    }
+    let s = knowledge.search_state(slot);
+    knowledge_view::results(ui, s, "related");
+    false
 }

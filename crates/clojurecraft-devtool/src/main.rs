@@ -8,7 +8,13 @@
 //! clojurecraft-devtool fetch-model <model-id> <quant>
 //! clojurecraft-devtool smoke-model <model-id> <quant> <backend> [context]
 //! clojurecraft-devtool sandbox-demo
+//! clojurecraft-devtool fetch-embedding-model
+//! clojurecraft-devtool knowledge-build [text|cpu|gpu]
+//! clojurecraft-devtool knowledge-search <query> [--all]
+//! clojurecraft-devtool knowledge-eval
 //! ```
+
+mod knowledge;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -524,12 +530,18 @@ fn main() -> Result<()> {
             Some(layers.parse()?),
         ),
         ["sandbox-demo"] => sandbox_demo(),
+        ["fetch-embedding-model"] => knowledge::fetch_embedding_model(),
+        ["knowledge-build"] => knowledge::build(knowledge::EmbedMode::Gpu),
+        ["knowledge-build", mode] => knowledge::build(knowledge::EmbedMode::parse(mode)?),
+        ["knowledge-search", q] => knowledge::search(q, false),
+        ["knowledge-search", q, "--all"] => knowledge::search(q, true),
+        ["knowledge-eval"] => knowledge::eval(),
         ["run-reply", path] => {
             run_generated(&std::fs::read_to_string(path)?);
             Ok(())
         }
         _ => bail!(
-            "usage: hardware | install-runtime [backend] | fetch-model <id> <quant> | smoke-model <id> <quant> <backend> [ctx] | smoke-file <path.gguf> <backend> [ctx] [gpu-layers] | run-reply <reply.txt> | sandbox-demo"
+            "usage: hardware | install-runtime [backend] | fetch-model <id> <quant> | smoke-model <id> <quant> <backend> [ctx] | smoke-file <path.gguf> <backend> [ctx] [gpu-layers] | run-reply <reply.txt> | sandbox-demo | fetch-embedding-model | knowledge-build [text|cpu|gpu] | knowledge-search <query> [--all] | knowledge-eval"
         ),
     }
 }

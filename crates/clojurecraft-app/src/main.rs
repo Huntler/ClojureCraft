@@ -8,6 +8,8 @@ mod implementation;
 mod inference;
 mod jobs;
 mod keys;
+mod knowledge;
+mod knowledge_view;
 mod library;
 mod model;
 mod model_view;

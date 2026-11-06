@@ -161,3 +161,23 @@ Release build against an empty scratch data directory (`CLOJURECRAFT_DATA_DIR`),
 | Clipboard: text copied in another application pasted into a field with Ctrl+V, and text copied from a field read back from the X clipboard (X11) | works |
 | CPU-only and Apple Silicon recommendations | covered by tests with mock hardware reports only |
 | macOS (Keychain, Metal, setup) | not tested (no Mac available) |
+
+### Documentation retrieval — 2026-11-06
+
+Debug build on the Linux reference machine, real network, llama.cpp b12138 CUDA, application
+driven with synthetic X11 input.
+
+| Check | Result |
+| --- | --- |
+| API extraction script in the sandbox: Clojure 1.12.6, 732 documented vars and special forms, 0.6 s | works |
+| 19 pinned clojure.org pages downloaded and SHA-256-verified; text-only collection built (1,032 chunks, 1.6 MiB) in 7 s | works |
+| Qwen3-Embedding-0.6B Q8_0 (610 MiB) downloaded through the model store and hash-verified | works |
+| Collection with embeddings built on the GPU in 26 s (7.7 MiB; 6.1 MiB after rebuild); verified and activated; previous collection kept | works |
+| CPU query embedder (`--device none`, 512-token batch): peak RSS 843 MiB (2048-token batch: 1011 MiB); load 0.7 s; searches 0.15–0.2 s | measured |
+| Retrieval evaluation (36 queries): hit@5 50 % text only, 91.7 % semantic only and combined; MRR 0.747 combined | measured |
+| Knowledge sources page: status, sources and licenses, embedding model, browser; "count how often each value occurs" returns `clojure.core/frequencies` first; expanded result shows text, link, license, revision, attribution | works |
+| Sources tab of a saved function: related documentation for its description (group-by, sorted maps, comparators guide) in 0.9 s including embedder start | works |
+| Rebuild from the page with progress (embedding phase shown), activation notice, search reloaded; rollback target kept | works (rollback target was lost before a fix in this session) |
+| Application exit stops the embedding server (no `llama-server` left running) | works |
+| Rollback button, failure banner, embedding-model removal, cancellation from the UI | covered by automated tests of the underlying operations; not clicked through |
+| macOS | not tested (no Mac available) |

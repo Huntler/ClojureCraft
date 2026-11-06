@@ -186,7 +186,12 @@ impl ComponentDir {
             let _ = fs::remove_dir_all(&trash);
         }
         fs::rename(&staging, &final_dir).map_err(io_err(&final_dir))?;
-        let previous = self.active().map(|i| i.version).filter(|v| v != version);
+        // Re-installing the active version keeps the existing rollback target.
+        let previous = match self.pointer() {
+            Some(p) if p.version == version => p.previous,
+            Some(p) => Some(p.version),
+            None => None,
+        };
         self.write_pointer(&ActivePointer {
             version: version.to_owned(),
             previous,
@@ -259,6 +264,10 @@ impl ComponentDir {
             previous: Some(ptr.version),
         })?;
         Ok(Installed { version: prev, dir })
+    }
+
+    fn pointer(&self) -> Option<ActivePointer> {
+        serde_json::from_str(&fs::read_to_string(self.pointer_path()).ok()?).ok()
     }
 
     fn write_pointer(&self, ptr: &ActivePointer) -> Result<(), InstallError> {

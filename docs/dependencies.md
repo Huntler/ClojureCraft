@@ -14,6 +14,9 @@ each one carries.
 | Clojure | 1.12.6 | EPL-1.0 | Show the license notice; exported user code is not a derivative work of the JVM runtime |
 | `spec.alpha`, `core.specs.alpha` | 0.5.238, 0.4.74 | EPL-1.0 | As above |
 | Model weights | per catalog | Apache-2.0 (current catalog) | Show each model's license before download; never auto-accept gated-model agreements |
+| Qwen3-Embedding-0.6B GGUF (`Qwen/Qwen3-Embedding-0.6B-GGUF`) | commit `370f27d7`, Q8_0 | Apache-2.0 | Optional; license shown before download |
+| clojure.org pages (`clojure/clojure-site`) | commit `d664fff7`, 19 pages | EPL-1.0 | Indexed locally, never redistributed by us; attribution ("Copyright (c) Rich Hickey and contributors") shown with every excerpt and on the Knowledge sources page |
+| Clojure docstrings | from the installed Clojure 1.12.6 | EPL-1.0 | Read from the runtime; attribution shown as above |
 
 If a later release bundles any of these instead of downloading them, redistribution obligations
 (notably the GPL-2.0 CE source offer for the JRE and the CUDA EULA) must be revisited.
@@ -48,6 +51,8 @@ Notable obligations:
   (Linux, pure Rust over the `zbus` already used by accesskit; session encryption through the
   RustCrypto `aes`, `cbc`, `hkdf` crates), `apple-native-keyring-store` and `security-framework`
   (macOS only). All MIT OR Apache-2.0.
+- Test fixtures in `crates/clojurecraft-knowledge/tests/fixtures/` contain short EPL-1.0 excerpts
+  of Clojure docstrings and clojure.org pages, with attribution in the fixture README.
 - `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) for free-space queries
   (`statvfs`) and for signalling the llama.cpp server process, without unsafe code.
 - The local inference client (`clojurecraft-inference`) has its own small HTTP/1.1

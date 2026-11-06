@@ -131,6 +131,7 @@ impl Engine for LlamaEngine {
             threads: spec.threads,
             pid_file: spec.pid_file.clone(),
             socket_base: self.socket_base.clone(),
+            embedding: None,
         };
         let mut server = LlamaServer::start(&cfg).map_err(|e| (e, String::new()))?;
         phase(LoadPhase::Loading);

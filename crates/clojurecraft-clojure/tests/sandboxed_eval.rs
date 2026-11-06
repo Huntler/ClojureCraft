@@ -223,3 +223,42 @@ fn explicit_refer_is_allowed_but_refer_all_is_not() {
         bad.response
     );
 }
+
+#[test]
+fn api_documentation_comes_from_the_installed_clojure() {
+    let Some(rt) = runtime() else { return };
+    let limits = Limits {
+        wall: Duration::from_secs(60),
+        max_output_bytes: 16 << 20,
+        ..Limits::default()
+    };
+    let out = rt
+        .run_script("api-docs", clojurecraft_clojure::API_DOCS_SOURCE, b"", &limits)
+        .expect("run");
+    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+    let doc: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("JSON");
+    let manifest = Manifest::bundled().expect("manifest");
+    assert_eq!(doc["clojure_version"], manifest.clojure.version.as_str());
+    let entries = doc["entries"].as_array().expect("entries");
+    let find = |ns: &str, name: &str| {
+        entries
+            .iter()
+            .find(|e| e["ns"] == ns && e["name"] == name)
+            .unwrap_or_else(|| panic!("{ns}/{name} missing"))
+    };
+    let group_by = find("clojure.core", "group-by");
+    assert_eq!(group_by["kind"], "function");
+    assert_eq!(group_by["added"], "1.2");
+    assert_eq!(group_by["arglists"][0], "[f coll]");
+    assert!(group_by["doc"].as_str().unwrap_or_default().contains("keyed by"));
+    assert_eq!(find("clojure.core", "when-let")["kind"], "macro");
+    assert_eq!(find("clojure.core", "if")["kind"], "special-form");
+    find("clojure.string", "join");
+    find("clojure.set", "rename-keys");
+    // Private vars are not documentation.
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["ns"] == "clojure.core" && e["name"] == "spread")
+    );
+}
