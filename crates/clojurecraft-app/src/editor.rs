@@ -1,9 +1,8 @@
-//! The specification editor in the centre column: name, description, examples, contract, and
-//! ordered transformation steps.
+//! The specification editor in the centre column: name, description, examples, contract,
+//! ordered transformation steps, and the model's interpretation with its questions.
 
 use clojurecraft_domain::{
-    Contract, ContractStatus, Example, ExampleId, ExampleInput, FunctionId, OrderingRequirement, RevisionPin,
-    Step, StepId,
+    Contract, Example, ExampleId, ExampleInput, FunctionId, RevisionPin, Step, StepId,
 };
 use egui::text::{CCursor, CCursorRange};
 use egui::{Id, RichText, TextStyle, Ui};
@@ -12,6 +11,7 @@ use crate::edn_view::{self, EdnCache};
 use crate::keys::{self, ADD_STEP_AFTER, MOVE_STEP_DOWN, MOVE_STEP_UP};
 use crate::session::{OpenDocument, SaveStatus};
 use crate::theme;
+use clojurecraft_workflow::assistant::{JobKind, Phase, Report};
 
 /// A keyboard focus the application wants to move to on the next frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,20 @@ pub enum Action {
     Trash,
     RetrySave,
     Removed { message: String, undo: Undo },
+    Interpret,
+    ProposeContract,
+    CancelJob,
+    DismissReport,
+}
+
+/// The model's availability and work for the open function.
+pub struct AssistStatus {
+    /// Why no model work can start right now.
+    pub blocked: Option<String>,
+    /// A job running for this function.
+    pub job: Option<(JobKind, Phase)>,
+    /// How the last job for this function ended.
+    pub report: Option<Report>,
 }
 
 pub struct EditorContext<'a> {
@@ -69,6 +83,7 @@ pub struct EditorContext<'a> {
     pub focus: &'a mut Option<Focus>,
     pub expanded: &'a mut Option<ExpandTarget>,
     pub actions: &'a mut Vec<Action>,
+    pub assist: &'a AssistStatus,
 }
 
 pub fn name_id(function: FunctionId) -> Id {
@@ -101,14 +116,16 @@ pub fn show(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
 
     changed |= examples(ui, open, cx);
     ui.add_space(18.0);
-    changed |= contract(ui, open, cx);
+    changed |= crate::contract_view::contract(ui, open, cx);
     ui.add_space(18.0);
     changed |= steps(ui, open, cx);
+    ui.add_space(18.0);
+    changed |= crate::interpretation_view::interpretation(ui, open, cx);
     ui.add_space(24.0);
     changed
 }
 
-fn section(ui: &mut Ui, title: &str, subtitle: &str) {
+pub fn section(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.label(RichText::new(title).text_style(TextStyle::Heading).size(16.0));
     if !subtitle.is_empty() {
         ui.label(RichText::new(subtitle).small().color(theme::MUTED));
@@ -453,150 +470,6 @@ fn expanded(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
     );
     if close {
         *cx.expanded = None;
-    }
-    changed
-}
-
-fn contract(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) -> bool {
-    let function = open.doc.id;
-    let mut changed = false;
-    section(
-        ui,
-        "Contract",
-        "Optional. Input and output shapes, nil handling, and ordering stated explicitly.",
-    );
-    let Some(contract) = &mut open.doc.contract else {
-        if ui.button("Add contract").clicked() {
-            open.doc.contract = Some(Contract::empty(ContractStatus::Accepted));
-            changed = true;
-        }
-        return changed;
-    };
-    let mut remove = false;
-    egui::Frame::new()
-        .stroke(theme::hairline())
-        .corner_radius(theme::RADIUS)
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            if contract.status == ContractStatus::Proposed {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("Proposed. This contract is not a requirement until you accept it.")
-                            .color(theme::WARN),
-                    );
-                    if ui.button("Accept").clicked() {
-                        contract.status = ContractStatus::Accepted;
-                        changed = true;
-                    }
-                    if ui.button("Discard").clicked() {
-                        remove = true;
-                    }
-                });
-                ui.add_space(4.0);
-            }
-            let id = |part: &str| Id::unique(("contract", function, part.to_owned()));
-            ui.label(RichText::new("Input").strong());
-            changed |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut contract.input.description)
-                        .id(id("input"))
-                        .hint_text("For example: a vector of order maps with :customer and :amount")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                )
-                .changed();
-            ui.label(RichText::new("Output").strong());
-            changed |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut contract.output.description)
-                        .id(id("output"))
-                        .hint_text("For example: a map from customer id to total amount")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                )
-                .changed();
-            changed |= ordering(ui, function, &mut contract.ordering);
-            let keys = contract.input.keys.len() + contract.output.keys.len();
-            if keys > 0 {
-                ui.label(
-                    RichText::new(format!("{keys} key {}", if keys == 1 { "rule" } else { "rules" }))
-                        .small()
-                        .color(theme::MUTED),
-                );
-            }
-            if !contract.allowed_dependencies.is_empty() {
-                ui.label(
-                    RichText::new(format!(
-                        "Allowed namespaces: {}",
-                        contract.allowed_dependencies.join(", ")
-                    ))
-                    .small()
-                    .color(theme::MUTED),
-                );
-            }
-            ui.label(RichText::new("Notes").strong());
-            changed |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut contract.notes)
-                        .id(id("notes"))
-                        .hint_text("How missing keys and nil values are treated, and anything else")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                )
-                .changed();
-            if contract.status == ContractStatus::Accepted && ui.button("Remove contract").clicked() {
-                remove = true;
-            }
-        });
-    if remove && let Some(contract) = open.doc.contract.take() {
-        cx.actions.push(Action::Removed {
-            message: "Removed the contract".into(),
-            undo: Undo::Contract {
-                function,
-                contract: Box::new(contract),
-            },
-        });
-        changed = true;
-    }
-    changed
-}
-
-fn ordering(ui: &mut Ui, function: FunctionId, ordering: &mut OrderingRequirement) -> bool {
-    let mut changed = false;
-    let label = |o: &OrderingRequirement| match o {
-        OrderingRequirement::Unspecified => "Not specified",
-        OrderingRequirement::PreserveInput => "Same order as the input",
-        OrderingRequirement::Unordered => "Order does not matter",
-        OrderingRequirement::Sorted(_) => "Sorted",
-    };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Output order").strong());
-        egui::ComboBox::from_id_salt(("ordering", function))
-            .selected_text(label(ordering))
-            .show_ui(ui, |ui| {
-                for option in [
-                    OrderingRequirement::Unspecified,
-                    OrderingRequirement::PreserveInput,
-                    OrderingRequirement::Unordered,
-                    OrderingRequirement::Sorted(String::new()),
-                ] {
-                    let selected = std::mem::discriminant(&option) == std::mem::discriminant(ordering);
-                    if ui.selectable_label(selected, label(&option)).clicked() && !selected {
-                        *ordering = option;
-                        changed = true;
-                    }
-                }
-            });
-    });
-    if let OrderingRequirement::Sorted(by) = ordering {
-        changed |= ui
-            .add(
-                egui::TextEdit::singleline(by)
-                    .id(Id::unique(("contract-sorted", function)))
-                    .hint_text("Sorted by… (for example: descending total, then customer id)")
-                    .desired_width(f32::INFINITY),
-            )
-            .changed();
     }
     changed
 }

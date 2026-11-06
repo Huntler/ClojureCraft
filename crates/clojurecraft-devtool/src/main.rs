@@ -12,8 +12,10 @@
 //! clojurecraft-devtool knowledge-build [text|cpu|gpu]
 //! clojurecraft-devtool knowledge-search <query> [--all]
 //! clojurecraft-devtool knowledge-eval
+//! clojurecraft-devtool generate <spec.toml> <model-id> <quant> <backend> [context] [--interpret] [--contract] [--no-docs]
 //! ```
 
+mod generate;
 mod knowledge;
 
 use std::io::Write;
@@ -25,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clojurecraft_clojure::{ClojureRuntime, EvalRequest, Limits};
+use clojurecraft_clojure::{Call, CallStatus, ClojureRuntime, EvalOutcome, EvalRequest, Limits};
 use clojurecraft_hardware::{Backend, default_budget};
 use clojurecraft_inference::engine::Engine;
 use clojurecraft_inference::http::Control;
@@ -303,6 +305,7 @@ fn smoke_file(
         messages: vec![Message::system(SYSTEM_PROMPT), Message::user(USER_PROMPT)],
         max_tokens: 600,
         temperature: 0.2,
+        top_p: None,
         response_schema: None,
         tools: vec![],
         seed: None,
@@ -367,6 +370,7 @@ fn smoke_file(
             messages: vec![Message::user("Reply with the word ok.")],
             max_tokens: 8,
             temperature: 0.0,
+            top_p: None,
             ..request.clone()
         },
         &control(),
@@ -391,23 +395,62 @@ fn run_generated(reply: &str) {
         Ok(rt) => rt,
         Err(e) => return println!("  generated code: not executed ({e})"),
     };
-    let req = EvalRequest {
+    let req = EvalRequest::new(
         code,
-        function: "summarize-orders".into(),
-        inputs: vec![
-            r#"[{:customer "bob" :amount 3} {:customer "ann" :amount 12.5} {:customer "bob" :amount 1.5}]"#
+        "summarize-orders",
+        vec![Call {
+            input: r#"[{:customer "bob" :amount 3} {:customer "ann" :amount 12.5} {:customer "bob" :amount 1.5}]"#
                 .into(),
-        ],
-        static_checks: true,
-    };
-    match rt.evaluate(&req, &Limits::default()) {
+            expected: None,
+        }],
+    );
+    match rt.evaluate(&req, &Limits::for_request(&req), None) {
         Ok(out) => println!(
             "  sandboxed execution ({:?}, {:.1?}): {}",
             out.status,
             out.elapsed,
-            out.response.trim()
+            describe(&out)
         ),
         Err(e) => println!("  sandboxed execution failed to start: {e}"),
+    }
+}
+
+/// One line about how a harness run went: the first failing stage, or each call's result.
+pub(crate) fn describe(out: &EvalOutcome) -> String {
+    let r = &out.report;
+    for (stage, result) in [("read", &r.read), ("check", &r.check), ("load", &r.load)] {
+        if let Some(Err(e)) = result {
+            return format!("{stage} failed: {} {}", e.class, e.message);
+        }
+    }
+    let lint: Vec<String> = r
+        .lint
+        .iter()
+        .flatten()
+        .map(|f| format!("lint {:?} line {:?}: {}", f.level, f.line, f.message))
+        .collect();
+    let calls: Vec<String> = r
+        .results
+        .iter()
+        .map(|c| match c.status {
+            CallStatus::Ok => format!("#{} = {}", c.index, c.actual.as_deref().unwrap_or("")),
+            CallStatus::Error => format!(
+                "#{} threw {}",
+                c.index,
+                c.error.as_ref().map_or("", |e| e.message.as_str())
+            ),
+            other => format!("#{} {other:?}", c.index),
+        })
+        .collect();
+    let mut parts = lint;
+    parts.extend(calls);
+    if let Some(i) = r.running {
+        parts.push(format!("#{i} was running when the process ended"));
+    }
+    if parts.is_empty() {
+        out.stderr.lines().last().unwrap_or("").to_owned()
+    } else {
+        parts.join("; ").chars().take(400).collect()
     }
 }
 
@@ -485,27 +528,23 @@ fn sandbox_demo() -> Result<()> {
         ),
     ];
     for (label, code, checks) in cases {
-        let req = EvalRequest {
-            code: (*code).to_owned(),
-            function: "f".into(),
-            inputs: vec!["[1 2 3]".into()],
-            static_checks: *checks,
-        };
-        let limits = if label.starts_with("runaway") {
-            Limits {
-                wall: Duration::from_secs(8),
-                ..limits
-            }
-        } else {
-            limits
-        };
-        let out = rt.evaluate(&req, &limits)?;
-        let detail = if out.response.is_empty() {
-            out.stderr.lines().last().unwrap_or("").to_owned()
-        } else {
-            out.response.trim().chars().take(260).collect()
-        };
-        println!("[{label}] {:?} in {:.1?}\n    {detail}", out.status, out.elapsed);
+        let mut req = EvalRequest::new(
+            *code,
+            "f",
+            vec![Call {
+                input: "[1 2 3]".into(),
+                expected: None,
+            }],
+        );
+        req.static_checks = *checks;
+        req.lint = *checks;
+        let out = rt.evaluate(&req, &limits, None)?;
+        println!(
+            "[{label}] {:?} in {:.1?}\n    {}",
+            out.status,
+            out.elapsed,
+            describe(&out)
+        );
     }
     Ok(())
 }
@@ -536,6 +575,27 @@ fn main() -> Result<()> {
         ["knowledge-search", q] => knowledge::search(q, false),
         ["knowledge-search", q, "--all"] => knowledge::search(q, true),
         ["knowledge-eval"] => knowledge::eval(),
+        ["generate", spec, id, q, b, rest @ ..] => {
+            let context = rest
+                .iter()
+                .find(|r| !r.starts_with("--"))
+                .map(|c| c.parse())
+                .transpose()?
+                .unwrap_or(8192);
+            generate::run(
+                spec,
+                id,
+                q,
+                b,
+                context,
+                &generate::Options {
+                    verbose: rest.contains(&"--verbose"),
+                    interpret: rest.contains(&"--interpret"),
+                    contract: rest.contains(&"--contract"),
+                    documentation: !rest.contains(&"--no-docs"),
+                },
+            )
+        }
         ["run-reply", path] => {
             run_generated(&std::fs::read_to_string(path)?);
             Ok(())

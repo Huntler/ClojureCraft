@@ -44,6 +44,9 @@ fn report(basis: Basis, diagnostics: Vec<String>) -> ValidationReport {
             duration_ms: None,
         }],
         attempt: None,
+        run: None,
+        source: None,
+        settings: None,
     }
 }
 

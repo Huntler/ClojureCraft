@@ -87,6 +87,67 @@ fn autosave_debounces_and_writes_the_newest_edit() {
 }
 
 #[test]
+fn revisions_recorded_through_the_autosaver_are_ordered_with_draft_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ui_store = open(dir.path());
+    let mut store = open(dir.path());
+    let doc = store.create_function("f").unwrap().document;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    // A long quiet period keeps the older edit queued when the commit arrives.
+    let saver = Autosaver::spawn(open(dir.path()), Duration::from_secs(30), move |e| {
+        sink.lock().unwrap().push(e);
+    });
+    let mut typed = doc.clone();
+    typed.description = "typed".into();
+    saver.submit(typed.clone(), 1);
+    let mut generated = typed.clone();
+    generated.implementation = Some(Implementation::manual("(ns a)\n(defn f [x] x)"));
+    saver.commit(generated.clone(), 2, RevisionReason::new(RevisionKind::Generated));
+    assert!(saver.flush());
+
+    let draft = ui_store.load_draft(doc.id).unwrap();
+    assert_eq!((draft.document, draft.seq), (generated.clone(), 2));
+    assert!(!draft.has_unrevisioned_changes);
+    let history = ui_store.revisions(doc.id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reason.kind, RevisionKind::Generated);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [AutosaveEvent::Committed {
+            function: doc.id,
+            seq: 2,
+            number: 1,
+            created: true,
+        }],
+        "the replaced older edit is never written"
+    );
+
+    // A failed commit still saves the draft as an ordinary edit.
+    events.lock().unwrap().clear();
+    store.save_draft(&generated, 10).unwrap();
+    let mut late = generated.clone();
+    late.description = "late".into();
+    saver.commit(late.clone(), 5, RevisionReason::new(RevisionKind::Generated));
+    assert!(saver.flush());
+    let events = events.lock().unwrap();
+    assert!(
+        matches!(
+            &events[..],
+            [
+                AutosaveEvent::CommitFailed { seq: 5, .. },
+                AutosaveEvent::Superseded {
+                    seq: 5,
+                    stored_seq: 10,
+                    ..
+                }
+            ]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn autosave_reports_permanent_failures_without_retrying() {
     let dir = tempfile::tempdir().unwrap();
     let secrets = Arc::new(SecretRegistry::new());

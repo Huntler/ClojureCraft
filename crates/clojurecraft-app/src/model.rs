@@ -72,7 +72,11 @@ pub struct ModelRuntime {
     pub since: Instant,
     /// The most recent load request and the installed model it used.
     pub loaded: Option<(LoadSpec, String)>,
+    /// A load was requested and the service has not reported on it yet.
+    load_pending: bool,
     pub trial: Trial,
+    /// Request events that are not the trial's, for the specification assistant.
+    pub unclaimed: Vec<ServiceEvent>,
 }
 
 impl Default for ModelRuntime {
@@ -82,7 +86,9 @@ impl Default for ModelRuntime {
             status: ModelStatus::Unloaded,
             since: Instant::now(),
             loaded: None,
+            load_pending: false,
             trial: Trial::default(),
+            unclaimed: Vec::new(),
         }
     }
 }
@@ -215,6 +221,7 @@ impl InferenceState {
         if let Some(service) = &self.model.service {
             service.load(spec.clone());
             self.model.loaded = Some((spec, key));
+            self.model.load_pending = true;
         }
     }
 
@@ -264,6 +271,49 @@ impl InferenceState {
         RemedyAction::None
     }
 
+    /// Makes sure the selected model is loaded (or loading) with the current settings, starting a
+    /// load when needed. Returns the load and the installed model's key.
+    pub fn ensure_model(&mut self) -> Result<(LoadSpec, String), String> {
+        if let Some(m) = self.missing().first() {
+            return Err(m.describe());
+        }
+        let (spec, key) = self.load_spec()?;
+        // A load requested a moment ago counts too; its status has not arrived yet.
+        let current = (self.model.load_pending
+            || matches!(
+                self.model.status,
+                ModelStatus::Ready { .. } | ModelStatus::Loading { .. }
+            ))
+            && self
+                .model
+                .loaded
+                .as_ref()
+                .is_some_and(|(loaded, k)| *k == key && same_load(loaded, &spec));
+        if !current {
+            if self.model.service.is_none() {
+                return Err("The inference service is not running.".into());
+            }
+            self.load_model(false);
+        }
+        Ok((spec, key))
+    }
+
+    /// Queues a request after the model's pending load, if any.
+    pub fn generate(&mut self, request: GenerateRequest) -> Result<RequestId, String> {
+        let service = self
+            .model
+            .service
+            .as_ref()
+            .ok_or("The inference service is not running.")?;
+        Ok(service.generate(request))
+    }
+
+    pub fn cancel_request(&self, id: RequestId) {
+        if let Some(service) = &self.model.service {
+            service.cancel(id);
+        }
+    }
+
     pub fn start_trial(&mut self) {
         let Some(service) = &self.model.service else {
             return;
@@ -304,6 +354,10 @@ impl InferenceState {
             ServiceEvent::Status(status) => {
                 if let ModelStatus::Failed { error, .. } = &status {
                     tracing::warn!(%error, "model failed to load");
+                }
+                // An earlier unload may still report `Unloaded` after a new load was requested.
+                if !matches!(status, ModelStatus::Unloaded) {
+                    self.model.load_pending = false;
                 }
                 self.model.status = status;
                 self.model.since = Instant::now();
@@ -352,8 +406,11 @@ impl InferenceState {
                     }
                 });
             }
-            // Output of requests that are no longer shown.
-            ServiceEvent::Stream { .. } | ServiceEvent::Finished { .. } | ServiceEvent::Tool { .. } => {}
+            // Output of other requests; the assistant applies only those it is waiting for.
+            other @ (ServiceEvent::Stream { .. } | ServiceEvent::Finished { .. }) => {
+                self.model.unclaimed.push(other);
+            }
+            ServiceEvent::Tool { .. } => {}
         }
     }
 }
@@ -483,6 +540,44 @@ mod tests {
         assert_eq!(st.settings.context_limit, Some(8192));
         assert_eq!(st.apply_remedy(&Remedy::SmallerModel), RemedyAction::OpenSettings);
         assert_eq!(st.apply_remedy(&Remedy::CpuBackend), RemedyAction::OpenSetup);
+    }
+
+    #[test]
+    fn a_requested_load_is_not_requested_again_before_it_reports() {
+        let mut st = crate::inference::tests::state();
+        st.model.loaded = Some((dummy_spec(), "k".into()));
+        st.model.load_pending = true;
+        // Status is still `Unloaded`, but the pending load counts as current.
+        assert!(matches!(st.model.status, ModelStatus::Unloaded));
+        st.handle_service(ServiceEvent::Status(ModelStatus::Unloaded));
+        assert!(
+            st.model.load_pending,
+            "a late Unloaded does not clear the pending load"
+        );
+        st.handle_service(ServiceEvent::Status(ModelStatus::Loading {
+            model: "m".into(),
+            phase: clojurecraft_inference::LoadPhase::Starting,
+        }));
+        assert!(!st.model.load_pending);
+    }
+
+    fn dummy_spec() -> LoadSpec {
+        LoadSpec {
+            server: "s".into(),
+            model: "m".into(),
+            label: "m".into(),
+            backend: "CPU".into(),
+            runtime: "b1-cpu".into(),
+            context: 4096,
+            gpu_layers: Some(0),
+            total_layers: None,
+            model_max_context: None,
+            threads: None,
+            load_timeout: Duration::from_secs(1),
+            memory: None,
+            skip_memory_check: false,
+            pid_file: None,
+        }
     }
 
     #[test]

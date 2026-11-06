@@ -1,16 +1,27 @@
 ;; Evaluation harness for candidate transformation functions.
 ;;
 ;; Reads one EDN request from stdin:
-;;   {:code "<source>" :fn "<public fn name>" :inputs ["<edn>" ...] :checks true}
-;; and prints one EDN response to stdout.
+;;   {:code "<source>" :fn "<public fn name>"
+;;    :calls [{:input "<edn>" :expected "<edn>"} ...]   ; :expected is optional
+;;    :checks true :lint true
+;;    :contract {:output {:type :map :keys [{:key "<edn>" :required true :type :integer :nil :disallowed}]}}
+;;    :equality {:float-tolerance 1e-9 :unordered false}
+;;    :call-ms 5000 :max-elements 1000000}
+;; and writes one JSON object per line to stdout as it goes:
+;;   read, check, lint, load       the stages before any call
+;;   start {index}                 a call begins (so a process that dies mid-call is attributable)
+;;   result {index ...}            a call's outcome, comparison, and contract findings
+;;   halted                        a call exceeded its time limit; the process stops without running the rest
+;;   done                          everything ran
 ;;
 ;; The static checks below are a second line of defence that produce clear diagnostics. The
 ;; operating-system sandbox around this JVM is the security boundary.
 
 (ns clojurecraft.harness
   (:require [clojure.edn :as edn]
+            [clojure.string :as string]
             [clojure.walk :as walk])
-  (:import (java.io StringWriter)))
+  (:import (java.io StringWriter Writer)))
 
 (def allowed-namespaces
   '#{clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.zip clojure.data})
@@ -34,8 +45,59 @@
 
 (def allowed-top-level '#{defn defn- def declare})
 
+;; ---------------------------------------------------------------------------------------------
+;; Output
+
+(def ^:private ^Writer raw-out *out*)
+
+(defn- json-string [^String s]
+  (let [sb (StringBuilder. (+ 2 (.length s)))]
+    (.append sb \")
+    (dotimes [i (.length s)]
+      (let [c (.charAt s i)]
+        (case c
+          \" (.append sb "\\\"")
+          \\ (.append sb "\\\\")
+          \newline (.append sb "\\n")
+          \return (.append sb "\\r")
+          \tab (.append sb "\\t")
+          (if (< (int c) 0x20)
+            (.append sb (format "\\u%04x" (int c)))
+            (.append sb c)))))
+    (.append sb \")
+    (.toString sb)))
+
+(defn- json [x]
+  (cond
+    (nil? x) "null"
+    (boolean? x) (str x)
+    (string? x) (json-string x)
+    (keyword? x) (json-string (name x))
+    (integer? x) (str x)
+    (number? x) (let [d (double x)]
+                  (if (or (Double/isNaN d) (Double/isInfinite d)) "null" (str d)))
+    (map? x) (str "{" (string/join "," (map (fn [[k v]] (str (json-string (name k)) ":" (json v))) x)) "}")
+    (coll? x) (str "[" (string/join "," (map json x)) "]")
+    :else (json-string (str x))))
+
+(defn- emit [m]
+  (.write raw-out (str (json m) "\n"))
+  (.flush raw-out))
+
+(defn- bounded-str
+  "Prints `x` readably with collection lengths and nesting bounded, then at most `limit` chars."
+  [x length level limit]
+  (let [s (binding [*print-length* length *print-level* level *print-namespace-maps* false]
+            (pr-str x))]
+    (if (> (count s) limit) (str (subs s 0 limit) " …") s)))
+
+(defn- show [x] (bounded-str x 12 5 240))
+
+;; ---------------------------------------------------------------------------------------------
+;; Static checks
+
 (defn- violation [msg form]
-  (throw (ex-info msg {:phase :check :form (pr-str form)})))
+  (throw (ex-info msg {:phase :check :form (pr-str form) :line (:line (meta form))})))
 
 (defn- check-symbol [aliases sym]
   (let [ns-part (namespace sym)
@@ -112,13 +174,432 @@
     (second (first forms))))
 
 (defn- error-map [phase ^Throwable t]
-  {:status :error
-   :phase (or (:phase (ex-data t)) phase)
-   :class (.getName (class t))
-   :message (str (.getMessage t))
-   :form (:form (ex-data t))})
+  (let [data (ex-data t)
+        root (loop [^Throwable c t]
+               (if (and (instance? clojure.lang.Compiler$CompilerException c) (.getCause c))
+                 (recur (.getCause c))
+                 c))]
+    {:phase (name (or (:phase data) phase))
+     :class (.getName (class root))
+     :message (str (.getMessage root))
+     :line (or (:line data) (:clojure.error/line data))
+     :form (:form data)}))
+
+;; ---------------------------------------------------------------------------------------------
+;; Lint: an analysis of the code after macroexpansion, made before it is evaluated. Only
+;; clojure.core macros can be expanded (candidate code cannot define macros), so no candidate
+;; code runs here.
+
+(def ^:private special-forms
+  '#{def loop* recur if case* let* letfn* do fn* quote var import* . set! deftype* reify* try
+     throw monitor-enter monitor-exit catch finally new})
+
+(def ^:private max-findings 40)
+
+(defn- finding! [ctx level line msg]
+  (when (< (count @(:findings ctx)) max-findings)
+    (swap! (:findings ctx) conj {:level level :line line :message msg})))
+
+(defn- ignorable-name? [sym]
+  (let [n (name sym)]
+    (or (.startsWith n "_") (.contains n "__") (= n "&"))))
+
+(defn- line-of [form line]
+  (or (when (instance? clojure.lang.IObj form) (:line (meta form))) line))
+
+(declare analyze)
+
+(defn- analyze-all [forms env ctx line]
+  (doseq [f forms] (analyze f env ctx line)))
+
+(defn- new-binding [sym line] {:sym sym :line line :used (volatile! false)})
+
+(defn- warn-unused [ctx bindings]
+  (doseq [{:keys [sym line used]} bindings]
+    (when (and (not @used) (not (ignorable-name? sym)))
+      (finding! ctx :warning line (str sym " is bound but never used")))))
+
+(defn- analyze-bindings
+  "Sequential bindings as in let* and loop*; returns the extended env and the new bindings."
+  [pairs env ctx line]
+  (loop [pairs (partition 2 pairs) env env acc []]
+    (if-let [[sym init] (first pairs)]
+      (do (analyze init env ctx line)
+          (let [b (new-binding sym (line-of sym line))]
+            (recur (rest pairs) (assoc env sym b) (conj acc b))))
+      [env acc])))
+
+(defn- analyze-fn-method [[params & body] env ctx line]
+  (let [bs (mapv #(new-binding % line) (remove #{'&} params))
+        env (into env (map (juxt :sym identity) bs))]
+    (analyze-all body env (assoc ctx :in-fn true) line)
+    (warn-unused ctx bs)))
+
+(defn- analyze-fn [form env ctx line]
+  (let [[_ & more] form
+        [fname more] (if (symbol? (first more)) [(first more) (rest more)] [nil more])
+        env (cond-> env fname (assoc fname (new-binding fname line)))
+        methods (if (vector? (first more)) [more] more)]
+    (doseq [m methods] (analyze-fn-method m env ctx line))))
+
+(defn- arity-ok? [arglists n]
+  (some (fn [params]
+          (let [[fixed rest-args] (split-with #(not= '& %) params)]
+            (if (seq rest-args) (>= n (count fixed)) (= n (count fixed)))))
+        arglists))
+
+(defn- check-arity [ctx ^clojure.lang.Var v n line]
+  (let [arglists (:arglists (meta v))
+        vns (str (.-ns v))]
+    (when (and (seq? arglists) (every? vector? arglists)
+               (or (.startsWith vns "clojure.") (= vns (str (:ns ctx))))
+               (not (arity-ok? arglists n)))
+      (finding! ctx :error line
+                (str (.-sym v) " is called with " n (if (= 1 n) " argument" " arguments")
+                     " but takes " (string/join " or " (map pr-str arglists)))))))
+
+(defn- resolve-in [ctx sym]
+  (try (ns-resolve (:ns ctx) sym) (catch Throwable _ nil)))
+
+(defn- analyze-symbol [sym env ctx line]
+  (if-let [b (get env sym)]
+    (vreset! (:used b) true)
+    (let [r (resolve-in ctx sym)]
+      (cond
+        (var? r) (swap! (:used-vars ctx) conj r)
+        (class? r) nil
+        (and (namespace sym) (class? (resolve-in ctx (symbol (namespace sym))))) nil
+        (contains? special-forms sym) nil
+        :else (finding! ctx :error line (str "Unable to resolve symbol: " sym))))))
+
+(defn- analyze-case [[_ expr _shift _mask default imap] env ctx line]
+  (analyze expr env ctx line)
+  (analyze default env ctx line)
+  (doseq [[_ [_test then]] imap] (analyze then env ctx line)))
+
+(defn- analyze-try [[_ & body] env ctx line]
+  (doseq [f body]
+    (cond
+      (and (seq? f) (= 'catch (first f)))
+      (let [[_ _class sym & cbody] f
+            b (new-binding sym line)]
+        (analyze-all cbody (assoc env sym b) ctx line))
+      (and (seq? f) (= 'finally (first f))) (analyze-all (rest f) env ctx line)
+      :else (analyze f env ctx line))))
+
+(defn- analyze-special [head form env ctx line]
+  (case head
+    quote nil
+    var nil
+    import* nil
+    deftype* nil
+    reify* nil
+    def (do (when (:in-fn ctx)
+              (finding! ctx :error line "def inside a function defines a global var on every call; use let"))
+            (analyze-all (drop 2 form) env ctx line))
+    (let* loop*) (let [[env bs] (analyze-bindings (second form) env ctx line)]
+                   (analyze-all (drop 2 form) env ctx line)
+                   (warn-unused ctx bs))
+    letfn* (let [pairs (partition 2 (second form))
+                 bs (mapv (fn [[sym _]] (new-binding sym line)) pairs)
+                 env (into env (map (juxt :sym identity) bs))]
+             (doseq [[_ f] pairs] (analyze f env ctx line))
+             (analyze-all (drop 2 form) env ctx line)
+             (warn-unused ctx bs))
+    fn* (analyze-fn form env ctx line)
+    case* (analyze-case form env ctx line)
+    try (analyze-try form env ctx line)
+    . (let [[_ target member & args] form]
+        (when-not (and (symbol? target) (class? (resolve-in ctx target)))
+          (analyze target env ctx line))
+        (if (seq? member)
+          (analyze-all (rest member) env ctx line)
+          (analyze-all args env ctx line)))
+    new (analyze-all (drop 2 form) env ctx line)
+    (analyze-all (rest form) env ctx line)))
+
+(defn- analyze-call [form env ctx line]
+  (let [head (first form)
+        r (when (and (symbol? head) (not (contains? env head))) (resolve-in ctx head))]
+    (if (and (var? r) (:macro (meta r)))
+      (let [expanded (try
+                       (binding [*ns* (:ns ctx)] (macroexpand-1 form))
+                       (catch Throwable t
+                         (finding! ctx :error line
+                                   (str "invalid use of " head ": "
+                                        (first (string/split-lines (str (.getMessage (or (.getCause t) t)))))))
+                         ::invalid))]
+        (swap! (:used-vars ctx) conj r)
+        (when-not (= ::invalid expanded)
+          (analyze expanded env ctx line)))
+      (let [expanded (if (and (symbol? head) (nil? r) (not (contains? env head)))
+                       (try (binding [*ns* (:ns ctx)] (macroexpand-1 form)) (catch Throwable _ form))
+                       form)]
+        (if (not (identical? expanded form))
+          (analyze expanded env ctx line)
+          (do (when (var? r) (check-arity ctx r (count (rest form)) line))
+              (analyze-all form env ctx line)))))))
+
+(defn analyze [form env ctx line]
+  (let [line (line-of form line)]
+    (cond
+      (symbol? form) (analyze-symbol form env ctx line)
+      (seq? form) (cond
+                    (empty? form) nil
+                    (and (symbol? (first form)) (contains? special-forms (first form))
+                         (not (contains? env (first form))))
+                    (analyze-special (first form) form env ctx line)
+                    :else (analyze-call form env ctx line))
+      (map? form) (doseq [[k v] form] (analyze k env ctx line) (analyze v env ctx line))
+      (coll? form) (analyze-all form env ctx line)
+      :else nil)))
+
+(defn- declared-arglists
+  "The parameter vectors of a defn form, or nil."
+  [[_ _ & more]]
+  (let [more (drop-while #(or (string? %) (map? %)) more)]
+    (cond
+      (vector? (first more)) (list (first more))
+      (every? seq? more) (seq (map first (filter #(vector? (first %)) more))))))
+
+(defn lint
+  "Findings for the forms after `ns`, analysed in namespace `ns-obj` before any of them is evaluated."
+  [ns-obj forms]
+  (let [ctx {:ns ns-obj :findings (atom []) :used-vars (atom #{})}
+        private (atom [])]
+    ;; Make every top-level name resolvable, with its declared parameters for arity checks.
+    (doseq [f forms]
+      (when (and (seq? f) (symbol? (second f)) (contains? '#{defn defn- def declare} (first f)))
+        (let [names (if (= 'declare (first f)) (rest f) [(second f)])]
+          (doseq [n names]
+            (when (and (symbol? n) (contains? (ns-refers ns-obj) n))
+              (finding! ctx :warning (line-of f nil) (str n " shadows clojure.core/" n)))
+            (let [v (intern ns-obj (with-meta n {}))]
+              (when (contains? '#{defn defn-} (first f))
+                (alter-meta! v assoc :arglists (declared-arglists f)))
+              (when (= 'defn- (first f)) (swap! private conj [n v (line-of f nil)])))))))
+    (doseq [f forms]
+      (try
+        (analyze f {} ctx (line-of f nil))
+        (catch Throwable t
+          (finding! ctx :warning (line-of f nil)
+                    (str "this form could not be fully analysed: " (.getMessage t))))))
+    (doseq [[n v line] @private]
+      (when-not (contains? @(:used-vars ctx) v)
+        (finding! ctx :warning line (str "private function " n " is never used"))))
+    @(:findings ctx)))
+
+;; ---------------------------------------------------------------------------------------------
+;; Results: bounded realization, structural comparison, and contract checks
+
+(defn- realize!
+  "Forces every lazy part of `x`, counting elements against `budget` (a one-element long array)."
+  [x ^longs budget depth]
+  (when (> depth 512)
+    (throw (ex-info "the result is nested more than 512 levels deep" {:phase :realize})))
+  (let [tick (fn []
+               (aset budget 0 (dec (aget budget 0)))
+               (when (neg? (aget budget 0))
+                 (throw (ex-info "too many elements" {:phase :realize :too-large true}))))]
+    (cond
+      (map? x) (doseq [[k v] x] (tick) (realize! k budget (inc depth)) (realize! v budget (inc depth)))
+      (or (coll? x) (seq? x)) (loop [s (seq x)]
+                                (when s
+                                  (tick)
+                                  (realize! (first s) budget (inc depth))
+                                  (recur (next s))))
+      :else nil)))
+
+(defn- describe [x]
+  (cond
+    (nil? x) "nil"
+    (boolean? x) "a boolean"
+    (string? x) "a string"
+    (keyword? x) "a keyword"
+    (symbol? x) "a symbol"
+    (char? x) "a character"
+    (or (instance? Double x) (instance? Float x)) "a floating-point number"
+    (decimal? x) "a BigDecimal"
+    (ratio? x) "a ratio"
+    (integer? x) "an integer"
+    (map? x) "a map"
+    (set? x) "a set"
+    (vector? x) "a vector"
+    (list? x) "a list"
+    (seq? x) "a sequence"
+    (sequential? x) "a sequential collection"
+    :else (str "an instance of " (.getName (class x)))))
+
+(defn- num-kind [x]
+  (cond
+    (or (instance? Double x) (instance? Float x)) :float
+    (decimal? x) :decimal
+    (rational? x) :rational
+    :else :other))
+
+(defn- floats-equal? [a b tolerance]
+  (let [a (double a) b (double b)]
+    (or (== a b)
+        (and (Double/isNaN a) (Double/isNaN b))
+        (and (not (Double/isInfinite a)) (not (Double/isInfinite b))
+             (<= (Math/abs (- a b))
+                 (max 1e-12 (* tolerance (max (Math/abs a) (Math/abs b)))))))))
+
+(defn- at [path]
+  (if (empty? path) "the output" (str "at " (pr-str path))))
+
+(declare difference)
+
+(defn- seq-difference [e a path opts]
+  (loop [i 0 e (seq e) a (seq a)]
+    (cond
+      (and (nil? e) (nil? a)) nil
+      (nil? e) (str (at path) ": expected " i " elements but got more, starting with " (show (first a)))
+      (nil? a) (str (at path) ": expected " (+ i (count e)) " elements but got " i
+                    "; missing " (show (first e)))
+      :else (or (difference (first e) (first a) (conj path i) opts)
+                (recur (inc i) (next e) (next a))))))
+
+(defn- unordered-difference [e a path opts]
+  (let [e (vec e) a (vec a)]
+    (cond
+      (= (frequencies e) (frequencies a)) nil
+      (not= (count e) (count a))
+      (str (at path) ": expected " (count e) " elements (in any order) but got " (count a))
+      (> (* (count e) (count a)) 4000000)
+      (str (at path) ": the elements differ (compared in any order)")
+      :else
+      (loop [pending e remaining a]
+        (if-let [x (first pending)]
+          (let [i (first (keep-indexed (fn [i y] (when-not (difference x y [] opts) i)) remaining))]
+            (if (nil? i)
+              (str (at path) ": no element matches the expected " (show x) " (compared in any order)")
+              (recur (rest pending) (into (subvec remaining 0 i) (subvec remaining (inc i))))))
+          nil)))))
+
+(defn difference
+  "nil when `actual` equals `expected` under the harness's equality rules, otherwise a
+   description of the first difference found."
+  [expected actual path opts]
+  (cond
+    (and (number? expected) (number? actual))
+    (let [ke (num-kind expected) ka (num-kind actual)]
+      (cond
+        (not= ke ka)
+        (str (at path) ": expected " (describe expected) " " (pr-str expected)
+             " but got " (describe actual) " " (pr-str actual))
+        (= ke :float) (when-not (floats-equal? expected actual (:float-tolerance opts))
+                        (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual)))
+        (= ke :decimal) (when-not (zero? (.compareTo ^BigDecimal expected ^BigDecimal actual))
+                          (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual)))
+        :else (when-not (= expected actual)
+                (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual)))))
+
+    (and (map? expected) (map? actual))
+    (let [missing (remove #(contains? actual %) (keys expected))
+          extra (remove #(contains? expected %) (keys actual))]
+      (cond
+        (seq missing) (str (at path) ": missing key " (show (first missing))
+                           (when (next missing) (str " (and " (dec (count missing)) " more)")))
+        (seq extra) (str (at path) ": unexpected key " (show (first extra))
+                         (when (next extra) (str " (and " (dec (count extra)) " more)")))
+        :else (some (fn [[k v]] (difference v (get actual k) (conj path k) opts)) expected)))
+
+    (and (set? expected) (set? actual))
+    (when-not (= expected actual)
+      (let [missing (remove #(contains? actual %) expected)
+            extra (remove #(contains? expected %) actual)]
+        (str (at path) ": "
+             (cond
+               (seq missing) (str "missing element " (show (first missing)))
+               :else (str "unexpected element " (show (first extra)))))))
+
+    (and (sequential? expected) (sequential? actual))
+    (if (and (empty? path) (:unordered opts))
+      (unordered-difference expected actual path opts)
+      (seq-difference expected actual path opts))
+
+    (= expected actual) nil
+
+    :else (str (at path) ": expected " (describe expected) " " (show expected)
+               " but got " (describe actual) " " (show actual))))
+
+(def ^:private type-checks
+  {:nil [nil? "nil"]
+   :boolean [boolean? "a boolean"]
+   :integer [integer? "an integer"]
+   :number [number? "a number"]
+   :string [string? "a string"]
+   :keyword [keyword? "a keyword"]
+   :symbol [symbol? "a symbol"]
+   :map [map? "a map"]
+   :vector [vector? "a vector"]
+   :list [seq? "a list or sequence"]
+   :set [set? "a set"]
+   :sequential [sequential? "a sequential collection"]})
+
+(defn- type-problem [t x]
+  (when-let [[pred label] (get type-checks t)]
+    (when-not (pred x) (str "must be " label " but is " (describe x)))))
+
+(defn- key-problems [where m key-specs]
+  (for [{:keys [key required type] nil-rule :nil} key-specs
+        :let [present (contains? m key)
+              v (get m key)
+              problem (cond
+                        (and required (not present)) (str "required key " (pr-str key) " is missing")
+                        (not present) nil
+                        (clojure.core/nil? v) (when (= nil-rule :disallowed)
+                                                (str "key " (pr-str key) " must not be nil"))
+                        :else (when-let [p (type-problem type v)]
+                                (str "key " (pr-str key) " " p)))]
+        :when problem]
+    (str where problem)))
+
+(defn contract-problems
+  "Violations of the output shape in `contract` by `value`, at most 20."
+  [contract value]
+  (let [{:keys [type keys]} (:output contract)
+        whole (when-let [p (type-problem type value)] [(str "the output " p)])
+        key-specs (map #(update % :key edn/read-string) keys)
+        per-key (when (seq key-specs)
+                  (cond
+                    (map? value) (key-problems "" value key-specs)
+                    (coll? value) (mapcat (fn [i x]
+                                            (when (map? x) (key-problems (str "element " i ": ") x key-specs)))
+                                          (range) value)
+                    :else nil))]
+    (vec (take 20 (concat whole per-key)))))
+
+;; ---------------------------------------------------------------------------------------------
+;; Calls
+
+(defn- frame-info
+  "Where in the candidate's namespace `t` was thrown (line), and the Clojure function it surfaced
+   in, from the stack trace: a clojure.core function, or for inlined ones (such as inc) the
+   runtime method."
+  [^Throwable t ns-sym]
+  (let [prefix (str (munge (str ns-sym)) "$")
+        frames (seq (.getStackTrace t))
+        class-of (fn [^StackTraceElement e] (.getClassName e))
+        own? (fn [e] (.startsWith ^String (class-of e) prefix))
+        user (first (filter own? frames))
+        before (take-while (complement own?) frames)
+        core (first (filter #(.startsWith ^String (class-of %) "clojure.core$") before))
+        ;; The runtime method the candidate's code called directly, not its internal helpers.
+        lang (last (filter #(.startsWith ^String (class-of %) "clojure.lang.") before))]
+    (cond-> {}
+      (and user (pos? (.getLineNumber ^StackTraceElement user)))
+      (assoc :line (.getLineNumber ^StackTraceElement user))
+      core
+      (assoc :in (str "clojure.core/"
+                      (clojure.lang.Compiler/demunge
+                       (first (string/split (subs (class-of core) 13) #"\$")))))
+      (and (not core) lang)
+      (assoc :in (str (class-of lang) "." (.getMethodName ^StackTraceElement lang))))))
 
 (def max-captured-chars 65536)
+(def max-shown-chars 20000)
 
 (defn- bounded-writer
   "A writer that keeps at most `limit` characters and fails the call once it is exceeded."
@@ -127,7 +608,7 @@
     (write
       ([x]
        (let [s (if (string? x) x (if (integer? x) (str (char x)) (String. ^chars x)))]
-         (.write this s 0 (count s))))
+         (.write ^Writer this s 0 (count s))))
       ([x off len]
        (when (> (+ (.length (.getBuffer sw)) len) limit)
          (throw (ex-info "printed output exceeds the capture limit" {:phase :call})))
@@ -137,36 +618,117 @@
     (flush [])
     (close [])))
 
-(defn- call-on [f input-text]
+(defn- in-thread
+  "Runs `f` on its own thread with a deep stack; returns its result or ::timeout after `ms`."
+  [f ms]
+  (let [result (promise)
+        t (Thread. nil
+                   (fn [] (deliver result (try {:ok (f)} (catch Throwable e {:error e}))))
+                   "clojurecraft-call"
+                   (* 16 1024 1024))]
+    (.setDaemon t true)
+    (.start t)
+    (.join t (long ms))
+    (if (realized? result) @result ::timeout)))
+
+(defn- call-once [f {:keys [input expected]} {:keys [call-ms max-elements equality contract] :as opts}]
   (let [sw (StringWriter.)
         out (bounded-writer sw max-captured-chars)
-        start (System/nanoTime)]
-    (try
-      (let [input (edn/read-string input-text)
-            value (binding [*out* out] (f input))
-            ;; Realize lazy results inside the measured call so errors surface here.
-            printed (binding [*print-length* 100000 *print-level* 200] (pr-str value))]
-        {:status :ok :value printed :out (str sw) :elapsed-ns (- (System/nanoTime) start)})
-      (catch Throwable t
-        (assoc (error-map :call t) :out (str sw) :elapsed-ns (- (System/nanoTime) start))))))
+        started (System/nanoTime)
+        expected-value (when expected
+                         (try {:value (edn/read-string expected)}
+                              (catch Throwable t {:error t})))
+        run (in-thread
+             (fn []
+               (let [in (edn/read-string input)
+                     v (binding [*out* out] (f in))]
+                 ;; Lazy results are realized inside the time limit, so their errors and cost
+                 ;; belong to this call.
+                 (realize! v (long-array [max-elements]) 0)
+                 v))
+             call-ms)
+        elapsed (- (System/nanoTime) started)
+        base {:out (str sw) :elapsed-ns elapsed}]
+    (cond
+      (= run ::timeout)
+      (assoc base :status "timeout")
 
-(defn run-request [{:keys [code fn inputs checks]}]
-  (try
-    (let [forms (read-all code)
-          ns-sym (if checks
-                   (check-forms forms)
-                   (second (first forms)))]
-      (binding [*ns* (create-ns 'clojurecraft.scratch)]
-        (refer-clojure)
-        (doseq [form forms] (eval form)))
-      (let [v (ns-resolve (the-ns ns-sym) (symbol fn))]
-        (if-not (and v (fn? @v))
-          {:status :error :phase :load :message (str "no function named " fn)}
-          {:status :ok :results (mapv #(call-on @v %) inputs)})))
-    (catch Throwable t (error-map :load t))))
+      (:error run)
+      (let [t (:error run)]
+        (if (:too-large (ex-data t))
+          (assoc base :status "too-large"
+                 :message (str "the result has more than " max-elements
+                               " elements; it may be an infinite lazy sequence"))
+          (assoc base :status "error"
+                 :error (merge (error-map :call t) (frame-info t (:ns opts))))))
 
-(let [request (edn/read-string (slurp *in*))
-      response (run-request request)]
-  (binding [*print-length* nil *print-level* nil]
-    (prn response))
+      :else
+      (let [v (:ok run)
+            shown (bounded-str v 100000 1000 max-shown-chars)
+            ;; Comparing can itself fail, for example looking up a key in a sorted map of
+            ;; another key type.
+            guarded (fn [f] (try (f) (catch Throwable t (str "could not compare: " (.getMessage t)))))]
+        (cond-> (assoc base :status "ok" :actual shown)
+          (:error expected-value)
+          (assoc :status "error"
+                 :error {:phase "expected" :class "" :message (str "the expected value is not valid EDN: "
+                                                                    (.getMessage ^Throwable (:error expected-value)))})
+          (contains? expected-value :value)
+          (merge (let [d (guarded #(difference (:value expected-value) v [] equality))]
+                   {:match (nil? d) :difference d}))
+          contract
+          (assoc :contract (let [p (guarded #(contract-problems contract v))]
+                             (if (string? p) [p] p))))))))
+
+(defn run-request [{code :code fname :fn calls :calls checks :checks lint? :lint :as request}]
+  (let [opts (merge {:call-ms 5000 :max-elements 1000000
+                     :equality {:float-tolerance 1e-9 :unordered false}}
+                    (select-keys request [:call-ms :max-elements :equality :contract]))
+        forms (try (read-all code)
+                   (catch Throwable t (emit (assoc (error-map :read t) :event "read" :ok false)) nil))]
+    (when forms
+      (emit {:event "read" :ok true :forms (count forms)})
+      (when-let [ns-sym (try
+                          (let [n (if checks (check-forms forms) (second (first forms)))]
+                            (when checks (emit {:event "check" :ok true}))
+                            n)
+                          (catch Throwable t
+                            (emit (assoc (error-map :check t) :event "check" :ok false))
+                            nil))]
+        (let [loaded (try
+                       (binding [*ns* (create-ns 'clojurecraft.scratch)]
+                         (refer-clojure)
+                         (eval (first forms))
+                         (when lint?
+                           (emit {:event "lint"
+                                  :findings (try (lint (the-ns ns-sym) (rest forms))
+                                                 (catch Throwable t
+                                                   [{:level :warning :message (str "lint could not run: " (.getMessage t))}]))})))
+                       (binding [*ns* (create-ns 'clojurecraft.scratch)]
+                         (refer-clojure)
+                         (doseq [form forms] (eval form)))
+                       (let [v (ns-resolve (the-ns ns-sym) (symbol fname))]
+                         (if (and v (fn? @v))
+                           (do (emit {:event "load" :ok true}) @v)
+                           (do (emit {:event "load" :ok false :phase "load" :class ""
+                                      :message (str "no public function named " fname)})
+                               nil)))
+                       (catch Throwable t
+                         (emit (assoc (error-map :load t) :event "load" :ok false))
+                         nil))]
+          (when loaded
+            (loop [i 0 calls (seq calls)]
+              (when calls
+                (emit {:event "start" :index i})
+                (let [r (call-once loaded (first calls) (assoc opts :ns ns-sym))]
+                  (emit (assoc r :event "result" :index i))
+                  (if (= "timeout" (:status r))
+                    (do (emit {:event "halted"})
+                        ;; The timed-out call cannot be stopped from outside its thread.
+                        (.halt (Runtime/getRuntime) 0))
+                    (recur (inc i) (next calls))))))))))
+    (emit {:event "done"})))
+
+(let [request (edn/read-string (slurp *in*))]
+  (run-request request)
   (flush))

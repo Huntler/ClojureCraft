@@ -81,6 +81,11 @@ fn embedder(mode: EmbedMode) -> Result<Option<LlamaEmbedder>> {
     Ok(Some(e))
 }
 
+/// The embedding model on the CPU, as searches use it; `None` when it is not installed.
+pub fn cpu_embedder() -> Result<Option<LlamaEmbedder>> {
+    embedder(EmbedMode::Cpu)
+}
+
 pub fn build(mode: EmbedMode) -> Result<()> {
     let manifest = KnowledgeManifest::bundled()?;
     let runtime = Manifest::bundled()?;

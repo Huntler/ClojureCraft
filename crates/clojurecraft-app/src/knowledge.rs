@@ -4,7 +4,8 @@
 //! worker threads. Searches run on one long-lived thread that owns the open collection and, when
 //! the collection has vectors, an embedding server on the CPU, started on the first search and
 //! stopped after a few idle minutes or when the application exits. Every search carries a request
-//! number, and only the newest request of each search field is applied.
+//! number, and only the newest request of each search field is applied. The same thread gathers
+//! the documentation given to the model when generating code.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ use clojurecraft_runtime::models::{FileProblem, ModelRecord};
 use clojurecraft_runtime::{Cancel, DataDirs, Manifest, Progress, components, platform_key};
 
 use crate::jobs::Event;
+use clojurecraft_workflow::assistant::{self, Gather, Gathered};
 
 /// The query-time embedding server is stopped after this long without searches.
 const EMBEDDER_IDLE: Duration = Duration::from_secs(300);
@@ -42,6 +44,10 @@ pub enum KnowledgeEvent {
         slot: Slot,
         request: u64,
         result: Box<Result<SearchOutcome, String>>,
+    },
+    Gathered {
+        request: u64,
+        result: Box<Result<Gathered, String>>,
     },
 }
 
@@ -119,6 +125,10 @@ enum Command {
         request: u64,
         query: Query,
     },
+    Gather {
+        request: u64,
+        gather: Gather,
+    },
     /// The active collection or the embedding model changed.
     Reload,
     Shutdown,
@@ -175,6 +185,8 @@ pub struct KnowledgeState {
     pub model_error: Option<String>,
     searches: HashMap<Slot, SearchState>,
     next_request: u64,
+    /// Finished documentation lookups for the assistant.
+    pub gathered: Vec<(u64, Result<Gathered, String>)>,
     worker: Sender<Command>,
     worker_handle: Option<JoinHandle<()>>,
 }
@@ -214,6 +226,7 @@ impl KnowledgeState {
             model_error: None,
             searches: HashMap::new(),
             next_request: 0,
+            gathered: Vec::new(),
             worker,
             worker_handle,
         };
@@ -353,7 +366,17 @@ impl KnowledgeState {
                     s.result = Some(*result);
                 }
             }
+            KnowledgeEvent::Gathered { request, result } => self.gathered.push((request, *result)),
         }
+    }
+
+    /// Starts gathering documentation for a generation; `None` when none is installed.
+    pub fn gather(&mut self, gather: Gather) -> Option<u64> {
+        self.active()?;
+        self.next_request += 1;
+        let request = self.next_request;
+        self.worker.send(Command::Gather { request, gather }).ok()?;
+        Some(request)
     }
 
     /// Builds (or rebuilds) the collection. `gpu_free` allows computing embeddings on the GPU,
@@ -605,6 +628,8 @@ fn run_build(
 struct Worker<'a> {
     env: &'a Env,
     retriever: Option<Retriever>,
+    /// Version of the collection `retriever` reads.
+    version: String,
     embedder: Option<LlamaEmbedder>,
     embedder_failed: Option<(Instant, String)>,
     last_search: Instant,
@@ -621,6 +646,7 @@ impl Worker<'_> {
                 .ok_or("No documentation collection is installed.")?
                 .map_err(|e| e.to_string())?;
             self.retriever = Some(Retriever::open(&active.dir).map_err(|e| e.to_string())?);
+            self.version = active.version;
         }
         self.retriever.as_mut().ok_or_else(|| "unavailable".to_owned())
     }
@@ -678,6 +704,22 @@ impl Worker<'_> {
     }
 }
 
+impl Worker<'_> {
+    fn gather(&mut self, g: &Gather) -> Result<Gathered, String> {
+        self.last_search = Instant::now();
+        self.ensure_retriever()?;
+        self.ensure_embedder();
+        let retriever = self.retriever.as_mut().ok_or("unavailable")?;
+        let embedder = self.embedder.as_mut().map(|e| e as &mut dyn Embedder);
+        let (found, semantic_failed) = assistant::gather(retriever, embedder, g, &self.version)?;
+        if semantic_failed {
+            // A server that stopped answering is replaced on the next search.
+            self.embedder = None;
+        }
+        Ok(found)
+    }
+}
+
 fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEvent)) {
     if let Some((_, server)) = components::llama_server(&env.runtime, &env.dirs) {
         clojurecraft_inference::process::reap_stale(&env.kdirs().embed_pid_file(), &server);
@@ -685,6 +727,7 @@ fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEven
     let mut w = Worker {
         env,
         retriever: None,
+        version: String::new(),
         embedder: None,
         embedder_failed: None,
         last_search: Instant::now(),
@@ -704,9 +747,11 @@ fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEven
         let mut pending: Vec<Command> = vec![first];
         pending.extend(rx.try_iter());
         let mut latest: HashMap<Slot, (u64, Query)> = HashMap::new();
+        let mut gathers = Vec::new();
         for c in pending {
             match c {
                 Command::Shutdown => return,
+                Command::Gather { request, gather } => gathers.push((request, gather)),
                 Command::Reload => {
                     w.retriever = None;
                     w.embedder = None;
@@ -716,6 +761,10 @@ fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEven
                     latest.insert(slot, (request, query));
                 }
             }
+        }
+        for (request, gather) in gathers {
+            let result = Box::new(w.gather(&gather));
+            emit(KnowledgeEvent::Gathered { request, result });
         }
         for (slot, (request, query)) in latest {
             let result = Box::new(w.search(&query));

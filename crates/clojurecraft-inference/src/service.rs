@@ -79,6 +79,8 @@ pub struct GenerateRequest {
     pub max_output_tokens: Option<u32>,
     pub timeout: Option<Duration>,
     pub seed: Option<u64>,
+    /// Overrides the role's sampling temperature.
+    pub temperature: Option<f32>,
 }
 
 impl GenerateRequest {
@@ -91,6 +93,7 @@ impl GenerateRequest {
             max_output_tokens: None,
             timeout: None,
             seed: None,
+            temperature: None,
         }
     }
 }
@@ -298,6 +301,7 @@ impl TokenCounter for Counter<'_> {
             messages: messages.to_vec(),
             max_tokens: 0,
             temperature: 0.0,
+            top_p: None,
             response_schema: None,
             tools: self.tools.to_vec(),
             seed: None,
@@ -530,7 +534,8 @@ impl Worker {
             let request = ChatRequest {
                 messages: messages.clone(),
                 max_tokens: reserved,
-                temperature: profile.temperature,
+                temperature: req.temperature.unwrap_or(profile.temperature),
+                top_p: Some(profile.top_p),
                 response_schema: req.schema.clone(),
                 tools: specs.clone(),
                 seed: req.seed,
@@ -570,9 +575,10 @@ impl Worker {
 
         let value = match &req.schema {
             Some(_) if turn.finish == Finish::Length => {
-                return Err(GenerationError::Malformed {
-                    problem: format!("the answer was cut off at the limit of {reserved} tokens"),
+                return Err(GenerationError::CutOff {
+                    limit: reserved,
                     raw: turn.content,
+                    reasoning_chars: turn.reasoning.chars().count(),
                 });
             }
             Some(schema) => Some(parse_structured(&turn.content, schema)?),

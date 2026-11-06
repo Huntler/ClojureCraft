@@ -119,18 +119,7 @@ pub struct ApiEntry {
 /// Symbols of `clojure.core` that the evaluation harness refuses in generated code, read from
 /// the harness itself so the two lists cannot diverge.
 pub fn restricted_core_symbols() -> BTreeSet<String> {
-    let src = clojurecraft_clojure::HARNESS_SOURCE;
-    let Some(start) = src.find("(def denied-core") else {
-        return BTreeSet::new();
-    };
-    let rest = &src[start..];
-    let (Some(open), Some(close)) = (rest.find("#{"), rest.find('}')) else {
-        return BTreeSet::new();
-    };
-    rest[open + 2..close]
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
+    clojurecraft_clojure::harness_policy().denied_core.clone()
 }
 
 /// Removes the indentation Clojure docstrings carry on their continuation lines.

@@ -1,0 +1,13 @@
+# String manipulation and map transformation, needing clojure.string.
+name = "Normalize headers"
+description = "Turn a map with string header names into a map with keyword keys: trim the names, lower-case them, and replace spaces with dashes. Values stay unchanged."
+steps = [
+  "Trim each key and convert it to lower case.",
+  "Replace each run of spaces in the key with a single dash.",
+  "Turn the result into a keyword.",
+]
+
+[[examples]]
+name = "csv headers"
+input = '{" First Name " "Ada" "LAST  NAME" "Lovelace" "Age" 36}'
+expected = '{:first-name "Ada" :last-name "Lovelace" :age 36}'

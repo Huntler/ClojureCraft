@@ -10,11 +10,12 @@ publish.workspace = true
 [dependencies]
 clojurecraft-sandbox.workspace = true
 hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 clojurecraft-runtime.workspace = true
 
 [lints]

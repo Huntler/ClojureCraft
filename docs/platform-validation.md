@@ -181,3 +181,43 @@ driven with synthetic X11 input.
 | Application exit stops the embedding server (no `llama-server` left running) | works |
 | Rollback button, failure banner, embedding-model removal, cancellation from the UI | covered by automated tests of the underlying operations; not clicked through |
 | macOS | not tested (no Mac available) |
+
+### Specification assistant and generation — 2026-11-06
+
+Debug build on the Linux reference machine (RTX 3070), llama.cpp b12138, application started on a
+scratch data directory sharing the installed runtimes, models, and documentation, driven with
+synthetic X11 input; command-line runs with `clojurecraft-devtool generate`.
+
+| Check | Result |
+| --- | --- |
+| Interpretation and questions, contract proposal, retrieval planning, documentation lookup (10 excerpts in 0.1–0.6 s), generation, structural check, and explanation with Qwen2.5-Coder 7B Q4_K_M on CUDA | works (9–37 s per generation) |
+| Explanation answers repeating a sentence until the token limit | fixed by grammar length bounds on prose |
+| Structural check rejects real model output with positioned diagnostics (unrequired `clojure.walk`, stray character literal from double escaping) and keeps the current implementation | works |
+| "Generate again" in the app loads the selected model (Mellum 12B, Vulkan, partial offload), streams phases and reasoning progress, retries after the reasoning cut-off, and shows the rejected code | works |
+| Contract editor (proposed banner, value types, key rules with nil defaults, allowed namespaces), interpretation section, questions answered by clicking an option, step-to-code mapping with line ranges | works |
+| Answering a question marks the stored interpretation and the implementation as based on an earlier specification | works |
+| "Generate again" with Qwen2.5-Coder 7B (Vulkan) replaced generated code and recorded revision 2 (`Generated`, format 2) with model repository, seed, 10 documentation references, and explanation; the user's answered questions appeared in the model's assumptions; the code was correct for both examples | works (about 40 s including model load) |
+| Namespace approval and review of code that would replace hand-written code | covered by automated tests; not clicked through |
+| macOS | not tested (no Mac available) |
+
+### Automatic validation and repair — 2026-11-06
+
+Linux reference machine, debug build, Temurin 25.0.5 and Clojure 1.12.6 in the Landlock/seccomp
+sandbox; llama.cpp b12138.
+
+| Check | Result |
+| --- | --- |
+| Harness: read, static checks, lint, load, and every call reported as separate stages; one sandboxed JVM per validation, 0.7 s for two examples | works |
+| Comparison rules (sequential types, maps, sets, `1`/`1N`, `1.5M`/`1.50M`, float tolerance, NaN, number categories, unordered output) | works (automated test against the real JVM) |
+| Infinite lazy result reported as too large; exception inside a lazy result attributed to its call | works |
+| Per-call time limit (1 s in the test) stops the JVM and reports the call as timed out; later calls listed as not run; process wall limit attributes the running call | works |
+| Memory exhaustion (128 MiB heap) and output flood attributed to the running call | works |
+| Lint: unresolved symbol, wrong arity (`assoc` with one argument), `let` spec violation, nested `def` reported with lines; unused bindings and private functions as warnings; idiomatic code (threading, destructuring, `for`, `cond->`, `as->`, transducers) lints clean | works |
+| Call errors report the candidate's line and the core function or runtime method (`clojure.core/subs`, `clojure.lang.Numbers.inc`) | works |
+| Cancelling a running validation stops the JVM within 3 s | works |
+| Repair loop with scripted answers and real execution: a wrong candidate is repaired from the harness's actual values; lint and load failures reach the repair prompt; four failures end unresolved with four stored reports | works (automated) |
+| Application (synthetic X11 input, scratch data directory with a copy of the library): "Generate implementation" with Mellum 12B Thinking (Vulkan) — attempt 1 unreadable (`line 4: ( is never closed`, later checks listed as not run), attempt 2 failed 2 checks, attempt 3 passed all 7 and was applied with the attempts and their diagnostics shown | works (about 9 minutes) |
+| Result tab: newest report for the current code, environment line, earlier checks with their code; "Run checks" records a new report in about 1 s; reports reload after restarting the application; editing an expected output marks the report outdated, undoing the edit makes it current again; closing the window stops llama.cpp | works |
+| Long attempt notes widened the right column under the centre panel | fixed (short headers, notes inside) |
+| Repair loop with Qwen2.5-Coder 7B (CUDA): 3 of 4 sample specifications pass on the first attempt; `order-totals` failed all repairs in 10 of 13 runs (see `docs/model-compatibility.md`) | loop works; repair quality limited by the model |
+| macOS | not tested (no Mac available) |

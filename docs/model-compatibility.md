@@ -59,6 +59,38 @@ application's offload estimate for a 7.2 GiB budget):
 The architecture is therefore allowed for installation from its repository, but the model is not
 offered in the curated catalog.
 
+## Generation with the specification assistant (2026-11-06)
+
+`clojurecraft-devtool generate` with llama.cpp b12138 CUDA, context 8192, on the four sample
+specifications (single runs; quality varies between seeds):
+
+- Qwen2.5-Coder 7B Q4_K_M: every request returns schema-valid JSON once prose fields are bounded
+  (see `docs/architecture.md`). Generation 2.6–3.2 s, explanation 4.8–6.2 s, interpretation
+  4–6 s, contract proposal 4 s. Code: `distinct-tags` correct; `order-totals` wrong in three runs
+  (a nil customer key, nested maps, a reduce over grouped values) and correct once in the app
+  after two questions had been answered; `top-scorers` returns a list
+  where a vector is expected; `normalize-headers` rejected by the structural check (used
+  `clojure.walk` without requiring it). Repairs are needed for most specifications.
+- Mellum2.1 12B-A2.5B Thinking Q4_K_M (Vulkan build, partial offload): reasoning used up the
+  2,500-token answer budget; the retry with the reasoning allowance answered after about 4
+  minutes in total, with code that escaped its line breaks twice (now unescaped automatically).
+
+## Validation and repair (2026-11-06)
+
+`clojurecraft-devtool generate` with validation in the sandbox (llama.cpp b12138 CUDA, context
+8192, documentation on, Qwen2.5-Coder 7B Q4_K_M); each sandboxed validation run took 0.7 s.
+
+- `top-scorers`, `normalize-keys`, `nested-tags`: passed every check on the first attempt.
+- `order-totals`, 13 runs in total: passed on the first attempt in 3; in the other 10 every repair
+  failed. Diagnostics were precise (path and values of the first difference; for exceptions the
+  line and the `clojure.core` function), but the model returned its failing approach nearly
+  unchanged (the same `reduce` over grouped values). Raising the repair temperature to 0.5 and
+  telling the model that an attempt failed exactly like the previous one did not change this in
+  6 runs. Repairs need a stronger model than the 7B tier.
+- Mellum2.1 12B-A2.5B Thinking (Vulkan, partial offload): in the application, generation attempts
+  ran out of their answer budget while reasoning (cut off at 8,192 tokens with a 16,384-token
+  context) and counted as failed attempts, at about 2–4 minutes each.
+
 ## Models from other Hugging Face repositories
 
 1. The repository id (`owner/name`) and optional branch, tag, or commit are validated, and the

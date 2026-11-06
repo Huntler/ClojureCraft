@@ -384,6 +384,7 @@ mod tests {
             messages: vec![Message::user(text)],
             max_tokens: 64,
             temperature: 0.0,
+            top_p: None,
             response_schema: None,
             tools: vec![],
             seed: None,

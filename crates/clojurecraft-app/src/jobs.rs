@@ -3,6 +3,7 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::execution::ExecutionEvent;
 use crate::inference::InferenceEvent;
 use crate::knowledge::KnowledgeEvent;
 use crate::library::LibraryEvent;
@@ -11,6 +12,7 @@ pub enum Event {
     Library(LibraryEvent),
     Inference(Box<InferenceEvent>),
     Knowledge(Box<KnowledgeEvent>),
+    Execution(Box<ExecutionEvent>),
 }
 
 pub struct Jobs {

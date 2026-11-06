@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use clojurecraft_domain::format::FormatError;
-use clojurecraft_domain::{FunctionDocument, FunctionId, SecretRegistry};
+use clojurecraft_domain::{FunctionDocument, FunctionId, SecretRegistry, ValidationReport};
 use clojurecraft_runtime::DataDirs;
 use clojurecraft_store::{
     AutosaveEvent, Autosaver, DATABASE_FILE, Draft, FunctionSummary, Listing, Store, StoreError,
@@ -37,6 +37,10 @@ pub enum Command {
     Purge(FunctionId),
     /// Replaces an unreadable draft with the latest revision.
     Recover(FunctionId),
+    /// Appends a validation report.
+    RecordValidation(FunctionId, Box<ValidationReport>),
+    /// Reads a function's validation reports, newest first.
+    LoadValidations(FunctionId),
 }
 
 pub enum LibraryEvent {
@@ -67,7 +71,15 @@ pub enum LibraryEvent {
         error: String,
     },
     Autosave(AutosaveEvent),
+    /// A function's stored validation reports, newest first.
+    Validations {
+        function: FunctionId,
+        reports: Vec<ValidationReport>,
+    },
 }
+
+/// Validation reports kept per function for display; older ones stay in the library.
+pub const VALIDATIONS_SHOWN: usize = 40;
 
 pub struct Library {
     tx: Sender<Command>,
@@ -109,6 +121,22 @@ fn run(rx: &Receiver<Command>, events: &Sender<Event>, ctx: &egui::Context, secr
     list(&store, &emit);
     for command in rx {
         match command {
+            Command::RecordValidation(function, report) => {
+                if let Err(e) = store.record_validation(function, &report) {
+                    emit(failed("store the validation results", &e));
+                }
+                continue;
+            }
+            Command::LoadValidations(function) => {
+                match store.validation_reports(function) {
+                    Ok(mut reports) => {
+                        reports.truncate(VALIDATIONS_SHOWN);
+                        emit(LibraryEvent::Validations { function, reports });
+                    }
+                    Err(e) => emit(failed("read the validation results", &e)),
+                }
+                continue;
+            }
             Command::Open(id) => match store.load_draft(id) {
                 Ok(draft) => emit(LibraryEvent::Opened {
                     draft: Box::new(draft),

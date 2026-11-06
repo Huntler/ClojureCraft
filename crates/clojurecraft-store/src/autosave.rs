@@ -1,15 +1,18 @@
 //! Background autosave. Edits are submitted with their edit sequence; the worker debounces them
 //! per function and writes the newest one on its own connection, so the UI thread never waits on
 //! disk. Transient failures are retried with back-off; every outcome is reported.
+//!
+//! Recording a revision goes through the same worker, so it is ordered with the draft writes and a
+//! queued older draft can never be written after the revision.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use clojurecraft_domain::{FunctionDocument, FunctionId};
+use clojurecraft_domain::{FunctionDocument, FunctionId, RevisionReason};
 
-use crate::{SaveOutcome, Store};
+use crate::{CommitOutcome, SaveOutcome, Store};
 
 const MAX_ATTEMPTS: u32 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -32,10 +35,37 @@ pub enum AutosaveEvent {
         error: String,
         will_retry: bool,
     },
+    /// The draft was saved and recorded as revision `number` (`created` is false when it equalled
+    /// the latest revision, which is then reused).
+    Committed {
+        function: FunctionId,
+        seq: u64,
+        number: u32,
+        created: bool,
+    },
+    /// The revision could not be recorded; the draft is still saved as an ordinary edit.
+    CommitFailed {
+        function: FunctionId,
+        seq: u64,
+        error: String,
+    },
+}
+
+impl AutosaveEvent {
+    pub fn function(&self) -> FunctionId {
+        match self {
+            Self::Saved { function, .. }
+            | Self::Superseded { function, .. }
+            | Self::Failed { function, .. }
+            | Self::Committed { function, .. }
+            | Self::CommitFailed { function, .. } => *function,
+        }
+    }
 }
 
 enum Message {
     Submit(Box<FunctionDocument>, u64),
+    Commit(Box<FunctionDocument>, u64, RevisionReason),
     Flush(Sender<bool>),
 }
 
@@ -82,6 +112,14 @@ impl Autosaver {
         }
     }
 
+    /// Saves the draft and records it as a revision, after any older queued edit of the same
+    /// function and replacing it.
+    pub fn commit(&self, document: FunctionDocument, seq: u64, reason: RevisionReason) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Message::Commit(Box::new(document), seq, reason));
+        }
+    }
+
     /// Writes everything queued now and waits for it. Returns whether all writes succeeded.
     pub fn flush(&self) -> bool {
         let (reply, done) = channel();
@@ -119,6 +157,7 @@ impl Worker {
             };
             match message {
                 Ok(Message::Submit(document, seq)) => self.queue(document, seq),
+                Ok(Message::Commit(document, seq, reason)) => self.commit(document, seq, reason),
                 Ok(Message::Flush(reply)) => {
                     let ok = self.write_all();
                     let _ = reply.send(ok);
@@ -156,6 +195,34 @@ impl Worker {
                 );
             }
         }
+    }
+
+    fn commit(&mut self, document: Box<FunctionDocument>, seq: u64, reason: RevisionReason) {
+        let id = document.id;
+        // A queued older edit is replaced by this one; a newer one stays queued and is written
+        // after the revision.
+        if self.pending.get(&id).is_some_and(|p| p.seq <= seq) {
+            self.pending.remove(&id);
+        }
+        let event = match self.store.commit_revision(&document, seq, reason) {
+            Ok(outcome) => AutosaveEvent::Committed {
+                function: id,
+                seq,
+                number: outcome.revision().number,
+                created: matches!(outcome, CommitOutcome::Created(_)),
+            },
+            Err(e) => {
+                tracing::warn!(function = %id, error = %e, "recording a revision failed");
+                // The content must still reach the draft.
+                self.queue(document, seq);
+                AutosaveEvent::CommitFailed {
+                    function: id,
+                    seq,
+                    error: e.to_string(),
+                }
+            }
+        };
+        (self.notify)(event);
     }
 
     fn write_due(&mut self) {

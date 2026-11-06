@@ -110,6 +110,18 @@ pub enum GenerationError {
     },
     #[error("the model kept calling tools after {0} rounds")]
     ToolRounds(u32),
+    /// A structured answer reached the token limit before it was complete. Reasoning models can
+    /// spend the whole budget thinking before they answer.
+    #[error(
+        "the answer was cut off at the limit of {limit} tokens{}",
+        if *reasoning_chars > 0 { " after the model reasoned at length" } else { "" }
+    )]
+    CutOff {
+        limit: u32,
+        raw: String,
+        /// Characters of reasoning produced before the answer.
+        reasoning_chars: usize,
+    },
 }
 
 /// A concrete change the user can make to recover from a failure.

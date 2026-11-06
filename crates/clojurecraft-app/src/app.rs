@@ -5,27 +5,36 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clojurecraft_domain::{FunctionId, SecretRegistry};
+use clojurecraft_clojure::EvalRequest;
+use clojurecraft_domain::{
+    Basis, FunctionId, InferenceRuntime, ModelIdentity, RevisionReason, SecretRegistry, ValidationReport,
+};
+use clojurecraft_inference::{GenerateRequest, RequestId};
 use clojurecraft_store::{Autosaver, FunctionSummary};
 use egui::{Id, Key, RichText, Ui};
 
-use crate::editor::{self, Action, EditorContext, ExpandTarget, Focus, Undo};
+use crate::editor::{self, Action, AssistStatus, EditorContext, ExpandTarget, Focus, Undo};
 use crate::edn_view::EdnCache;
-use crate::implementation::{self, Tab};
+use crate::execution::ExecutionState;
+use crate::generation_view::PanelAction;
+use crate::implementation::{self, ColumnContext, Tab, ValidationContext};
 use crate::inference::InferenceState;
 use crate::jobs::{Event, Jobs};
 use crate::keys::{self, DUPLICATE, FIND, NEW_FUNCTION, RENAME, SAVE};
 use crate::knowledge::KnowledgeState;
 use crate::knowledge_view;
-use crate::library::{Command, Library, LibraryEvent};
+use crate::library::{Command, Library, LibraryEvent, VALIDATIONS_SHOWN};
 use crate::model::RemedyAction;
 use crate::model_view;
 use crate::models_view::ModelsPage;
-use crate::session::{self, OpenDocument};
+use crate::session::{self, OpenDocs, OpenDocument};
 use crate::setup_view::{self, SetupAction, SetupPage};
 use crate::theme;
 use crate::views::{self, SettingsAction, TrashAction, WelcomeAction};
 use clojurecraft_runtime::settings::SetupState;
+use clojurecraft_workflow::Names;
+use clojurecraft_workflow::assistant::{Assistant, Gather, JobKind, ModelContext, Ports, Update};
+use clojurecraft_workflow::validation::{self, Plan, ReportContext};
 
 /// Toasts stay this long after the pointer or keyboard focus last left them.
 const TOAST_LIFETIME: Duration = Duration::from_secs(12);
@@ -56,6 +65,14 @@ struct Toast {
     shown_at: Instant,
 }
 
+/// A check of a function's current code that the user started.
+struct ManualCheck {
+    run: u64,
+    plan: Plan,
+    /// The function's content when the check started; the report is about exactly this.
+    basis: Basis,
+}
+
 enum Dialog {
     Purge(FunctionSummary),
     Recover(FunctionId),
@@ -78,6 +95,13 @@ pub struct ClojureCraftApp {
     open_errors: HashMap<FunctionId, (String, bool)>,
     inference: InferenceState,
     knowledge: KnowledgeState,
+    assistant: Assistant,
+    execution: ExecutionState,
+    /// Stored validation reports of open functions, newest first.
+    validations: HashMap<FunctionId, Vec<ValidationReport>>,
+    checks: HashMap<FunctionId, ManualCheck>,
+    /// Reports of finished checks, applied with the frame's other updates.
+    pending_reports: Vec<(FunctionId, ValidationReport)>,
     setup_page: SetupPage,
     models_page: ModelsPage,
     toasts: Vec<Toast>,
@@ -99,6 +123,7 @@ impl ClojureCraftApp {
         let library = Library::start(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
         let inference = InferenceState::new(jobs.sender(), cc.egui_ctx.clone(), secrets);
         let knowledge = KnowledgeState::new(jobs.sender(), cc.egui_ctx.clone());
+        let execution = ExecutionState::new(jobs.sender(), cc.egui_ctx.clone());
         let first_run = inference.settings.setup == SetupState::NotStarted;
         let reopen = cc
             .storage
@@ -120,6 +145,11 @@ impl ClojureCraftApp {
             open_errors: HashMap::new(),
             inference,
             knowledge,
+            assistant: Assistant::default(),
+            execution,
+            validations: HashMap::new(),
+            checks: HashMap::new(),
+            pending_reports: Vec::new(),
             setup_page: SetupPage::default(),
             models_page: ModelsPage::default(),
             toasts: Vec::new(),
@@ -151,11 +181,275 @@ impl ClojureCraftApp {
                 Event::Library(event) => self.library_event(event),
                 Event::Inference(event) => self.inference.handle(*event),
                 Event::Knowledge(event) => self.knowledge.handle(*event),
+                Event::Execution(event) => self.execution.handle(*event),
             }
         }
+        // Responses for the assistant, routed after the services updated their own state.
+        let unclaimed = std::mem::take(&mut self.inference.model.unclaimed);
+        let gathered = std::mem::take(&mut self.knowledge.gathered);
+        let mut executed = std::mem::take(&mut self.execution.finished);
+        // Checks the user started are completed here; the rest belong to the assistant.
+        executed.retain(|(run, execution)| {
+            let Some(function) = self.checks.iter().find(|(_, c)| c.run == *run).map(|(f, _)| *f) else {
+                return true;
+            };
+            if let Some(check) = self.checks.remove(&function) {
+                let report = validation::report(
+                    &check.plan,
+                    ReportContext {
+                        basis: check.basis,
+                        environment: execution.environment.clone(),
+                        attempt: None,
+                        run: None,
+                        outcome: execution.outcome.as_ref().map_err(String::as_str),
+                    },
+                );
+                self.pending_reports.push((function, report));
+            }
+            false
+        });
+        let mut updates: Vec<Update> = std::mem::take(&mut self.pending_reports)
+            .into_iter()
+            .map(|(f, r)| Update::Validated(f, Box::new(r)))
+            .collect();
+        {
+            let mut ports = AppPorts {
+                inference: &mut self.inference,
+                knowledge: &mut self.knowledge,
+                execution: &mut self.execution,
+            };
+            for event in &unclaimed {
+                updates.extend(
+                    self.assistant
+                        .on_model(event, &mut OpenDocs(&mut self.docs), &mut ports),
+                );
+            }
+            for (request, result) in gathered {
+                self.assistant.on_gathered(request, result, &mut ports);
+            }
+            for (run, execution) in executed {
+                updates.extend(self.assistant.on_validated(
+                    run,
+                    execution,
+                    &mut OpenDocs(&mut self.docs),
+                    &mut ports,
+                ));
+            }
+        }
+        self.apply_updates(updates);
         for notice in std::mem::take(&mut self.inference.notices) {
             self.toast(notice, None);
         }
+    }
+
+    // ---- assistant --------------------------------------------------------------------------
+
+    fn apply_updates(&mut self, updates: Vec<Update>) {
+        for u in updates {
+            match u {
+                Update::Edited(id) => self.submit(id, false),
+                Update::Commit(id, reason) => self.commit(id, reason),
+                Update::Validated(id, report) => {
+                    let list = self.validations.entry(id).or_default();
+                    list.insert(0, (*report).clone());
+                    list.truncate(VALIDATIONS_SHOWN);
+                    self.library.send(Command::RecordValidation(id, report));
+                }
+            }
+        }
+    }
+
+    /// Checks the current code of `id` in the sandbox.
+    fn run_checks(&mut self, id: FunctionId) {
+        if self.checks.contains_key(&id) {
+            return;
+        }
+        let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
+            return;
+        };
+        let Some(source) = doc.implementation.as_ref().map(|i| i.source.clone()) else {
+            return;
+        };
+        let names = match doc.implementation.as_ref().and_then(|i| i.generation.as_ref()) {
+            Some(g) if !g.namespace.is_empty() && !g.function_name.is_empty() => Names {
+                namespace: g.namespace.clone(),
+                function: g.function_name.clone(),
+            },
+            _ => Names::for_document(&doc, |_| false),
+        };
+        let plan = validation::plan(&doc, &source, &names);
+        let basis = doc.basis();
+        let Some(request) = plan.request.clone() else {
+            // Parse or structure problems: complete without running anything.
+            let report = validation::report(
+                &plan,
+                ReportContext {
+                    basis,
+                    environment: self.execution.environment(),
+                    attempt: None,
+                    run: None,
+                    outcome: Err("not run"),
+                },
+            );
+            self.apply_updates(vec![Update::Validated(id, Box::new(report))]);
+            return;
+        };
+        match self.execution.start(request) {
+            Ok(run) => {
+                self.checks.insert(id, ManualCheck { run, plan, basis });
+            }
+            Err(e) => self.toast(e, None),
+        }
+    }
+
+    fn cancel_checks(&mut self, id: FunctionId) {
+        if let Some(check) = self.checks.remove(&id) {
+            self.execution.cancel(check.run);
+        }
+    }
+
+    /// Saves the draft and records it as a revision, in order with pending autosaves.
+    fn commit(&mut self, id: FunctionId, reason: RevisionReason) {
+        let Some(open) = self.docs.get_mut(&id) else {
+            return;
+        };
+        let seq = open.edited();
+        if let Some(autosaver) = &self.autosaver {
+            autosaver.commit(open.doc.clone(), seq, reason);
+        }
+    }
+
+    /// The loaded (or now loading) model, as recorded with generated code.
+    fn model_context(&mut self) -> Result<ModelContext, String> {
+        let (spec, key) = self.inference.ensure_model()?;
+        let record = self
+            .inference
+            .installed(&key)
+            .ok_or("The selected model is not installed.")?
+            .clone();
+        let file = record.files.first().ok_or("The selected model has no files.")?;
+        let release = self
+            .inference
+            .manifest
+            .as_ref()
+            .map(|m| m.llama_cpp.release.clone())
+            .unwrap_or_default();
+        let clojure_version = self
+            .knowledge
+            .runtime_clojure()
+            .map(str::to_owned)
+            .or_else(|| {
+                self.inference
+                    .manifest
+                    .as_ref()
+                    .map(|m| m.clojure.version.clone())
+            })
+            .unwrap_or_default();
+        Ok(ModelContext {
+            label: spec.label.clone(),
+            model: ModelIdentity {
+                display_name: record.display_name.clone(),
+                repository: record.repo.clone(),
+                revision: record.revision.clone(),
+                file: file.repo_path.clone(),
+                sha256: file.sha256.clone(),
+                quantization: record.quant.clone(),
+                architecture: record.architecture.clone(),
+            },
+            runtime: InferenceRuntime {
+                llama_cpp_release: release,
+                backend: spec.backend.to_lowercase(),
+            },
+            context_length: spec.context,
+            clojure_version,
+        })
+    }
+
+    /// Why no model work can start for `id` right now.
+    fn assist_blocked(&self, id: FunctionId) -> Option<String> {
+        if let Some(m) = self.inference.missing().first() {
+            return Some(m.describe());
+        }
+        let job = self.assistant.job()?;
+        if job.function == id {
+            return Some(format!(
+                "The model is busy: {}.",
+                job.phase.label().to_lowercase()
+            ));
+        }
+        let name = self
+            .docs
+            .get(&job.function)
+            .map_or("another function", |o| views::display_name(&o.doc.name));
+        Some(format!("The model is busy with “{name}”."))
+    }
+
+    fn start_job(&mut self, id: FunctionId, kind: JobKind) {
+        let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
+            return;
+        };
+        if let Some(why) = self.assist_blocked(id) {
+            self.toast(why, None);
+            return;
+        }
+        let model = match kind {
+            JobKind::Generate => match self.model_context() {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    self.toast(e, None);
+                    return;
+                }
+            },
+            _ => None,
+        };
+        let documentation = self.knowledge.active().is_some();
+        let mut ports = AppPorts {
+            inference: &mut self.inference,
+            knowledge: &mut self.knowledge,
+            execution: &mut self.execution,
+        };
+        match (kind, model) {
+            (JobKind::Interpret, _) => self.assistant.interpret(&doc, &mut ports),
+            (JobKind::ProposeContract, _) => self.assistant.propose_contract(&doc, &mut ports),
+            (JobKind::Generate, Some(model)) => {
+                self.assistant.generate(&doc, model, documentation, &mut ports)
+            }
+            (JobKind::Generate, None) => {}
+        }
+    }
+
+    fn cancel_job(&mut self) {
+        let mut ports = AppPorts {
+            inference: &mut self.inference,
+            knowledge: &mut self.knowledge,
+            execution: &mut self.execution,
+        };
+        self.assistant.cancel(&mut ports);
+    }
+
+    fn panel_action(&mut self, id: FunctionId, action: PanelAction) -> RemedyAction {
+        match action {
+            PanelAction::Generate => self.start_job(id, JobKind::Generate),
+            PanelAction::Cancel => self.cancel_job(),
+            PanelAction::AcceptPending => {
+                let result = match self.docs.get_mut(&id) {
+                    Some(open) => self.assistant.accept_pending(&mut open.doc),
+                    None => Ok(Vec::new()),
+                };
+                match result {
+                    Ok(updates) => self.apply_updates(updates),
+                    Err(e) => self.toast(format!("The code could not be used: {e}."), None),
+                }
+            }
+            PanelAction::DiscardPending => self.assistant.discard_pending(id),
+            PanelAction::Dismiss => self.assistant.dismiss_report(id),
+            PanelAction::Remedy(r) => return self.inference.apply_remedy(&r),
+            PanelAction::RunChecks => self.run_checks(id),
+            PanelAction::CancelChecks => self.cancel_checks(id),
+            PanelAction::InstallRuntime => self.execution.install(),
+            PanelAction::CancelInstall => self.execution.cancel_install(),
+        }
+        RemedyAction::None
     }
 
     fn library_event(&mut self, event: LibraryEvent) {
@@ -186,6 +480,9 @@ impl ClojureCraftApp {
                 self.loading.remove(&id);
                 self.open_errors.remove(&id);
                 // The in-memory copy is never older than the stored draft.
+                if !self.docs.contains_key(&id) {
+                    self.library.send(Command::LoadValidations(id));
+                }
                 self.docs.entry(id).or_insert_with(|| OpenDocument::new(*draft));
                 self.view = View::Function(id);
                 if created {
@@ -209,8 +506,20 @@ impl ClojureCraftApp {
                     Some(Undo::Function(id)),
                 );
             }
+            LibraryEvent::Validations { function, reports } => {
+                // Reports produced since the request was sent are newer than any stored ones.
+                let list = self.validations.entry(function).or_default();
+                for r in reports {
+                    if !list.iter().any(|x| x.id == r.id) {
+                        list.push(r);
+                    }
+                }
+                list.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+                list.truncate(VALIDATIONS_SHOWN);
+            }
             LibraryEvent::Purged(id) => {
                 self.docs.remove(&id);
+                self.validations.remove(&id);
                 self.toast("Deleted permanently".into(), None);
             }
             LibraryEvent::Failed { action, error } => {
@@ -222,11 +531,17 @@ impl ClojureCraftApp {
                 });
             }
             LibraryEvent::Autosave(event) => {
-                let id = match &event {
-                    clojurecraft_store::AutosaveEvent::Saved { function, .. }
-                    | clojurecraft_store::AutosaveEvent::Superseded { function, .. }
-                    | clojurecraft_store::AutosaveEvent::Failed { function, .. } => *function,
-                };
+                let id = event.function();
+                if let clojurecraft_store::AutosaveEvent::CommitFailed { error, .. } = &event {
+                    self.toasts.push(Toast {
+                        message: format!(
+                            "The revision could not be recorded: {error}. The draft is still saved."
+                        ),
+                        undo: None,
+                        error: true,
+                        shown_at: Instant::now(),
+                    });
+                }
                 if let Some(open) = self.docs.get_mut(&id) {
                     open.apply(&event);
                 }
@@ -610,14 +925,22 @@ impl ClojureCraftApp {
             }
             return;
         }
-        let Some(open) = self.docs.get_mut(&id) else {
+        if !self.docs.contains_key(&id) {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(RichText::new("Opening…").color(theme::MUTED));
             });
             return;
-        };
+        }
         let mut actions = Vec::new();
+        let assist = AssistStatus {
+            blocked: self.assist_blocked(id),
+            job: self.assistant.busy_with(id).map(|j| (j.kind, j.phase)),
+            report: self.assistant.report(id).cloned(),
+        };
+        let Some(open) = self.docs.get_mut(&id) else {
+            return;
+        };
         let changed = egui::ScrollArea::vertical()
             .id_salt(("editor", id))
             .auto_shrink([false, false])
@@ -629,6 +952,7 @@ impl ClojureCraftApp {
                     focus: &mut self.focus,
                     expanded: &mut self.expanded,
                     actions: &mut actions,
+                    assist: &assist,
                 };
                 editor::show(ui, open, &mut cx)
             })
@@ -642,6 +966,10 @@ impl ClojureCraftApp {
                 Action::Trash => self.trash_function(id),
                 Action::RetrySave => self.submit(id, true),
                 Action::Removed { message, undo } => self.toast(message, Some(undo)),
+                Action::Interpret => self.start_job(id, JobKind::Interpret),
+                Action::ProposeContract => self.start_job(id, JobKind::ProposeContract),
+                Action::CancelJob => self.cancel_job(),
+                Action::DismissReport => self.assistant.dismiss_report(id),
             }
         }
     }
@@ -786,6 +1114,36 @@ impl ClojureCraftApp {
     }
 }
 
+/// The assistant's access to inference, documentation, and execution.
+struct AppPorts<'a> {
+    inference: &'a mut InferenceState,
+    knowledge: &'a mut KnowledgeState,
+    execution: &'a mut ExecutionState,
+}
+
+impl Ports for AppPorts<'_> {
+    fn generate(&mut self, request: GenerateRequest) -> Result<RequestId, String> {
+        self.inference.ensure_model()?;
+        self.inference.generate(request)
+    }
+
+    fn cancel(&mut self, request: RequestId) {
+        self.inference.cancel_request(request);
+    }
+
+    fn gather(&mut self, gather: Gather) -> Option<u64> {
+        self.knowledge.gather(gather)
+    }
+
+    fn validate(&mut self, request: EvalRequest) -> Result<u64, String> {
+        self.execution.start(request)
+    }
+
+    fn cancel_validation(&mut self, id: u64) {
+        self.execution.cancel(id);
+    }
+}
+
 /// A full-width, left-aligned selectable row.
 fn list_item(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
@@ -824,10 +1182,15 @@ impl eframe::App for ClojureCraftApp {
         let mut open_setup = false;
         let mut open_knowledge = false;
         let mut remedy = RemedyAction::None;
+        let blocked = match self.view {
+            View::Function(id) => self.assist_blocked(id),
+            _ => None,
+        };
         let current = match self.view {
             View::Function(id) => self.docs.get(&id).map(|o| &o.doc),
             _ => None,
         };
+        let mut panel = None;
         egui::Panel::right("implementation")
             .resizable(true)
             .default_size(400.0)
@@ -846,12 +1209,35 @@ impl eframe::App for ClojureCraftApp {
                             remedy = model_view::status(ui, &mut self.inference, true);
                         });
                 }
-                match implementation::show(ui, &mut self.right_tab, current, &missing, &mut self.knowledge) {
+                let reports = current
+                    .and_then(|d| self.validations.get(&d.id))
+                    .map_or(&[][..], Vec::as_slice);
+                let cx = ColumnContext {
+                    missing: &missing,
+                    knowledge: &mut self.knowledge,
+                    assistant: &self.assistant,
+                    blocked,
+                    validation: ValidationContext {
+                        reports,
+                        running: current.is_some_and(|d| self.checks.contains_key(&d.id)),
+                        unavailable: self.execution.runtime().err(),
+                        installable: self.execution.installable(),
+                        install: &self.execution.install,
+                    },
+                };
+                match implementation::show(ui, &mut self.right_tab, current, cx) {
                     implementation::ColumnAction::OpenSetup => open_setup = true,
                     implementation::ColumnAction::OpenKnowledge => open_knowledge = true,
+                    implementation::ColumnAction::Generation(a) => panel = current.map(|d| (d.id, a)),
                     implementation::ColumnAction::None => {}
                 }
             });
+        if let Some((id, action)) = panel {
+            let r = self.panel_action(id, action);
+            if r != RemedyAction::None {
+                remedy = r;
+            }
+        }
         match remedy {
             RemedyAction::OpenSetup => open_setup = true,
             RemedyAction::OpenSettings => self.view = View::Settings,

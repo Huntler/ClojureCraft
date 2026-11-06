@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::DomainError;
 use crate::fingerprint::Fingerprint;
 use crate::ids::{
-    BenchmarkConfigId, BenchmarkInputId, ExampleId, FunctionId, RevisionId, StepId, TestCaseId,
+    BenchmarkConfigId, BenchmarkInputId, ClarificationId, ExampleId, FunctionId, RevisionId, StepId,
+    TestCaseId,
 };
 use crate::time::Timestamp;
 
@@ -35,6 +36,14 @@ pub struct FunctionDocument {
     pub contract: Option<Contract>,
     pub steps: Vec<Step>,
     pub examples: Vec<Example>,
+    /// Questions about the specification and the user's answers. Answered questions are part of
+    /// the specification; open and dismissed ones are not.
+    #[serde(default)]
+    pub clarifications: Vec<Clarification>,
+    /// The model's restatement of the specification, kept next to (never instead of) the user's
+    /// own text.
+    #[serde(default)]
+    pub interpretation: Option<Interpretation>,
     pub implementation: Option<Implementation>,
     pub tests: Vec<TestCase>,
     pub benchmarks: Vec<BenchmarkConfig>,
@@ -49,6 +58,8 @@ impl FunctionDocument {
             contract: None,
             steps: Vec::new(),
             examples: Vec::new(),
+            clarifications: Vec::new(),
+            interpretation: None,
             implementation: None,
             tests: Vec::new(),
             benchmarks: Vec::new(),
@@ -138,6 +149,23 @@ impl FunctionDocument {
         true
     }
 
+    pub fn clarification_mut(&mut self, id: ClarificationId) -> Option<&mut Clarification> {
+        self.clarifications.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Answered questions, which count as requirements.
+    pub fn answered_clarifications(&self) -> impl Iterator<Item = &Clarification> {
+        self.clarifications.iter().filter(|c| c.is_answered())
+    }
+
+    /// Replaces the open questions with `questions`. Answered and dismissed questions are kept,
+    /// so a new interpretation never discards the user's answers.
+    pub fn replace_open_questions(&mut self, questions: Vec<Clarification>) {
+        self.clarifications
+            .retain(|c| c.status != ClarificationStatus::Open);
+        self.clarifications.extend(questions);
+    }
+
     /// Every reference from an example input to another function's output.
     pub fn output_references(&self) -> impl Iterator<Item = (ExampleId, &OutputReference)> {
         self.examples.iter().filter_map(|e| match &e.input {
@@ -184,6 +212,10 @@ pub enum ContractStatus {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Shape {
     pub description: String,
+    /// The type of the whole value.
+    #[serde(default, skip_serializing_if = "ValueType::is_any")]
+    pub value_type: ValueType,
+    /// Keys of the value when it is a map, or of each element when it is a collection of maps.
     pub keys: Vec<KeySpec>,
 }
 
@@ -197,9 +229,10 @@ pub struct KeySpec {
     pub notes: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type", content = "name")]
 pub enum ValueType {
+    #[default]
     Any,
     Nil,
     Boolean,
@@ -215,6 +248,49 @@ pub enum ValueType {
     Sequential,
     /// A type described in the user's own words.
     Other(String),
+}
+
+impl ValueType {
+    /// Every type with a fixed meaning, in the order offered to users.
+    pub const KNOWN: [Self; 14] = [
+        Self::Any,
+        Self::Nil,
+        Self::Boolean,
+        Self::Integer,
+        Self::Number,
+        Self::String,
+        Self::Keyword,
+        Self::Symbol,
+        Self::Map,
+        Self::Vector,
+        Self::List,
+        Self::Set,
+        Self::Sequential,
+        Self::Other(String::new()),
+    ];
+
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Any => "any value",
+            Self::Nil => "nil",
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Keyword => "keyword",
+            Self::Symbol => "symbol",
+            Self::Map => "map",
+            Self::Vector => "vector",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::Sequential => "sequential collection",
+            Self::Other(_) => "other",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +317,88 @@ pub enum OrderingRequirement {
     Unordered,
     /// Output is sorted as described.
     Sorted(String),
+}
+
+/// A question about the specification, asked so that an ambiguity or contradiction is decided by
+/// the user instead of becoming a hidden assumption.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clarification {
+    pub id: ClarificationId,
+    pub question: String,
+    /// The contradiction or gap the question resolves.
+    pub context: String,
+    /// Suggested answers; the user may also answer in their own words.
+    pub options: Vec<String>,
+    /// Parts of the specification concerned, for example "step 2" or "example 1".
+    pub refers_to: Vec<String>,
+    pub answer: String,
+    pub status: ClarificationStatus,
+}
+
+impl Clarification {
+    pub fn open(question: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            id: ClarificationId::generate(),
+            question: question.into(),
+            context: context.into(),
+            options: Vec::new(),
+            refers_to: Vec::new(),
+            answer: String::new(),
+            status: ClarificationStatus::Open,
+        }
+    }
+
+    /// Records the user's answer; an empty answer leaves the question open.
+    pub fn answer(&mut self, answer: impl Into<String>) {
+        self.answer = answer.into();
+        self.status = if self.answer.trim().is_empty() {
+            ClarificationStatus::Open
+        } else {
+            ClarificationStatus::Answered
+        };
+    }
+
+    pub fn is_answered(&self) -> bool {
+        self.status == ClarificationStatus::Answered && !self.answer.trim().is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClarificationStatus {
+    Open,
+    Answered,
+    /// The user decided the question does not matter.
+    Dismissed,
+}
+
+/// The model's reading of the specification. It never replaces the user's text and has no effect
+/// on generation; only the user's answers to the questions it raises do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interpretation {
+    pub restatement: String,
+    pub assumptions: Vec<String>,
+    pub issues: Vec<Issue>,
+    /// The specification fingerprint the interpretation was made from.
+    pub spec_basis: Fingerprint,
+    pub model: String,
+    pub created_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Issue {
+    pub kind: IssueKind,
+    pub detail: String,
+    pub refers_to: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueKind {
+    /// Two parts of the specification disagree.
+    Contradiction,
+    /// Something that affects the output is not specified.
+    Gap,
 }
 
 /// One natural-language transformation step. The identifier survives reordering and rewording.
@@ -355,6 +513,57 @@ pub struct GenerationRecord {
     /// 1 for the initial generation, plus one per repair attempt.
     pub attempts: u32,
     pub created_at: Timestamp,
+    /// The namespace and public function the code defines.
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub function_name: String,
+    /// Namespaces required by the code, besides `clojure.core`.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Decisions the model made where the specification was silent.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    /// Optional prompt content left out to fit the context (for example documentation).
+    #[serde(default)]
+    pub omitted_context: Vec<String>,
+    #[serde(default)]
+    pub explanation: Option<Explanation>,
+}
+
+/// A plain-language explanation of generated code.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Explanation {
+    pub summary: String,
+    /// Which code implements each transformation step.
+    pub steps: Vec<StepMapping>,
+    /// Standard-library functions used and what each does here.
+    pub symbols: Vec<SymbolUse>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepMapping {
+    pub step: StepId,
+    /// The step's text when the code was explained.
+    pub step_text: String,
+    /// The code the model attributes to the step, as quoted by the model.
+    pub excerpt: String,
+    /// Lines (1-based, inclusive) where the excerpt was found in the source; `None` when it could
+    /// not be located, in which case the mapping is shown as approximate.
+    pub lines: Option<LineRange>,
+    pub explanation: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolUse {
+    pub symbol: String,
+    pub purpose: String,
 }
 
 /// Which model produced a result. Locations are repository coordinates, never download URLs, so

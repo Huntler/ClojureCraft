@@ -385,7 +385,7 @@ fn structured_answers_are_validated_and_malformed_ones_keep_the_raw_text() {
         Some(answer_schema())
     );
 
-    for expected in ["missing key \"requires\"", "not valid JSON", "cut off"] {
+    for expected in ["missing key \"requires\"", "not valid JSON"] {
         let id = h.service.generate(structured());
         match h.finished(id).1 {
             Err(GenerationError::Malformed { problem, raw }) => {
@@ -394,6 +394,11 @@ fn structured_answers_are_validated_and_malformed_ones_keep_the_raw_text() {
             }
             other => panic!("{other:?}"),
         }
+    }
+    let id = h.service.generate(structured());
+    match h.finished(id).1 {
+        Err(e @ GenerationError::CutOff { .. }) => assert!(e.to_string().contains("cut off"), "{e}"),
+        other => panic!("{other:?}"),
     }
 }
 

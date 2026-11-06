@@ -74,7 +74,7 @@ impl OpenDocument {
     /// Applies an autosave outcome. Outcomes may arrive out of order relative to edits.
     pub fn apply(&mut self, event: &AutosaveEvent) {
         match event {
-            AutosaveEvent::Saved { seq, .. } => {
+            AutosaveEvent::Saved { seq, .. } | AutosaveEvent::Committed { seq, .. } => {
                 self.saved_seq = self.saved_seq.max(*seq);
                 if self
                     .failure
@@ -95,6 +95,8 @@ impl OpenDocument {
                     conflict: true,
                 });
             }
+            // The draft is still saved as an ordinary edit, which reports its own outcome.
+            AutosaveEvent::CommitFailed { .. } => {}
             AutosaveEvent::Failed {
                 seq,
                 error,
@@ -129,6 +131,15 @@ impl OpenDocument {
             self.failure = None;
         }
         self.edited()
+    }
+}
+
+/// The open documents, as the assistant changes them.
+pub struct OpenDocs<'a>(pub &'a mut std::collections::HashMap<clojurecraft_domain::FunctionId, OpenDocument>);
+
+impl clojurecraft_workflow::assistant::Documents for OpenDocs<'_> {
+    fn document(&mut self, id: clojurecraft_domain::FunctionId) -> Option<&mut FunctionDocument> {
+        self.0.get_mut(&id).map(|o| &mut o.doc)
     }
 }
 

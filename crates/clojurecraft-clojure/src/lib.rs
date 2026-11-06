@@ -9,10 +9,17 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clojurecraft_sandbox::{Outcome, Policy, RunRequest, Termination, run};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+pub mod policy;
+
+pub use policy::{HarnessPolicy, harness_policy};
 
 pub const HARNESS_SOURCE: &str = include_str!("../../../resources/clojure/harness.clj");
 
@@ -55,33 +62,385 @@ impl Default for Limits {
     }
 }
 
+/// Time for starting the JVM, reading, checking, linting, and loading the code.
+const STARTUP_ALLOWANCE: Duration = Duration::from_secs(20);
+
+impl Limits {
+    /// Limits for a request: start-up plus every call's own time limit, so the process limit is
+    /// only a backstop behind the per-call limits enforced inside the JVM.
+    pub fn for_request(req: &EvalRequest) -> Self {
+        let calls = u32::try_from(req.calls.len()).unwrap_or(u32::MAX);
+        let wall = STARTUP_ALLOWANCE
+            .saturating_add(
+                req.call_timeout
+                    .saturating_add(Duration::from_millis(500))
+                    .saturating_mul(calls),
+            )
+            .min(Duration::from_secs(600));
+        Self {
+            wall,
+            cpu_seconds: wall.as_secs() + 10,
+            ..Self::default()
+        }
+    }
+}
+
+/// One call of the candidate function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    /// The input as EDN text.
+    pub input: String,
+    /// The expected output as EDN text; without it the call only reports the value.
+    pub expected: Option<String>,
+}
+
+/// How results are compared with expected values. Apart from the options here, comparison
+/// follows Clojure's `=`: sequential collections (vectors, lists, sequences) are equal when their
+/// elements are equal in order, maps and sets regardless of order, and integers regardless of
+/// their class (`1` equals `1N`). Numbers of different categories are never equal: an integer is
+/// not equal to a floating-point number or a ratio (`1` differs from `1.0` and from `1/1` written
+/// as `1.0`), and a BigDecimal only equals a BigDecimal of the same value (`1.50M` equals `1.5M`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Equality {
+    /// Floating-point numbers are equal when they differ by at most this fraction of the larger
+    /// magnitude (or by 1e-12 near zero). `NaN` equals `NaN`. Map keys and set elements are
+    /// compared exactly.
+    pub float_tolerance: f64,
+    /// The top-level output, when sequential, is compared as a multiset: order is ignored, but
+    /// every element must be matched once.
+    pub unordered: bool,
+}
+
+impl Default for Equality {
+    fn default() -> Self {
+        Self {
+            float_tolerance: 1e-9,
+            unordered: false,
+        }
+    }
+}
+
+/// The type a value must have, as checked by the harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeRule {
+    Nil,
+    Boolean,
+    Integer,
+    Number,
+    String,
+    Keyword,
+    Symbol,
+    Map,
+    Vector,
+    /// A list or any other sequence.
+    List,
+    Set,
+    Sequential,
+}
+
+impl TypeRule {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Nil => ":nil",
+            Self::Boolean => ":boolean",
+            Self::Integer => ":integer",
+            Self::Number => ":number",
+            Self::String => ":string",
+            Self::Keyword => ":keyword",
+            Self::Symbol => ":symbol",
+            Self::Map => ":map",
+            Self::Vector => ":vector",
+            Self::List => ":list",
+            Self::Set => ":set",
+            Self::Sequential => ":sequential",
+        }
+    }
+}
+
+/// A rule for one key of the output map (or of each map in an output collection).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRule {
+    /// The key as EDN text.
+    pub key: String,
+    pub required: bool,
+    pub value_type: Option<TypeRule>,
+    pub nil_allowed: bool,
+}
+
+/// The checkable part of an output contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputRules {
+    pub value_type: Option<TypeRule>,
+    pub keys: Vec<KeyRule>,
+}
+
+impl OutputRules {
+    pub fn is_empty(&self) -> bool {
+        self.value_type.is_none() && self.keys.is_empty()
+    }
+
+    fn to_edn(&self) -> String {
+        let ty = |t: Option<TypeRule>| t.map_or(":any", TypeRule::keyword);
+        let keys: Vec<String> = self
+            .keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "{{:key {} :required {} :type {} :nil {}}}",
+                    edn_string(&k.key),
+                    k.required,
+                    ty(k.value_type),
+                    if k.nil_allowed { ":allowed" } else { ":disallowed" }
+                )
+            })
+            .collect();
+        format!(
+            "{{:output {{:type {} :keys [{}]}}}}",
+            ty(self.value_type),
+            keys.join(" ")
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EvalRequest {
     pub code: String,
     pub function: String,
-    /// Each input as EDN text.
-    pub inputs: Vec<String>,
+    pub calls: Vec<Call>,
     /// Static checks; only disabled to demonstrate that the OS sandbox holds on its own.
     pub static_checks: bool,
+    /// Analyse the code after macroexpansion before loading it.
+    pub lint: bool,
+    pub output_rules: Option<OutputRules>,
+    pub equality: Equality,
+    /// Time limit of each call, including realizing its result.
+    pub call_timeout: Duration,
+    /// Elements a result may have once realized; more is reported as too large (and is how an
+    /// infinite lazy sequence shows up).
+    pub max_elements: u64,
+}
+
+impl EvalRequest {
+    /// A checked and linted request with default comparison and limits.
+    pub fn new(code: impl Into<String>, function: impl Into<String>, calls: Vec<Call>) -> Self {
+        Self {
+            code: code.into(),
+            function: function.into(),
+            calls,
+            static_checks: true,
+            lint: true,
+            output_rules: None,
+            equality: Equality::default(),
+            call_timeout: Duration::from_secs(5),
+            max_elements: 1_000_000,
+        }
+    }
+
+    pub fn to_edn(&self) -> String {
+        let calls: Vec<String> = self
+            .calls
+            .iter()
+            .map(|c| match &c.expected {
+                Some(e) => format!("{{:input {} :expected {}}}", edn_string(&c.input), edn_string(e)),
+                None => format!("{{:input {}}}", edn_string(&c.input)),
+            })
+            .collect();
+        let contract = match &self.output_rules {
+            Some(r) if !r.is_empty() => format!(" :contract {}", r.to_edn()),
+            _ => String::new(),
+        };
+        format!(
+            "{{:code {} :fn {} :calls [{}] :checks {} :lint {}{contract} :equality {{:float-tolerance {:e} :unordered {}}} :call-ms {} :max-elements {}}}",
+            edn_string(&self.code),
+            edn_string(&self.function),
+            calls.join(" "),
+            self.static_checks,
+            self.lint,
+            self.equality.float_tolerance,
+            self.equality.unordered,
+            self.call_timeout.as_millis(),
+            self.max_elements,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalStatus {
-    /// The harness produced a response (which may still report check, load, or call errors).
+    /// The harness finished (its report may still contain check, load, or call errors), or
+    /// stopped itself after a call exceeded its time limit.
     Completed,
     TimedOut,
     OutputLimitExceeded,
     MemoryLimitExceeded,
-    /// The JVM ended without a response (crash, CPU limit, or startup failure).
+    /// The JVM ended without finishing (crash, CPU limit, or startup failure).
     Crashed(String),
     SandboxUnavailable(String),
+    Cancelled,
+}
+
+/// An error reported by the harness for a stage or a call.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct HarnessError {
+    /// `read`, `check`, `load`, `call`, `realize`, or `expected`.
+    #[serde(default)]
+    pub phase: String,
+    /// The exception class, when there was one.
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// The offending form, for static check violations.
+    #[serde(default)]
+    pub form: Option<String>,
+    /// For a call error, the `clojure.core` function the exception surfaced in.
+    #[serde(default, rename = "in")]
+    pub within: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct LintFinding {
+    pub level: LintLevel,
+    #[serde(default)]
+    pub line: Option<u32>,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallStatus {
+    /// The function returned and its result was realized.
+    Ok,
+    /// The function (or reading its input) threw.
+    Error,
+    /// The call exceeded its time limit; the harness stopped afterwards.
+    Timeout,
+    /// The realized result exceeded the element limit.
+    TooLarge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct CallResult {
+    pub index: usize,
+    pub status: CallStatus,
+    /// The result printed readably, bounded in length.
+    #[serde(default)]
+    pub actual: Option<String>,
+    /// Whether the result equals the expected value; absent without an expected value.
+    #[serde(default, rename = "match")]
+    pub matches: Option<bool>,
+    /// The first difference from the expected value.
+    #[serde(default)]
+    pub difference: Option<String>,
+    /// Output contract violations.
+    #[serde(default)]
+    pub contract: Vec<String>,
+    /// Text the function printed, bounded.
+    #[serde(default)]
+    pub out: String,
+    #[serde(default, rename = "elapsed-ns")]
+    pub elapsed_ns: u64,
+    #[serde(default)]
+    pub error: Option<HarnessError>,
+    /// Explanation for statuses without an exception (too large).
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+enum Line {
+    Read {
+        ok: bool,
+        #[serde(flatten)]
+        error: HarnessError,
+    },
+    Check {
+        ok: bool,
+        #[serde(flatten)]
+        error: HarnessError,
+    },
+    Lint {
+        findings: Vec<LintFinding>,
+    },
+    Load {
+        ok: bool,
+        #[serde(flatten)]
+        error: HarnessError,
+    },
+    Start {
+        index: usize,
+    },
+    Result(CallResult),
+    Halted,
+    Done,
+}
+
+/// What the harness reported, stage by stage. A stage that never reported (because an earlier
+/// one failed or the process ended) is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarnessReport {
+    pub read: Option<Result<(), HarnessError>>,
+    pub check: Option<Result<(), HarnessError>>,
+    pub lint: Option<Vec<LintFinding>>,
+    pub load: Option<Result<(), HarnessError>>,
+    pub results: Vec<CallResult>,
+    /// The call that had started but not finished when the process ended.
+    pub running: Option<usize>,
+    /// The harness stopped itself after a call timed out.
+    pub halted: bool,
+    pub done: bool,
+    /// Output lines that were not part of the protocol (at most a few, shortened).
+    pub stray: Vec<String>,
+}
+
+impl HarnessReport {
+    /// Reads the harness's output, tolerating a final line cut off by the process ending.
+    pub fn parse(stdout: &str) -> Self {
+        let mut r = Self::default();
+        for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(parsed) = serde_json::from_str::<Line>(line) else {
+                if r.stray.len() < 5 {
+                    r.stray.push(line.chars().take(300).collect());
+                }
+                continue;
+            };
+            match parsed {
+                Line::Read { ok, error } => r.read = Some((!ok).then_some(error).map_or(Ok(()), Err)),
+                Line::Check { ok, error } => r.check = Some((!ok).then_some(error).map_or(Ok(()), Err)),
+                Line::Lint { findings } => r.lint = Some(findings),
+                Line::Load { ok, error } => r.load = Some((!ok).then_some(error).map_or(Ok(()), Err)),
+                Line::Start { index } => r.running = Some(index),
+                Line::Result(result) => {
+                    if r.running == Some(result.index) {
+                        r.running = None;
+                    }
+                    r.results.push(result);
+                }
+                Line::Halted => r.halted = true,
+                Line::Done => r.done = true,
+            }
+        }
+        r
+    }
+
+    pub fn result(&self, index: usize) -> Option<&CallResult> {
+        self.results.iter().find(|r| r.index == index)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct EvalOutcome {
     pub status: EvalStatus,
-    /// The harness's EDN response when `status` is `Completed`.
-    pub response: String,
+    pub report: HarnessReport,
     pub stderr: String,
     pub elapsed: Duration,
 }
@@ -107,19 +466,6 @@ pub fn edn_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-impl EvalRequest {
-    pub fn to_edn(&self) -> String {
-        let inputs: Vec<String> = self.inputs.iter().map(|i| edn_string(i)).collect();
-        format!(
-            "{{:code {} :fn {} :inputs [{}] :checks {}}}",
-            edn_string(&self.code),
-            edn_string(&self.function),
-            inputs.join(" "),
-            self.static_checks
-        )
-    }
 }
 
 /// The result of running a script shipped with the application.
@@ -198,7 +544,7 @@ impl ClojureRuntime {
         limits: &Limits,
     ) -> Result<ScriptOutcome, EvalError> {
         let script = self.script_path(stem, source)?;
-        let (status, stdout, stderr, elapsed) = self.run_sandboxed(&script, stdin, limits, |_| true)?;
+        let (status, stdout, stderr, elapsed) = self.run_sandboxed(&script, stdin, limits, None, |_| true)?;
         Ok(ScriptOutcome {
             status,
             stdout,
@@ -212,6 +558,7 @@ impl ClojureRuntime {
         script: &Path,
         stdin: &[u8],
         limits: &Limits,
+        cancel: Option<Arc<AtomicBool>>,
         completed: impl Fn(&str) -> bool,
     ) -> Result<(EvalStatus, String, String, Duration), EvalError> {
         let outcome: Outcome = run(&RunRequest {
@@ -224,6 +571,7 @@ impl ClojureRuntime {
             wall_timeout: limits.wall,
             max_stdout: limits.max_output_bytes,
             max_stderr: 64 * 1024,
+            cancel,
         })?;
         let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
@@ -234,25 +582,28 @@ impl ClojureRuntime {
             Termination::Signaled(s) => EvalStatus::Crashed(format!("killed by signal {s}")),
             Termination::TimedOut => EvalStatus::TimedOut,
             Termination::OutputLimitExceeded => EvalStatus::OutputLimitExceeded,
+            Termination::Cancelled => EvalStatus::Cancelled,
             Termination::SandboxSetupFailed => EvalStatus::SandboxUnavailable(stderr.clone()),
         };
         Ok((status, stdout, stderr, outcome.elapsed))
     }
 
-    pub fn evaluate(&self, req: &EvalRequest, limits: &Limits) -> Result<EvalOutcome, EvalError> {
+    /// Runs `req` in a fresh sandboxed JVM. `cancel`, when set from another thread, stops it.
+    pub fn evaluate(
+        &self,
+        req: &EvalRequest,
+        limits: &Limits,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<EvalOutcome, EvalError> {
         let harness = self.script_path("harness", HARNESS_SOURCE)?;
         let (status, stdout, stderr, elapsed) =
-            self.run_sandboxed(&harness, req.to_edn().as_bytes(), limits, |out| {
-                out.trim_start().starts_with('{')
+            self.run_sandboxed(&harness, req.to_edn().as_bytes(), limits, cancel, |out| {
+                out.lines()
+                    .any(|l| l == r#"{"event":"done"}"# || l == r#"{"event":"halted"}"#)
             })?;
-        let response = if status == EvalStatus::Completed {
-            stdout
-        } else {
-            String::new()
-        };
         Ok(EvalOutcome {
             status,
-            response,
+            report: HarnessReport::parse(&stdout),
             stderr,
             elapsed,
         })
@@ -270,15 +621,88 @@ mod tests {
 
     #[test]
     fn request_is_one_edn_map() {
-        let r = EvalRequest {
-            code: "(ns a)".into(),
-            function: "f".into(),
-            inputs: vec!["{:a 1}".into(), "\"s\"".into()],
-            static_checks: true,
-        };
+        let mut r = EvalRequest::new(
+            "(ns a)",
+            "f",
+            vec![
+                Call {
+                    input: "{:a 1}".into(),
+                    expected: Some("\"s\"".into()),
+                },
+                Call {
+                    input: "2".into(),
+                    expected: None,
+                },
+            ],
+        );
+        r.output_rules = Some(OutputRules {
+            value_type: Some(TypeRule::Map),
+            keys: vec![KeyRule {
+                key: ":total".into(),
+                required: true,
+                value_type: Some(TypeRule::Integer),
+                nil_allowed: false,
+            }],
+        });
         assert_eq!(
             r.to_edn(),
-            r#"{:code "(ns a)" :fn "f" :inputs ["{:a 1}" "\"s\""] :checks true}"#
+            r#"{:code "(ns a)" :fn "f" :calls [{:input "{:a 1}" :expected "\"s\""} {:input "2"}] :checks true :lint true :contract {:output {:type :map :keys [{:key ":total" :required true :type :integer :nil :disallowed}]}} :equality {:float-tolerance 1e-9 :unordered false} :call-ms 5000 :max-elements 1000000}"#
         );
+    }
+
+    #[test]
+    fn the_report_attributes_a_process_that_died_mid_call() {
+        let out = concat!(
+            r#"{"event":"read","ok":true,"forms":2}"#,
+            "\n",
+            r#"{"event":"check","ok":true}"#,
+            "\n",
+            r#"{"event":"lint","findings":[{"level":"warning","line":2,"message":"x is bound but never used"}]}"#,
+            "\n",
+            r#"{"event":"load","ok":true}"#,
+            "\n",
+            r#"{"event":"start","index":0}"#,
+            "\n",
+            r#"{"index":0,"status":"ok","actual":"[1]","match":false,"difference":"the output: expected 2 elements","contract":[],"out":"","elapsed-ns":10,"event":"result"}"#,
+            "\n",
+            r#"{"event":"start","index":1}"#,
+            "\n",
+            r#"{"index":1,"status":"ok","act"#,
+        );
+        let r = HarnessReport::parse(out);
+        assert_eq!(r.read, Some(Ok(())));
+        assert_eq!(r.lint.as_ref().map(Vec::len), Some(1));
+        assert_eq!(r.results.len(), 1);
+        assert_eq!(r.results[0].matches, Some(false));
+        assert_eq!(r.running, Some(1), "the unfinished call is known");
+        assert!(!r.done && !r.halted);
+        assert_eq!(r.stray.len(), 1);
+    }
+
+    #[test]
+    fn stage_errors_keep_their_position() {
+        let r = HarnessReport::parse(
+            r#"{"phase":"load","class":"java.lang.RuntimeException","message":"Unable to resolve symbol: x","line":7,"form":null,"event":"load","ok":false}"#,
+        );
+        let Some(Err(e)) = r.load else { panic!("{r:?}") };
+        assert_eq!(
+            (e.line, e.class.as_str()),
+            (Some(7), "java.lang.RuntimeException")
+        );
+    }
+
+    #[test]
+    fn the_process_limit_covers_every_call() {
+        let mut r = EvalRequest::new("", "f", vec![]);
+        r.calls = vec![
+            Call {
+                input: "1".into(),
+                expected: None,
+            };
+            3
+        ];
+        let l = Limits::for_request(&r);
+        assert_eq!(l.wall, Duration::from_millis(20_000 + 3 * 5_500));
+        assert!(l.cpu_seconds >= l.wall.as_secs());
     }
 }

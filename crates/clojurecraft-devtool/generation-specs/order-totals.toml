@@ -1,0 +1,17 @@
+# Grouping and summing: the classic group-by / update-vals transformation.
+name = "Order totals"
+description = "Total the order amounts per customer."
+steps = [
+  "Group the orders by :customer.",
+  "Sum the :amount of each customer's orders.",
+]
+
+[[examples]]
+name = "two customers"
+input = '[{:customer "ann" :amount 10} {:customer "bob" :amount 5} {:customer "ann" :amount 2.5}]'
+expected = '{"ann" 12.5 "bob" 5}'
+
+[[examples]]
+name = "no orders"
+input = '[]'
+expected = '{}'

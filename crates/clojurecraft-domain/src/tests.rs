@@ -45,6 +45,9 @@ fn report_for(doc: &FunctionDocument) -> ValidationReport {
             duration_ms: Some(3),
         }],
         attempt: None,
+        run: None,
+        source: None,
+        settings: None,
     }
 }
 
@@ -331,4 +334,74 @@ fn a_new_example_is_empty_and_direct() {
         }
     );
     assert!(example.expected.as_str().is_empty());
+}
+
+#[test]
+fn only_answered_clarifications_change_the_specification() {
+    let mut doc = sample();
+    let before = doc.spec_fingerprint();
+    let mut question = Clarification::open("Are refunds negative amounts?", "step 2 says sum");
+    doc.replace_open_questions(vec![question.clone()]);
+    assert_eq!(
+        doc.spec_fingerprint(),
+        before,
+        "an open question is not a requirement"
+    );
+
+    doc.interpretation = Some(Interpretation {
+        restatement: "Totals per customer".into(),
+        assumptions: vec!["amounts are numbers".into()],
+        issues: vec![],
+        spec_basis: before.clone(),
+        model: "m".into(),
+        created_at: Timestamp(0),
+    });
+    assert_eq!(
+        doc.spec_fingerprint(),
+        before,
+        "the model's reading is not a requirement"
+    );
+
+    let id = question.id;
+    doc.clarification_mut(id)
+        .unwrap()
+        .answer("yes, keep them negative");
+    let answered = doc.spec_fingerprint();
+    assert_ne!(answered, before);
+
+    // An empty answer reopens the question.
+    doc.clarification_mut(id).unwrap().answer("  ");
+    assert_eq!(doc.spec_fingerprint(), before);
+    doc.clarification_mut(id).unwrap().status = ClarificationStatus::Dismissed;
+    assert_eq!(doc.spec_fingerprint(), before);
+
+    question.answer("yes");
+    doc.clarifications = vec![question];
+    assert_ne!(doc.spec_fingerprint(), before);
+}
+
+#[test]
+fn new_questions_never_discard_answers() {
+    let mut doc = sample();
+    let mut answered = Clarification::open("a?", "");
+    answered.answer("yes");
+    let mut dismissed = Clarification::open("b?", "");
+    dismissed.status = ClarificationStatus::Dismissed;
+    doc.clarifications = vec![
+        answered.clone(),
+        Clarification::open("old?", ""),
+        dismissed.clone(),
+    ];
+    doc.replace_open_questions(vec![Clarification::open("new?", "")]);
+    let questions: Vec<&str> = doc.clarifications.iter().map(|c| c.question.as_str()).collect();
+    assert_eq!(questions, ["a?", "b?", "new?"]);
+}
+
+#[test]
+fn whole_value_types_change_the_accepted_contract_fingerprint() {
+    let mut doc = sample();
+    doc.contract = Some(Contract::empty(ContractStatus::Accepted));
+    let before = doc.spec_fingerprint();
+    doc.contract.as_mut().unwrap().output.value_type = ValueType::Map;
+    assert_ne!(doc.spec_fingerprint(), before);
 }

@@ -8,7 +8,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clojurecraft_clojure::{ClojureRuntime, EvalOutcome, EvalRequest, EvalStatus, Limits};
+use clojurecraft_clojure::{
+    Call, CallResult, CallStatus, ClojureRuntime, EvalOutcome, EvalRequest, EvalStatus, HarnessError,
+    KeyRule, Limits, LintLevel, OutputRules, TypeRule,
+};
 use clojurecraft_runtime::{DataDirs, Manifest, components, platform_key};
 
 fn runtime() -> Option<ClojureRuntime> {
@@ -38,17 +41,22 @@ fn runtime() -> Option<ClojureRuntime> {
     })
 }
 
+fn call(input: &str, expected: Option<&str>) -> Call {
+    Call {
+        input: input.into(),
+        expected: expected.map(str::to_owned),
+    }
+}
+
+fn run(rt: &ClojureRuntime, req: &EvalRequest, limits: Limits) -> EvalOutcome {
+    rt.evaluate(req, &limits, None).expect("evaluate")
+}
+
 fn eval(rt: &ClojureRuntime, code: &str, checks: bool, limits: Limits) -> EvalOutcome {
-    rt.evaluate(
-        &EvalRequest {
-            code: code.into(),
-            function: "f".into(),
-            inputs: vec!["[1 2 3]".into()],
-            static_checks: checks,
-        },
-        &limits,
-    )
-    .expect("evaluate")
+    let mut req = EvalRequest::new(code, "f", vec![call("[1 2 3]", None)]);
+    req.static_checks = checks;
+    req.lint = checks;
+    run(rt, &req, limits)
 }
 
 fn quick() -> Limits {
@@ -56,6 +64,29 @@ fn quick() -> Limits {
         wall: Duration::from_secs(15),
         ..Limits::default()
     }
+}
+
+/// The first call's result.
+fn first(out: &EvalOutcome) -> &CallResult {
+    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+    out.report
+        .results
+        .first()
+        .unwrap_or_else(|| panic!("no result: {:?}", out.report))
+}
+
+/// The error of the first stage that failed, or of the first call.
+fn failure(out: &EvalOutcome) -> HarnessError {
+    let r = &out.report;
+    for stage in [&r.read, &r.check, &r.load] {
+        if let Some(Err(e)) = stage {
+            return e.clone();
+        }
+    }
+    first(out)
+        .error
+        .clone()
+        .unwrap_or_else(|| panic!("no error: {r:?}"))
 }
 
 #[test]
@@ -67,8 +98,11 @@ fn pure_function_runs_and_returns_edn() {
         true,
         quick(),
     );
-    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
-    assert!(out.response.contains(r#":value "\"2,3,4\"""#), "{}", out.response);
+    let r = first(&out);
+    assert_eq!(r.status, CallStatus::Ok);
+    assert_eq!(r.actual.as_deref(), Some(r#""2,3,4""#));
+    assert_eq!(out.report.lint, Some(vec![]));
+    assert!(out.report.done);
 }
 
 #[test]
@@ -102,12 +136,12 @@ fn static_checks_reject_dynamic_evaluation_and_interop() {
     ] {
         let out = eval(&rt, code, true, quick());
         assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+        assert!(out.report.results.is_empty(), "{code}: nothing may run");
+        let e = failure(&out);
         assert!(
-            out.response.contains(":status :error"),
-            "{code}: {}",
-            out.response
+            e.message.contains(needle) || e.class.contains(needle),
+            "{code}: {e:?}"
         );
-        assert!(out.response.contains(needle), "{code}: {}", out.response);
     }
 }
 
@@ -127,15 +161,32 @@ fn os_sandbox_blocks_side_effects_without_static_checks() {
         ("process", "(ns t.e)\n(defn f [_] (.waitFor (.exec (Runtime/getRuntime) (into-array String [\"/bin/true\"]))))".to_owned()),
     ] {
         let out = eval(&rt, &code, false, quick());
-        assert_eq!(out.status, EvalStatus::Completed, "{what}: {}", out.stderr);
-        assert!(out.response.contains(":phase :call"), "{what}: {}", out.response);
-        assert!(!out.response.contains(":status :ok, :value"), "{what} succeeded: {}", out.response);
+        let r = first(&out);
+        assert_eq!(r.status, CallStatus::Error, "{what} succeeded: {r:?}");
+        assert_eq!(r.error.as_ref().map(|e| e.phase.as_str()), Some("call"), "{what}");
     }
     assert!(!marker.exists(), "sandboxed code wrote a file");
 }
 
 #[test]
-fn runaway_computation_times_out() {
+fn runaway_computation_is_stopped_by_the_call_limit() {
+    let Some(rt) = runtime() else { return };
+    let mut req = EvalRequest::new(
+        "(ns t.l)\n(defn f [x] (if (= x 2) (loop [] (recur)) x))",
+        "f",
+        vec![call("1", Some("1")), call("2", Some("2")), call("3", Some("3"))],
+    );
+    req.call_timeout = Duration::from_secs(1);
+    let out = run(&rt, &req, Limits::for_request(&req));
+    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+    let r = &out.report;
+    assert_eq!(r.results[0].matches, Some(true));
+    assert_eq!(r.results[1].status, CallStatus::Timeout);
+    assert!(r.halted && r.results.len() == 2, "later calls are not run: {r:?}");
+}
+
+#[test]
+fn the_process_wall_limit_is_a_backstop() {
     let Some(rt) = runtime() else { return };
     let out = eval(
         &rt,
@@ -147,10 +198,11 @@ fn runaway_computation_times_out() {
         },
     );
     assert_eq!(out.status, EvalStatus::TimedOut);
+    assert_eq!(out.report.running, Some(0), "the running call is known");
 }
 
 #[test]
-fn memory_exhaustion_is_reported() {
+fn memory_exhaustion_is_reported_for_the_running_call() {
     let Some(rt) = runtime() else { return };
     let out = eval(
         &rt,
@@ -162,6 +214,7 @@ fn memory_exhaustion_is_reported() {
         },
     );
     assert_eq!(out.status, EvalStatus::MemoryLimitExceeded);
+    assert_eq!(out.report.running, Some(0));
 }
 
 #[test]
@@ -173,8 +226,11 @@ fn printing_inside_a_function_is_bounded() {
         true,
         quick(),
     );
-    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
-    assert!(out.response.contains("capture limit"), "{}", out.response);
+    assert!(
+        failure(&out).message.contains("capture limit"),
+        "{:?}",
+        out.report
+    );
 }
 
 #[test]
@@ -197,8 +253,11 @@ fn raw_stdout_flood_hits_the_process_output_cap() {
 fn stack_overflow_is_an_ordinary_call_error() {
     let Some(rt) = runtime() else { return };
     let out = eval(&rt, "(ns t.s)\n(defn f [x] (f x))", true, quick());
-    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
-    assert!(out.response.contains("StackOverflowError"), "{}", out.response);
+    assert!(
+        failure(&out).class.contains("StackOverflowError"),
+        "{:?}",
+        out.report
+    );
 }
 
 #[test]
@@ -210,18 +269,268 @@ fn explicit_refer_is_allowed_but_refer_all_is_not() {
         true,
         quick(),
     );
-    assert!(ok.response.contains(r#":value "\"1-2-3\"""#), "{}", ok.response);
+    assert_eq!(first(&ok).actual.as_deref(), Some(r#""1-2-3""#));
     let bad = eval(
         &rt,
         "(ns t.a (:require [clojure.string :refer :all]))\n(defn f [xs] xs)",
         true,
         quick(),
     );
-    assert!(
-        bad.response.contains(":refer :all is not allowed"),
-        "{}",
-        bad.response
+    assert!(failure(&bad).message.contains(":refer :all is not allowed"));
+}
+
+/// Each case: expected EDN, the function's result as code, and whether they are equal.
+#[test]
+fn results_are_compared_structurally_under_the_documented_rules() {
+    let Some(rt) = runtime() else { return };
+    let cases = [
+        ("[2 3 4]", "(map inc [1 2 3])", true),
+        ("(1 2)", "[1 2]", true),
+        ("{:a 1 :b [1 2]}", "{:b '(1 2) :a 1}", true),
+        ("#{1 2}", "#{2 1}", true),
+        ("1", "1N", true),
+        ("1.5M", "1.50M", true),
+        ("0.3", "(+ 0.1 0.2)", true),
+        ("##NaN", "Double/NaN", true),
+        ("1", "1.0", false),
+        ("0.5", "1/2", false),
+        ("[1 2]", "[2 1]", false),
+        ("[1 2]", "#{1 2}", false),
+        ("nil", "[]", false),
+        ("{:a 1}", "{:a 1 :b 2}", false),
+        ("{:a 1}", "(sorted-map 1 2)", false),
+        ("0.3", "0.30001", false),
+    ];
+    let code = format!(
+        "(ns t.eq)\n(defn f [i]\n  (case i\n{}))",
+        cases
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v, _))| format!("    {i} {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+    let calls = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (e, _, _))| call(&i.to_string(), Some(e)))
+        .collect();
+    let mut req = EvalRequest::new(code, "f", calls);
+    req.lint = false;
+    let out = run(&rt, &req, Limits::for_request(&req));
+    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+    for (i, (expected, value, equal)) in cases.iter().enumerate() {
+        let r = out
+            .report
+            .result(i)
+            .unwrap_or_else(|| panic!("{i}: {:?}", out.report));
+        assert_eq!(r.status, CallStatus::Ok, "{value}: {r:?}");
+        assert_eq!(r.matches, Some(*equal), "{expected} vs {value}: {r:?}");
+        assert_eq!(r.difference.is_some(), !equal, "{expected} vs {value}");
+    }
+    let category = out
+        .report
+        .result(8)
+        .and_then(|r| r.difference.clone())
+        .unwrap_or_default();
+    assert!(
+        category.contains("an integer 1 but got a floating-point number 1.0"),
+        "{category}"
+    );
+}
+
+#[test]
+fn unordered_output_ignores_order_but_not_multiplicity() {
+    let Some(rt) = runtime() else { return };
+    let mut req = EvalRequest::new(
+        "(ns t.u)\n(defn f [xs] (reverse xs))",
+        "f",
+        vec![call("[1 2 3]", Some("[1 2 3]")), call("[1 2 2]", Some("[1 1 2]"))],
+    );
+    req.equality.unordered = true;
+    let out = run(&rt, &req, Limits::for_request(&req));
+    assert_eq!(out.report.results[0].matches, Some(true));
+    assert_eq!(out.report.results[1].matches, Some(false));
+}
+
+#[test]
+fn an_infinite_lazy_result_is_reported_as_too_large() {
+    let Some(rt) = runtime() else { return };
+    let mut req = EvalRequest::new(
+        "(ns t.z)\n(defn f [x] (if x (range) (map #(/ 1 %) [1 0])))",
+        "f",
+        vec![call("true", Some("[0 1]")), call("false", Some("[1]"))],
+    );
+    req.max_elements = 10_000;
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let r = &out.report;
+    assert_eq!(r.results[0].status, CallStatus::TooLarge, "{r:?}");
+    // An error hidden in a lazy result belongs to the call that produced it.
+    assert_eq!(r.results[1].status, CallStatus::Error);
+    assert!(
+        r.results[1]
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("Divide by zero"))
+    );
+}
+
+#[test]
+fn call_errors_point_at_the_line_and_the_core_function() {
+    let Some(rt) = runtime() else { return };
+    let code =
+        "(ns t.npe)\n\n(defn f [m]\n  (update-vals m\n    (fn [v] (if (string? v) (subs v 9) (inc v)))))";
+    let req = EvalRequest::new(
+        code,
+        "f",
+        vec![call("{:a \"x\"}", Some("{}")), call("{:a nil}", Some("{}"))],
+    );
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let errors: Vec<HarnessError> = out
+        .report
+        .results
+        .iter()
+        .map(|r| r.error.clone().unwrap_or_else(|| panic!("{r:?}")))
+        .collect();
+    assert!(errors.iter().all(|e| e.line == Some(5)), "{errors:?}");
+    assert_eq!(
+        errors[0].within.as_deref(),
+        Some("clojure.core/subs"),
+        "{errors:?}"
+    );
+    // inc is inlined, so the runtime method is named instead.
+    assert!(errors[1].class.contains("NullPointerException"), "{errors:?}");
+    assert_eq!(
+        errors[1].within.as_deref(),
+        Some("clojure.lang.Numbers.inc"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn lint_reports_errors_and_warnings_with_lines_before_loading() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.lint)\n(defn- unused-helper [x] x)\n(defn f [xs]\n  (let [tmp 1]\n    (assoc xs)\n    (undefined-fn xs)))";
+    let req = EvalRequest::new(code, "f", vec![call("{}", Some("{}"))]);
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let lint = out.report.lint.clone().unwrap_or_default();
+    let has = |level, needle: &str| {
+        lint.iter()
+            .any(|f| f.level == level && f.message.contains(needle) && f.line.is_some())
+    };
+    assert!(
+        has(LintLevel::Error, "assoc is called with 1 argument"),
+        "{lint:?}"
+    );
+    assert!(
+        has(LintLevel::Error, "Unable to resolve symbol: undefined-fn"),
+        "{lint:?}"
+    );
+    assert!(has(LintLevel::Warning, "tmp is bound but never used"), "{lint:?}");
+    assert!(
+        has(LintLevel::Warning, "private function unused-helper"),
+        "{lint:?}"
+    );
+    // Loading then fails as the compiler would, with the line.
+    let Some(Err(load)) = &out.report.load else {
+        panic!("{:?}", out.report)
+    };
+    assert_eq!(load.line, Some(6));
+}
+
+#[test]
+fn idiomatic_code_lints_clean() {
+    let Some(rt) = runtime() else { return };
+    let code = r#"(ns t.clean (:require [clojure.string :as str] [clojure.set :as set]))
+(defn- total [orders] (reduce + 0 (map :amount orders)))
+(defn f [{:keys [orders]}]
+  (let [by-customer (group-by :customer orders)
+        rows (->> by-customer
+                  (map (fn [[customer os]] {:customer customer :total (total os)}))
+                  (sort-by (juxt (comp - :total) :customer))
+                  (into [] (comp (filter #(pos? (:total %)))
+                                 (map #(update % :customer str/upper-case)))))]
+    (as-> rows rs
+      (cond-> rs (empty? orders) (conj {:none true}))
+      (if-let [[r & more] (seq rs)] (vec (cons r more)) rs)
+      (if (set/subset? #{} (set rs)) rs [])
+      (vec (for [x rs :let [y x] :when y] y)))))"#;
+    let req = EvalRequest::new(
+        code,
+        "f",
+        vec![call(
+            r#"{:orders [{:customer "a" :amount 1} {:customer "b" :amount 2}]}"#,
+            Some(r#"[{:customer "B" :total 2} {:customer "A" :total 1}]"#),
+        )],
+    );
+    let out = run(&rt, &req, Limits::for_request(&req));
+    assert_eq!(out.report.lint, Some(vec![]), "{:?}", out.report.lint);
+    assert_eq!(first(&out).matches, Some(true), "{:?}", out.report);
+}
+
+#[test]
+fn output_contracts_are_checked_on_every_result() {
+    let Some(rt) = runtime() else { return };
+    let mut req = EvalRequest::new(
+        "(ns t.c)\n(defn f [x] x)",
+        "f",
+        vec![
+            call("[{:id 1 :total 2}]", None),
+            call("[{:id 1 :total 2.5} {:total nil}]", None),
+            call("{:id 1}", None),
+        ],
+    );
+    req.output_rules = Some(OutputRules {
+        value_type: Some(TypeRule::Vector),
+        keys: vec![
+            KeyRule {
+                key: ":id".into(),
+                required: true,
+                value_type: Some(TypeRule::Integer),
+                nil_allowed: false,
+            },
+            KeyRule {
+                key: ":total".into(),
+                required: false,
+                value_type: Some(TypeRule::Integer),
+                nil_allowed: false,
+            },
+        ],
+    });
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let r = &out.report.results;
+    assert!(r[0].contract.is_empty(), "{:?}", r[0]);
+    assert_eq!(
+        r[1].contract,
+        [
+            "element 0: key :total must be an integer but is a floating-point number",
+            "element 1: required key :id is missing",
+            "element 1: key :total must not be nil"
+        ]
+    );
+    assert_eq!(r[2].contract, ["the output must be a vector but is a map"]);
+}
+
+#[test]
+fn cancelling_stops_the_jvm() {
+    let Some(rt) = runtime() else { return };
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setter = flag.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let req = EvalRequest::new(
+        "(ns t.k)\n(defn f [_] (loop [] (recur)))",
+        "f",
+        vec![call("1", None)],
+    );
+    let started = std::time::Instant::now();
+    let out = rt
+        .evaluate(&req, &Limits::for_request(&req), Some(flag))
+        .expect("evaluate");
+    assert_eq!(out.status, EvalStatus::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(4));
 }
 
 #[test]

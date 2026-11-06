@@ -72,6 +72,29 @@ installed collection with exact + full text, semantic only, and the combined ran
 after changing chunking, weights, sources, or the embedding model, and record the result in
 `docs/architecture.md`.
 
+The specification assistant (interpretation, contract proposal, and generation with retrieval,
+validation in the sandbox, automatic repair, and explanation) can be run against a real model with
+the same code the application uses. Every attempt's checks are printed (failing checks with their
+diagnostics and expected and actual values):
+
+```sh
+./target/debug/clojurecraft-devtool generate crates/clojurecraft-devtool/generation-specs/order-totals.toml \
+    qwen2.5-coder-7b-instruct Q4_K_M cuda 8192 --interpret --contract   # add --verbose for raw answers
+```
+
+`--no-docs` generates without the documentation collection. Validation needs the Java runtime and
+Clojure (installed by `install-runtime` or a documentation build); without them the code is
+reported as not run. The sample specifications in
+`crates/clojurecraft-devtool/generation-specs/` cover grouping and summing, sorting with a
+tie-breaker, string keys (needs `clojure.string`), and nested data with a deliberate gap.
+
+The sandboxed Clojure tests (`crates/clojurecraft-clojure/tests/sandboxed_eval.rs`) cover the
+harness: comparison rules, lazy and infinite results, per-call time limits, memory and output
+limits, lint findings, contract checks, call-error locations, and cancellation. The repair loop
+is tested with scripted model answers and real sandboxed execution in
+`crates/clojurecraft-workflow/tests/repair_loop.rs`. Both skip themselves without the Java runtime
+or the sandbox helper.
+
 The application runs the API extraction through the sandbox helper next to its own executable, so
 build the whole workspace (`cargo build --workspace`) before `cargo run` when installing the
 documentation from the app.

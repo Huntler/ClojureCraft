@@ -16,8 +16,9 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates, GGUF header reading, Hugging Face resolution, model store, inference settings, disk usage |
 | `clojurecraft-inference` | Replaceable inference interface; `llama-server` process on a private Unix socket; inference service (lifecycle, crash recovery, streaming, cancellation, timeouts); context policy; roles; structured output and tool validation |
 | `clojurecraft-sandbox` | OS-level restriction of untrusted processes (library + `clojurecraft-sandbox` helper binary) |
-| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness); trusted scripts in the same sandbox |
+| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions: static checks, lint, loading, calls with per-call limits, structural comparison with expected EDN, output-contract checks (harness); trusted scripts in the same sandbox |
 | `clojurecraft-knowledge` | Versioned Clojure documentation: pinned sources, API extraction, chunking, SQLite/FTS5 index, embeddings, merged retrieval, atomic collection updates, prompt formatting |
+| `clojurecraft-workflow` | Specification readiness and prompt sections, model requests and answer schemas (interpretation, questions, retrieval planning, contract proposals, generation, explanation), structural checks of generated code, allowed namespaces, validation plans and reports, and the assistant that sequences these requests with validation and repair (no I/O; inference, retrieval, and execution are reached through a trait) |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
 
 Later boundaries (export, benchmarking, updates)
@@ -139,7 +140,9 @@ data, not instructions.
 enumerations, bounded integers, numbers, booleans, bounded arrays, closed objects) is sent as
 `response_format` for llama.cpp's grammar sampling. The answer is still parsed and validated
 (`Malformed` with the path of the first violation and the raw text). An answer cut off at the
-token limit is malformed.
+token limit is `CutOff`, which records how much the model reasoned before answering. Every
+request sends its role's temperature and top-p (0.9) explicitly, so the settings recorded with
+generated code are the ones that ran.
 
 **Tools.** The model may call only the application-defined tools passed with a request. Arguments
 must be valid JSON matching the tool's schema before the tool runs. Each call has a 5 s limit and
@@ -243,6 +246,19 @@ checks that give users and the repair loop clear diagnostics:
 Allowing more interop (for example selected `String` methods) is a deliberate future change made
 by extending the allowlist, with tests.
 
+**Lint.** Before the code is evaluated, the harness interns the names the code defines (with the
+parameter lists of `defn` forms) and analyses every top-level form after macroexpansion. Only
+`clojure.core` macros can be expanded, because candidate code cannot define macros, so no
+candidate code runs during linting. Errors (which fail validation): unresolved symbols, calls of
+`clojure.*` functions or the code's own functions with a number of arguments no parameter list
+accepts, macro calls rejected by `clojure.core.specs` (for example malformed `let` bindings), and
+`def` inside a function. Warnings (reported, not failures): unused local bindings and parameters
+(names starting with `_` and generated names are ignored), unused private functions, and
+top-level names that shadow `clojure.core`. Findings carry line numbers; at most 40 are reported.
+An external linter (clj-kondo) was not adopted: it would be another downloaded native binary per
+platform to pin, verify, and sandbox, and these rules cover what generated code most often gets
+wrong.
+
 ### Storage and retrieval index: SQLite (bundled via `rusqlite`)
 
 Chosen for transactional writes with WAL journaling (crash safety for drafts and revisions),
@@ -301,6 +317,22 @@ revision. Functions are deleted to a trash and can be restored; permanent deleti
 while any other function's draft or history references them. `check_references` reports missing
 or trashed functions, missing or mismatched revisions, and missing upstream examples. Cycle
 detection is part of the referenced-input workflow, not yet implemented.
+
+**Validation report format 2.** Reports gained the generation run they belong to, the checked
+source (so candidates that were never applied stay inspectable), and the comparison settings
+(float tolerance, unordered output, per-call time limit, element limit). The fields default to
+empty, so format 1 reports upgrade unchanged.
+
+**Format 2.** Documents gained clarifications, the model's interpretation, a whole-value type in
+contract shapes, and the generated code's namespace, requirements, assumptions, left-out context,
+and explanation. All new fields default to empty, so format 1 records upgrade unchanged; an
+application that only knows format 1 refuses format 2 documents instead of dropping the new
+fields on save. The specification fingerprint includes answered clarifications but omits them
+(and a shape type of "any") when absent, so fingerprints of existing specifications did not change.
+
+**Revisions from background work.** The autosaver also records revisions: a commit is queued on
+the same worker as draft writes, replaces an older queued edit of that function, and is reported
+as `Committed`. If recording fails, the content is still saved as an ordinary draft write.
 
 **Credentials.** No record has a credential field; provenance uses repository coordinates, never
 download URLs. A process-wide `SecretRegistry` holds every secret the application knows (inference
@@ -401,12 +433,184 @@ full text with link, license, revision, and attribution. The right column's Sour
 documentation recorded for the implementation and searches documentation related to the
 specification (description and steps).
 
+### Specification assistant and generation
+
+The model works on a specification in three user-started jobs, run one at a time by the
+`Assistant` (`clojurecraft-workflow`). Each job is a sequence of role requests; every response is
+matched by request number, so a cancelled or superseded request never changes a function.
+
+**Readiness.** Before any request, the specification is checked: example inputs and expected
+outputs, accepted tests, and contract keys and defaults must be valid EDN; an example with only an
+input or only an output blocks with a message naming it; empty examples and references without a
+recorded output are left out with a note. Something to work from (description, a step, or an
+example) is required.
+
+**Prompt content.** Every part the user wrote is a *required* prompt section, never shortened or
+dropped: description, non-empty steps (numbered), the accepted contract rendered as text, answered
+questions, each usable example, and each accepted test. A proposed contract, open or dismissed
+questions, and the model's interpretation are never sent as requirements. Retrieved documentation
+is the only optional section. If required content does not fit, the request is refused with the
+context policy's remedies.
+
+**Interpretation** (Interpretation, then Clarification role). The model restates the
+specification, lists assumptions, and reports contradictions and gaps that change the output;
+when there are any, a second request turns them into at most six questions with suggested answers.
+The restatement is stored next to the user's text with the specification fingerprint it was made
+from and is marked as outdated once the specification changes. Questions stay open until the user
+picks an option or writes an answer; only answered questions are requirements (and part of the
+specification fingerprint). New interpretations replace open questions but keep answered and
+dismissed ones, and dismissed questions are not asked again.
+
+**Contracts.** The contract editor covers input and output value types, key rules (key as EDN,
+required or optional, value type, nil behaviour: not allowed, same as missing, passed through,
+or a default EDN value), output order, allowed namespaces, and notes. "Propose a contract" asks the
+model (Interpretation role) for the same structure; the proposal is stored as *proposed*, is not
+part of the specification fingerprint or any prompt, and must be accepted in the editor. A proposal
+never replaces an accepted contract (a contract accepted while a proposal is being written wins)
+and never changes the allowed namespaces.
+
+**Allowed namespaces.** The harness's namespace allowlist (read from `harness.clj`, like its
+denied symbols, so the lists cannot diverge) defines what is *supported*. Without an accepted
+contract a function may require `clojure.string` and `clojure.set`; with one, exactly its list.
+Generated code that requires another supported namespace is held until the user approves it,
+which adds the namespace to the accepted contract (creating one when there is none).
+
+**Generation.** (1) Retrieval planning: the model names up to twelve standard-library symbols and
+six concepts. (2) Documentation: the description and steps, each step, and each planned symbol are
+searched (4, 2, and 1 results each), merged without duplicates to at most ten excerpts, and the
+derived function name is checked against `clojure.core`. Without a documentation collection these
+two steps are skipped and the result says so; if planning fails, the description and steps are
+used. (3) Generation: the task names the namespace (`<name>.core`) and function (the display name
+in kebab case, suffixed `-fn` if it would shadow a `clojure.core` var or special form), the
+allowed namespaces, purity and interop rules, and the Clojure version; the answer is
+`{code, assumptions}` with a per-request random seed. (4) Structural check (below). (5)
+Explanation: a summary, the code implementing each numbered step, and the standard-library
+functions used; quoted code is located in the source (ignoring whitespace; shortened quotes by
+their first and last lines; ambiguous quotes are not placed) and shown with its line range or as
+approximate. A failed explanation keeps the code.
+
+**Structural check** (before any execution). The source is read with the editors' lexer into
+forms and checked against the harness's rules: an `ns` form first, with only `:require` of
+supported namespaces (`[ns :as a]`, `:refer [..]`; no `:refer :all`); top-level forms limited to
+`defn`, `defn-`, `def`, `declare`; exactly one public function, with an arity of one argument; no
+denied `clojure.core` symbols, `#'`, `#=`, Java interop, or classes other than the allowed numeric
+ones; qualified symbols must name a required namespace (stricter than the harness, so exported code
+never relies on namespaces being loaded by accident). Quoted data is not checked. A different
+namespace or function name is a warning, not a failure. Problems carry line numbers and are shown
+with the rejected code; the current implementation is unchanged. The OS sandbox remains the
+security boundary; this check exists for fast, precise feedback.
+
+**Applying code.** Checked code replaces the implementation only when there is none or it is
+exactly what the model generated earlier; code written or edited by hand is never replaced
+silently, and code needing a namespace approval waits. Held code is shown for review with "Use
+this code" or "Allow … and use this code". Applied code is committed as a `Generated` revision
+recording the model (repository, revision, file, SHA-256, quantization, architecture), llama.cpp
+release and backend, temperature, top-p, seed, context, output limit, the documentation excerpts
+actually sent (none if the documentation section was left out to fit), the specification
+fingerprint it was generated from, assumptions, and the explanation. If the specification changes
+afterwards, the implementation shows that it was generated from an earlier version.
+
+**Answer schemas.** Prose fields carry length limits in the grammar (120–800 characters). Without
+them, Qwen2.5-Coder 7B repeated one sentence inside a string until the token limit. Code has no
+grammar bound (llama.cpp expands each bound into rules) and is refused above 20,000 characters.
+Code that arrives escaped twice (no real line breaks, `\n` text between forms) is unescaped once
+when it is a valid JSON string body, with a note.
+
+**Reasoning models.** Their thinking counts against the answer budget. When a structured answer
+is cut off after the model reasoned, the request is sent once more with 6,144 extra tokens (the
+service still caps the answer at half the context), and later requests keep the allowance while
+that model is loaded.
+
+**Model loading.** Starting a job loads the selected model with the current settings when it is
+not loaded or loading; the request is queued behind the load.
+
+### Automatic validation and repair
+
+**Sequence** (`clojurecraft_workflow::validation`). (1) Parse and (2) check structure and
+dependencies with the structural check above; parse or structure failures stop the sequence and
+every later check is listed as not run. (3) Lint, (4) load, (5) run every usable example and every
+accepted test with a defined expectation, and check the accepted output contract, all in one fresh
+sandboxed JVM. (6) Compare each result with its expected EDN in the JVM. (7) Record diagnostics,
+per-call timing, and bounded output (printed text up to 64 KiB captured, 2,000 characters per
+diagnostic, 20,000 characters per value). A report passes only when every check passed; a
+timeout, crash, forbidden operation (sandbox denial or static-check violation), result over the
+element limit, memory or output limit, and a malformed harness response are failures. Code that
+needs a namespace approval is validated normally; the approval only gates applying it.
+
+**Harness protocol.** The harness writes one JSON object per line as it works (`read`, `check`,
+`lint`, `load`, `start` with the call index, `result`, `halted`, `done`). If the JVM dies (out of
+memory, output cap, wall-clock limit, crash), the report attributes the failure to the stage or
+call that had started and lists the rest as not run. Each call runs on its own thread with a 5 s
+limit that includes realizing its result; on a timeout the harness reports it and stops the JVM,
+because a running thread cannot be stopped from outside. The process limit (20 s for start-up
+plus 5.5 s per call, at most 10 min) is only a backstop. Runs are cancellable: the sandbox runner
+kills the process when a shared flag is set. Call errors report the line in the candidate's
+namespace (from the stack trace) and the `clojure.core` function the exception surfaced in, or
+for inlined functions such as `inc` the runtime method (`clojure.lang.Numbers.inc`).
+
+**Equality** (`clojurecraft_clojure::Equality`, compared in the JVM against the value read with
+`clojure.edn`). Clojure's `=` semantics, made explicit: sequential collections (vector, list,
+sequence) are equal when their elements are equal in order; maps by keys and values regardless of
+order; sets by elements; integers regardless of class (`1` = `1N`). Numbers of different
+categories are never equal: integer vs. floating point (`1` ≠ `1.0`), ratio vs. floating point
+(`1/2` ≠ `0.5`), BigDecimal vs. anything else; BigDecimals compare by value (`1.50M` = `1.5M`).
+Floating-point numbers are equal within a relative tolerance of 1e-9 (absolute 1e-12 near zero),
+and `##NaN` equals `##NaN`; map keys and set elements are compared exactly. When the accepted
+contract says output order does not matter, a sequential top-level output is compared as a
+multiset. The first difference is reported with its path, for example
+`at [0 :total]: expected an integer 25 but got a floating-point number 25.0`.
+
+**Laziness.** A result is realized inside the call's time limit, walking every nested
+collection, with a budget of 1,000,000 elements and 512 levels of nesting. More is reported as too
+large ("it may be an infinite lazy sequence"); an exception thrown while realizing belongs to the
+call that produced the sequence. The value is printed (bounded) only after realization.
+
+**Output contract.** From the accepted contract: the output's value type, and for each key rule
+(applied to the output map, or to each map in an output collection) presence of required keys,
+the value type of present non-nil values, and nil where nil is disallowed. Types `other` and
+`any` are not checked; ordering requirements other than "does not matter", nil defaults, and the
+input shape are not checked mechanically. Violations from all results form one `Contract` check.
+
+**Repair loop** (`Assistant`). One generation plus at most three repairs. Every attempt's code is
+validated against a snapshot of the specification taken when the job started; its report
+(attempt number, generation run, checked source) is stored. The first passing attempt ends the
+loop and is explained, then applied or held for review under the rules above. A failing attempt
+leads to a repair request (Generation role, a new seed, temperature 0.5 instead of 0.2, because
+the model otherwise tends to return its failing code nearly unchanged) containing the whole
+specification as required sections, the previous code, the failures (each failing check with its
+diagnostics, input, expected and actual values, named as in the specification, at most 6,000
+characters), and the same documentation excerpts. When the newest attempt has the same code or
+exactly the same failures as an earlier one, the request says so and asks for a different
+approach. A malformed or cut-off answer is a failed attempt without code; the next attempt
+repairs the most recent code, or generates afresh if there is none. After the fourth failure the
+job ends with every attempt's diagnostics visible; nothing is applied, and the user may choose
+the best candidate (most passing checks among those that loaded), recorded as not passing. Other
+inference failures (timeouts, crashes) end the job and keep the attempts made so far. Examples,
+contracts, and accepted tests are never modified by the loop. The revision records the attempts
+used and the seed and temperature of the attempt that produced the code.
+
+**Stale results.** If the specification or accepted tests change while a job runs, its reports
+stay recorded against the snapshot (so they show as outdated), and passing code is held for review
+instead of being applied. Validation results arriving for a cancelled or superseded run are
+ignored.
+
+**Unavailable runtime.** If the Java runtime or the sandbox helper is missing, generated code is
+handled as before validation existed (applied or held), marked as not run, and the interface
+offers to install the pinned Java runtime and Clojure.
+
+**Checks of current code.** The Result tab runs the same validation on the current implementation
+(written, edited, or generated), records the report against the function's content at the start,
+and shows the newest report for exactly the current code with its freshness, plus earlier reports
+(including unapplied candidates and their code).
+
 ### Main workspace
 
 Three resizable columns: the function library (search, new function, and navigation to knowledge
 sources, settings, and trash) on the left; the specification editor (name, description, example
-tabs, contract, ordered steps) in the centre; implementation, result, step, and source views on the
-right. Column widths persist. The centre keeps at least 440 points; the side columns give way
+tabs, contract, ordered steps, interpretation and questions) in the centre; implementation
+(generation, live output, review of held or rejected code, explanation, assumptions, provenance),
+result (validation: run checks, every check with diagnostics and expected/actual values, freshness,
+earlier reports and candidates), step (step-to-code mapping), and source views on the right. Column widths persist. The centre keeps at least 440 points; the side columns give way
 first. The documented minimum window is 1024 × 640 points; increasing the text size reduces the
 available points, and the layout then wraps rather than clipping.
 
@@ -593,3 +797,22 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
 11. The embedding model has been validated on Linux (CUDA and CPU) only; Metal is untested.
 12. The retrieval evaluation set is small (36 queries) and written by us; it guides weights but is
     not a benchmark. It should grow with real specifications once generation exists.
+13. Repair quality depends on the model. With Qwen2.5-Coder 7B Q4_K_M, generations that fail
+    their first validation were rarely repaired: the model tends to repeat its approach even when
+    told it is stuck. Mellum 12B (thinking) often spends its whole answer budget reasoning, which
+    counts as a failed attempt. Larger catalog models should be evaluated for repairs.
+14. Interpretation and contract-proposal quality depends heavily on the model: Qwen2.5-Coder 7B
+    asks some irrelevant questions and proposed an input type of "map" for a vector of maps. The
+    user reviews both, so neither changes intent, but larger catalog models should be evaluated.
+15. Assistant results (held code, last errors) are kept for the session only; validation reports
+    of every attempt, with their code, are stored and survive restarts.
+16. Only one model job runs at a time across all functions; a second one is refused with a message
+    naming the busy function.
+17. Exported `clojure.test` tests will need the same comparison as validation (float tolerance,
+    unordered output); plain `=` would disagree for floating-point results.
+18. Validation of example inputs against the accepted input shape is not mechanical; contradictions
+    are left to interpretation.
+19. A per-call time limit stops the whole JVM, so the calls after a timed-out call are not run in
+    that validation.
+20. The sandbox on macOS (Seatbelt) has not run the new harness; thread creation inside the JVM is
+    needed for per-call limits.

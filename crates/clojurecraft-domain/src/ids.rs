@@ -66,6 +66,10 @@ id_type!(
     ValidationId
 );
 id_type!(
+    /// One generation with its automatic repairs; groups the candidates it produced.
+    GenerationRunId
+);
+id_type!(
     /// A saved benchmark configuration within one function.
     BenchmarkConfigId
 );
@@ -76,4 +80,8 @@ id_type!(
 id_type!(
     /// One benchmark run.
     BenchmarkResultId
+);
+id_type!(
+    /// A question about the specification.
+    ClarificationId
 );

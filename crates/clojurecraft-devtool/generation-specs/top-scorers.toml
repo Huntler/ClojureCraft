@@ -1,0 +1,18 @@
+# Sorting with a tie-breaker and taking a prefix.
+name = "Top scorers"
+description = "Return the names of the three players with the highest score."
+steps = [
+  "Sort players by :score, highest first; players with equal scores are ordered by :name alphabetically.",
+  "Take the first three players.",
+  "Return their :name values as a vector.",
+]
+
+[[examples]]
+name = "ties"
+input = '[{:name "dan" :score 7} {:name "ann" :score 9} {:name "cat" :score 7} {:name "bob" :score 3}]'
+expected = '["ann" "cat" "dan"]'
+
+[[examples]]
+name = "fewer than three"
+input = '[{:name "eve" :score 1}]'
+expected = '["eve"]'

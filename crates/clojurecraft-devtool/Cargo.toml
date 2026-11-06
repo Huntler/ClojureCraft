@@ -10,11 +10,14 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clojurecraft-clojure.workspace = true
+clojurecraft-domain.workspace = true
+clojurecraft-edn.workspace = true
 clojurecraft-hardware.workspace = true
 clojurecraft-inference.workspace = true
 clojurecraft-knowledge.workspace = true
 clojurecraft-runtime.workspace = true
 clojurecraft-sandbox.workspace = true
+clojurecraft-workflow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

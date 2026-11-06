@@ -1,0 +1,24 @@
+[package]
+name = "clojurecraft-workflow"
+description = "Specification interpretation, contract proposals, and generation requests; structural checks of generated Clojure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clojurecraft-clojure.workspace = true
+clojurecraft-domain.workspace = true
+clojurecraft-edn.workspace = true
+clojurecraft-inference.workspace = true
+clojurecraft-knowledge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+clojurecraft-runtime.workspace = true
+clojurecraft-sandbox.workspace = true
+
+[lints]
+workspace = true

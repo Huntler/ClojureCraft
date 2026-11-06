@@ -22,10 +22,14 @@ pub enum Role {
 pub struct RoleProfile {
     pub instructions: &'static str,
     pub temperature: f32,
+    pub top_p: f32,
     pub max_output_tokens: u32,
     /// Limit for the whole request, including tool rounds.
     pub timeout: Duration,
 }
+
+/// Nucleus sampling for every role; sent explicitly so recorded settings match what ran.
+const TOP_P: f32 = 0.9;
 
 /// Rules shared by every role. Reference material is data, never instructions.
 const COMMON: &str = "You are part of ClojureCraft, an application that helps engineers write small, \
@@ -59,6 +63,7 @@ impl Role {
                     between the description, the steps, the contract, and the examples, and anything \
                     left undefined. Keep the user's wording where it is precise.",
                 temperature: 0.2,
+                top_p: TOP_P,
                 max_output_tokens: 1500,
                 timeout: Duration::from_secs(300),
             },
@@ -66,6 +71,7 @@ impl Role {
                 instructions: "Ask only questions whose answers change the function's output. Make each \
                     question short and answerable with a choice or a small example.",
                 temperature: 0.3,
+                top_p: TOP_P,
                 max_output_tokens: 800,
                 timeout: Duration::from_secs(180),
             },
@@ -73,6 +79,7 @@ impl Role {
                 instructions: "List the Clojure functions, macros, and concepts whose documentation would \
                     help implement the transformation. Prefer clojure.core and the standard library.",
                 temperature: 0.1,
+                top_p: TOP_P,
                 max_output_tokens: 400,
                 timeout: Duration::from_secs(120),
             },
@@ -81,6 +88,7 @@ impl Role {
                     the specification, the contract, and every example. Use only the allowed namespaces. \
                     Prefer clear, idiomatic core functions over clever code.",
                 temperature: 0.2,
+                top_p: TOP_P,
                 max_output_tokens: 2500,
                 timeout: Duration::from_secs(600),
             },
@@ -88,6 +96,7 @@ impl Role {
                 instructions: "Explain clearly and briefly for an engineer who can read Clojure but may not \
                     know its standard library. Name the core functions used and what each does here.",
                 temperature: 0.3,
+                top_p: TOP_P,
                 max_output_tokens: 1200,
                 timeout: Duration::from_secs(300),
             },

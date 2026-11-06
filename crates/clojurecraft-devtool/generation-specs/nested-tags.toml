@@ -1,0 +1,13 @@
+# Nested data: collecting distinct values from nested collections. The steps leave a gap
+# (ordering of the result) that interpretation should notice.
+name = "Distinct tags"
+description = "Collect every tag used by any post, without duplicates."
+steps = [
+  "Take the :tags of every post; a post may have no :tags key.",
+  "Remove duplicates.",
+]
+
+[[examples]]
+name = "overlap"
+input = '[{:id 1 :tags ["clj" "data"]} {:id 2} {:id 3 :tags ["data" "edn"]}]'
+expected = '#{"clj" "data" "edn"}'

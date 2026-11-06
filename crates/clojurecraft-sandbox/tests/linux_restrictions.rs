@@ -38,6 +38,7 @@ fn sh(script: &str, policy: Policy) -> Outcome {
         wall_timeout: Duration::from_secs(5),
         max_stdout: 64 * 1024,
         max_stderr: 64 * 1024,
+        cancel: None,
     })
     .expect("run")
 }
@@ -133,6 +134,7 @@ fn network_connections_are_refused() {
         wall_timeout: Duration::from_secs(5),
         max_stdout: 4096,
         max_stderr: 4096,
+        cancel: None,
     })
     .expect("run");
     assert!(!text(&out.stdout).contains("connected"), "{:?}", out);
@@ -155,6 +157,7 @@ fn runaway_loop_hits_wall_clock_timeout() {
         wall_timeout: Duration::from_millis(800),
         max_stdout: 1024,
         max_stderr: 1024,
+        cancel: None,
     })
     .expect("run");
     assert_eq!(out.termination, Termination::TimedOut);
@@ -175,6 +178,7 @@ fn cpu_limit_kills_busy_process() {
         wall_timeout: Duration::from_secs(10),
         max_stdout: 1024,
         max_stderr: 1024,
+        cancel: None,
     })
     .expect("run");
     assert!(
@@ -196,6 +200,7 @@ fn excessive_output_is_cut_off() {
         wall_timeout: Duration::from_secs(5),
         max_stdout: 10_000,
         max_stderr: 1024,
+        cancel: None,
     })
     .expect("run");
     assert_eq!(out.termination, Termination::OutputLimitExceeded);
@@ -235,4 +240,31 @@ fn seccomp_filter_compiles_for_this_architecture() {
             .expect("program")
             .is_empty()
     );
+}
+
+#[test]
+fn a_cancelled_run_is_stopped_promptly() {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setter = flag.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let out = run(&RunRequest {
+        helper: helper(),
+        policy: policy(vec![]),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "while :; do :; done".into()],
+        env: vec![],
+        stdin: vec![],
+        wall_timeout: Duration::from_secs(10),
+        max_stdout: 1024,
+        max_stderr: 1024,
+        cancel: Some(flag),
+    })
+    .expect("run");
+    t.join().expect("join");
+    assert_eq!(out.termination, Termination::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(3));
 }

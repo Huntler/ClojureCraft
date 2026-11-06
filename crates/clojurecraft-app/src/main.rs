@@ -2,10 +2,14 @@
 //! coding model.
 
 mod app;
+mod contract_view;
 mod editor;
 mod edn_view;
+mod execution;
+mod generation_view;
 mod implementation;
 mod inference;
+mod interpretation_view;
 mod jobs;
 mod keys;
 mod knowledge;
@@ -17,6 +21,7 @@ mod models_view;
 mod session;
 mod setup_view;
 mod theme;
+mod validation_view;
 mod views;
 
 const APP_ID: &str = "org.clojurecraft.ClojureCraft";

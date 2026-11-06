@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::fingerprint::{Basis, Component, Fingerprint, Freshness};
 use crate::function::Edn;
 use crate::ids::{
-    BenchmarkConfigId, BenchmarkInputId, BenchmarkResultId, ExampleId, TestCaseId, ValidationId,
+    BenchmarkConfigId, BenchmarkInputId, BenchmarkResultId, ExampleId, GenerationRunId, TestCaseId,
+    ValidationId,
 };
 use crate::time::Timestamp;
 
@@ -28,6 +29,28 @@ pub struct ValidationReport {
     pub checks: Vec<Check>,
     /// The generation or repair attempt this report belongs to, when produced by that workflow.
     pub attempt: Option<u32>,
+    /// The generation run (initial generation plus repairs) this report belongs to.
+    #[serde(default)]
+    pub run: Option<GenerationRunId>,
+    /// The code that was checked. Candidates that were never applied to the function are kept
+    /// here, so every attempt stays inspectable.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// How results were compared and execution was bounded.
+    #[serde(default)]
+    pub settings: Option<ValidationSettings>,
+}
+
+/// The comparison rules and limits a validation used.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ValidationSettings {
+    /// Relative tolerance for floating-point numbers.
+    pub float_tolerance: f64,
+    /// Whether a sequential output was compared without regard to order.
+    pub unordered_output: bool,
+    pub call_timeout_ms: u64,
+    /// Elements a result may have once lazy sequences are realized.
+    pub max_elements: u64,
 }
 
 impl ValidationReport {

@@ -24,6 +24,8 @@ pub struct RunRequest {
     pub wall_timeout: Duration,
     pub max_stdout: usize,
     pub max_stderr: usize,
+    /// Set by another thread to stop the program early.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub enum Termination {
     Signaled(i32),
     TimedOut,
     OutputLimitExceeded,
+    /// Stopped through [`RunRequest::cancel`].
+    Cancelled,
     /// The helper could not establish the sandbox; the program never ran.
     SandboxSetupFailed,
 }
@@ -129,6 +133,11 @@ pub fn run(req: &RunRequest) -> Result<Outcome, RunError> {
             let _ = child.kill();
             let _ = child.wait();
             break Termination::OutputLimitExceeded;
+        }
+        if req.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Termination::Cancelled;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();

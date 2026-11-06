@@ -112,6 +112,9 @@ struct SpecProjection<'a> {
     contract: Option<&'a Contract>,
     steps: Vec<&'a str>,
     examples: Vec<ExampleProjection<'a>>,
+    /// Omitted when empty, so specifications without answers keep their earlier fingerprint.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    clarifications: Vec<(&'a str, &'a str)>,
 }
 
 #[derive(Serialize)]
@@ -138,8 +141,9 @@ struct TestProjection<'a> {
 }
 
 impl FunctionDocument {
-    /// Description, accepted contract, step texts in order, and examples (input value as used for
-    /// validation, plus expected output). Names and step identifiers are excluded.
+    /// Description, accepted contract, step texts in order, examples (input value as used for
+    /// validation, plus expected output), and answered clarifications. Names, step identifiers,
+    /// proposals, the model's interpretation, and open or dismissed questions are excluded.
     pub fn spec_fingerprint(&self) -> Fingerprint {
         let projection = SpecProjection {
             description: &self.description,
@@ -163,16 +167,26 @@ impl FunctionDocument {
                     expected: &e.expected,
                 })
                 .collect(),
+            clarifications: self
+                .answered_clarifications()
+                .map(|c| (c.question.as_str(), c.answer.as_str()))
+                .collect(),
         };
         Fingerprint::of("clojurecraft/spec/v1", &projection)
     }
 
     /// The implementation source text exactly; no implementation has its own fingerprint.
     pub fn code_fingerprint(&self) -> Fingerprint {
-        Fingerprint::of(
-            "clojurecraft/code/v1",
-            &self.implementation.as_ref().map(|i| i.source.as_str()),
-        )
+        code_fingerprint(self.implementation.as_ref().map(|i| i.source.as_str()))
+    }
+
+    /// The basis of a result for `source` checked against this document's specification and
+    /// tests, for code that is not (or not yet) the implementation.
+    pub fn basis_with_code(&self, source: &str) -> Basis {
+        Basis {
+            code: code_fingerprint(Some(source)),
+            ..self.basis()
+        }
     }
 
     /// Accepted tests with a defined expectation, in order. Proposed, rejected, and ambiguous
@@ -206,6 +220,11 @@ impl FunctionDocument {
     pub fn content_fingerprint(&self) -> Fingerprint {
         Fingerprint::of("clojurecraft/document/v1", self)
     }
+}
+
+/// The fingerprint of implementation source text (`None` for no implementation).
+pub fn code_fingerprint(source: Option<&str>) -> Fingerprint {
+    Fingerprint::of("clojurecraft/code/v1", &source)
 }
 
 impl BenchmarkConfig {

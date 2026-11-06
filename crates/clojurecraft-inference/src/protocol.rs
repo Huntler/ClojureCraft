@@ -113,6 +113,8 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Nucleus sampling; the server's default when `None`.
+    pub top_p: Option<f32>,
     /// Constrains the answer to JSON matching this schema (llama.cpp grammar sampling).
     pub response_schema: Option<Schema>,
     pub tools: Vec<ToolSpec>,
@@ -131,6 +133,9 @@ impl ChatRequest {
         });
         if stream {
             body["stream_options"] = json!({"include_usage": true});
+        }
+        if let Some(p) = self.top_p {
+            body["top_p"] = json!(p);
         }
         if let Some(schema) = &self.response_schema {
             body["response_format"] = json!({
@@ -612,6 +617,7 @@ mod tests {
             ],
             max_tokens: 10,
             temperature: 0.1,
+            top_p: None,
             response_schema: Some(Schema::string()),
             tools: vec![ToolSpec {
                 name: "t".into(),

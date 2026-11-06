@@ -665,6 +665,7 @@ dependencies = [
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
  "clojurecraft-store",
+ "clojurecraft-workflow",
  "eframe",
  "egui",
  "tracing",
@@ -678,6 +679,7 @@ dependencies = [
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
  "hex",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
@@ -700,11 +702,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clojurecraft-clojure",
+ "clojurecraft-domain",
+ "clojurecraft-edn",
  "clojurecraft-hardware",
  "clojurecraft-inference",
  "clojurecraft-knowledge",
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
+ "clojurecraft-workflow",
  "serde",
  "serde_json",
  "toml",
@@ -814,6 +819,21 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "clojurecraft-workflow"
+version = "0.1.0"
+dependencies = [
+ "clojurecraft-clojure",
+ "clojurecraft-domain",
+ "clojurecraft-edn",
+ "clojurecraft-inference",
+ "clojurecraft-knowledge",
+ "clojurecraft-runtime",
+ "clojurecraft-sandbox",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
