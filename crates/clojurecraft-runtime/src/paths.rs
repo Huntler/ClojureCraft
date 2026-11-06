@@ -47,6 +47,11 @@ impl DataDirs {
         self.root.join("library")
     }
 
+    /// Inference settings (backend, active model, budget, hardware corrections).
+    pub fn settings(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
     /// File holding window geometry, panel sizes, text size, and the last open function.
     pub fn ui_state(&self) -> PathBuf {
         self.root.join("ui-state.ron")

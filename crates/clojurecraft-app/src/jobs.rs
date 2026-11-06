@@ -1,42 +1,25 @@
-//! Background work. Jobs run on their own threads and report typed events; the UI drains the
-//! channel each frame and never blocks on a job.
+//! Background work reports typed events over one channel; the UI drains it each frame and never
+//! blocks on a job.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
 
-use clojurecraft_hardware::{HardwareReport, MemoryBudget, default_budget};
-use clojurecraft_runtime::{DataDirs, Manifest, components, platform_key};
-
+use crate::inference::InferenceEvent;
 use crate::library::LibraryEvent;
 
-/// Which runtime components are installed.
-#[derive(Clone, Debug, Default)]
-pub struct RuntimeStatus {
-    pub data_dir: Option<String>,
-    pub llama_cpp: Option<String>,
-    pub java: bool,
-    pub clojure: bool,
-}
-
 pub enum Event {
-    SystemChecked {
-        report: Box<HardwareReport>,
-        budget: MemoryBudget,
-        runtime: RuntimeStatus,
-    },
     Library(LibraryEvent),
+    Inference(Box<InferenceEvent>),
 }
 
 pub struct Jobs {
     tx: Sender<Event>,
     rx: Receiver<Event>,
-    ctx: egui::Context,
 }
 
 impl Jobs {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new() -> Self {
         let (tx, rx) = channel();
-        Self { tx, rx, ctx }
+        Self { tx, rx }
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -46,28 +29,5 @@ impl Jobs {
     /// A sender for background services that report through the same channel.
     pub fn sender(&self) -> Sender<Event> {
         self.tx.clone()
-    }
-
-    /// Detects hardware and installed runtimes.
-    pub fn check_system(&self) {
-        let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let report = clojurecraft_hardware::detect();
-            let budget = default_budget(&report, report.recommended_backend());
-            let mut runtime = RuntimeStatus::default();
-            if let (Ok(manifest), Some(dirs)) = (Manifest::bundled(), DataDirs::discover()) {
-                runtime.data_dir = Some(dirs.root().display().to_string());
-                runtime.llama_cpp = components::llama_server(&manifest, &dirs).map(|(i, _)| i.version);
-                runtime.java = components::java(&manifest, &dirs, &platform_key()).is_some();
-                runtime.clojure = components::clojure_jars(&manifest, &dirs).is_some();
-            }
-            let _ = tx.send(Event::SystemChecked {
-                report: Box::new(report),
-                budget,
-                runtime,
-            });
-            ctx.request_repaint();
-        });
     }
 }

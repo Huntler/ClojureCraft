@@ -8,6 +8,7 @@
 //! All memory figures derived here (budgets, usable fractions) are estimates.
 
 mod budget;
+mod overrides;
 mod parse;
 
 #[cfg(target_os = "linux")]
@@ -16,6 +17,7 @@ mod linux;
 mod macos;
 
 pub use budget::{BudgetBasis, MemoryBudget, default_budget};
+pub use overrides::{HardwareOverrides, ManualGpu};
 pub use parse::{parse_meminfo, parse_nvidia_smi_csv, parse_proc_cpuinfo_flags};
 
 use serde::{Deserialize, Serialize};

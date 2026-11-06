@@ -79,7 +79,9 @@ fn visuals() -> Visuals {
     v.error_fg_color = BAD;
     for (w, fill, stroke) in [
         (&mut v.widgets.noninteractive, CONTROL, LINE),
-        (&mut v.widgets.inactive, CONTROL, LINE),
+        // Interactive controls get a stronger outline than decorative hairlines so their
+        // boundaries stay visible (checkboxes, radio buttons, text fields).
+        (&mut v.widgets.inactive, CONTROL, LINE_STRONG),
         (&mut v.widgets.hovered, HOVER, LINE_STRONG),
         (&mut v.widgets.active, HOVER, LINE_STRONG),
         (&mut v.widgets.open, HOVER, LINE_STRONG),

@@ -10,9 +10,10 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-app` | egui/eframe UI, application state, background job dispatch (binary `clojurecraft`) |
 | `clojurecraft-domain` | Versioned function records, results, content fingerprints, staleness rules, credential guard (no I/O) |
 | `clojurecraft-edn` | Tolerant EDN/Clojure lexing for highlighting; recovering EDN parser with positioned diagnostics and a value tree (no I/O) |
+| `clojurecraft-credentials` | Access tokens in the OS credential store (Secret Service on Linux, Keychain on macOS) behind one trait |
 | `clojurecraft-store` | SQLite library: drafts, immutable revisions, results, migrations, autosave |
 | `clojurecraft-hardware` | RAM, CPU feature, and GPU/VRAM detection; backend recommendation; default memory budget |
-| `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates |
+| `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates, GGUF header reading, Hugging Face resolution, model store, inference settings, disk usage |
 | `clojurecraft-inference` | `llama-server` child process lifecycle, loopback HTTP client, streaming, cancellation |
 | `clojurecraft-sandbox` | OS-level restriction of untrusted processes (library + `clojurecraft-sandbox` helper binary) |
 | `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness) |
@@ -29,9 +30,11 @@ Data lives outside the repository in the platform data directory, overridable wi
 - Linux: `~/.local/share/clojurecraft/`
 - macOS: `~/Library/Application Support/ClojureCraft/`
 
-with `downloads/`, `runtimes/<component>/<version>/`, `models/<id>/<quant>/`, `harness/`,
-`library/library.sqlite3` (saved functions, history, results), and `ui-state.ron` (window
-geometry, column widths, text size, last open function).
+with `downloads/` (archives and resumable `.part` files), `runtimes/<component>/<version>/`,
+`models/<catalog-id>/<quant>/` and `models/hf/<owner>/<name>/<commit12>/<quant>/` (each with a
+`model.json` record), `harness/`, `library/library.sqlite3` (saved functions, history, results),
+`settings.json` (inference settings), and `ui-state.ron` (window geometry, column widths, text
+size, last open function). Access tokens are never stored here.
 
 ## Decisions
 
@@ -283,8 +286,88 @@ what the chosen backend actually sees. Failures degrade to notes and manual conf
 Default budgets (estimates, user-adjustable): dedicated GPU = VRAM − 768 MiB plus up to half of
 system RAM for partial offload; Apple Silicon = 50 % of unified memory (36 GB → 18 GB); CPU-only =
 50 % of RAM, keeping at least 4 GiB free. Model estimates = weights + per-token KV cache × context
-+ a compute allowance; the KV figures come from each model's published configuration and will be
-cross-checked against GGUF metadata when models are installed.
++ a compute allowance; catalog KV figures come from each model's published configuration, and
+for other repositories from the GGUF header (`block_count × head_count_kv × (key + value
+length) × 2 bytes`).
+
+**Manual correction.** Detected values are never edited in place. The user's corrections
+(system memory; a GPU vendor and memory, replacing the largest detected GPU of that vendor or
+adding one when none was found) are stored in `settings.json` and applied on top of detection,
+marked as "entered manually". When nothing could be detected the budget is a 4 GiB placeholder
+and setup asks for the memory size. The budget itself can be overridden (device and offload
+bytes).
+
+**Partial offload.** When an estimate exceeds the device budget but fits within device plus
+offload memory, whole layers are split: the KV cache and compute buffers are assumed to stay on
+the device, and as many layers as fit go to the GPU. Catalog entries carry their layer count;
+other models take it from the GGUF header. The split is shown as an estimate in setup and
+settings, and "GPU layers" can be set to automatic, all, or a fixed count.
+
+### Inference setup and model management
+
+**First run.** When `settings.json` has no completed or skipped setup, the app opens the setup
+page instead of the editor: hardware (with corrections and budget), backend (recommended first;
+backends without matching hardware are marked; CPU fallback explained), llama.cpp runtime
+(download with progress, cancellation, and resume; verification; smoke test), and the catalog
+ranked for the budget (recommended entry highlighted; estimated memory, download size, context,
+license; entries over budget hidden behind a toggle and marked when shown). Setup can be skipped
+and reopened from the sidebar or settings. While the runtime or an intact selected model is
+missing, the sidebar and the right column say what is missing; specification editing is
+unaffected.
+
+**Background work.** Detection, downloads, hashing, Hub lookups, header inspection, and
+credential-store access run on worker threads that report typed events. One runtime install and
+one model download run at a time; further models queue. Cancelling keeps `.part` files, so the
+next attempt resumes with an HTTP range request.
+
+**Runtime builds.** Each backend build is installed as `runtimes/llama.cpp/<release>-<backend>/`.
+Settings list installed builds and allow activating another, rolling back to the previously
+active one, and removing inactive ones (the active build cannot be removed). Choosing a backend
+whose build is installed activates it. Before downloading, free space for the archives and their
+extraction is checked.
+
+**Model store.** A model is installed from a `ModelRecord` (repository, pinned commit, files with
+size and SHA-256, architecture, layers, KV estimate, license). Files download to
+`downloads/<sha12>-<name>`, are verified, moved into `.staging-<quant>` next to the final
+directory together with `model.json`, and the staging directory is renamed into place; only then
+does the model appear. Files already present in the final directory with the recorded size and
+hash are reused (this also adopts files fetched by the developer tool). Free space for the
+remaining bytes plus 512 MiB is checked first; the error tells the user that finished files are
+kept. Listing performs a size check of every file (missing or changed files mark the model as
+needing repair); "Verify" re-hashes everything; "Repair" downloads only what is broken. Removal
+renames the directory away first, so a half-deleted model never looks installed. A single
+installed model is selected automatically for generation.
+
+**Other Hugging Face repositories.** The repository id and revision are validated, and the
+revision is resolved to a commit through `/api/models/<repo>/revision/<rev>?blobs=true`; all
+downloads use that commit. GGUF files are grouped into options (split files
+`name-0000N-of-0000M.gguf` become one option; vision projector `mmproj` files are not offered).
+Before any download, "Check" reads the first file's header through HTTP range requests (2 MiB,
+growing up to 64 MiB only if the metadata is larger) and reports, before anything large is
+fetched: unsupported or missing architecture (the list ships in the catalog file), missing split
+parts, a split count that disagrees with the file names, files without a Hub-published
+SHA-256, and single files with fewer than two tensors per declared layer (add-ons such as
+speculative-decoding heads). Repositories without GGUF files (for example safetensors only) are explained.
+Installed files are verified against the Hub's LFS SHA-256 and that hash is recorded for later
+verification. Nothing from a repository is ever executed.
+
+**Access tokens.** A Hugging Face token is stored in the OS credential store under the service
+`org.clojurecraft.ClojureCraft` (`keyring-core` with the zbus Secret Service store on Linux,
+the login Keychain on macOS), read and written on worker threads because the store may prompt
+to unlock. When no store is available the token is used for the session only and the user is
+told so. A loaded token is registered with the `SecretRegistry`, so it can never enter function
+drafts, revisions, or results; `Secret` and `Hub` redact it from `Debug` output, errors never
+contain it, and it is sent only to the Hub host (redirects to storage hosts drop the header).
+Gated repositories are never accepted on the user's behalf: a refusal explains that the
+conditions must be accepted on huggingface.co.
+
+**Settings file.** `settings.json` (setup state, backend, active model, context limit, GPU layers,
+budget override, hardware corrections) is written with write-then-rename. An unreadable file is
+kept as `settings.json.unreadable` and defaults apply; a file from a newer format is left
+untouched; both are reported in settings.
+
+**Storage.** Settings show the space used by models, runtimes, cached runtime archives
+(deletable), and unfinished downloads (discardable), and the free space on the data volume.
 
 ## Supported-platform matrix
 
@@ -318,7 +401,9 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
 ## Open decisions and risks
 
 1. **macOS validation is outstanding** (UI, Metal, Seatbelt profile, notarization interaction with
-   downloaded binaries). This needs access to an Apple Silicon Mac.
+   downloaded binaries, Keychain token storage, first-run setup). This needs access to an Apple
+   Silicon Mac; the macOS credential store is compiled only for macOS targets and has not been
+   built.
 2. Whether to offer the CUDA 12.8 llama.cpp build for drivers older than CUDA 13.4 support.
 3. Whether to move `llama-server` to a Unix-domain socket.
 4. cgroup v2 limits for thread count and memory on Linux, when a delegated cgroup is available.
@@ -328,3 +413,6 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
    compositor was available on the reference Linux machine.
 7. The bundled fonts lack some symbols (⌘, arrows, ✕); the interface uses words instead. Adding a
    symbol font (or system fonts) is optional polish.
+8. Model catalog entries are recommended only when `smoke-tested`; Qwen2.5-Coder 1.5B and 7B are
+   the only ones so far, so machines with large budgets are still recommended a 7B model.
+9. Per-model GPU layer and context settings are global, not per model.

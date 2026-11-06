@@ -28,6 +28,10 @@ pub enum InstallError {
     SmokeTest(String),
     #[error("no installation is active")]
     NothingActive,
+    #[error("{0} is not installed")]
+    NotInstalled(String),
+    #[error("{0} is in use; activate another version first")]
+    InUse(String),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstallError + '_ {
@@ -193,6 +197,54 @@ impl ComponentDir {
         })
     }
 
+    /// Completed installations (version ids), sorted.
+    pub fn installed(&self) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Makes an already installed version active, remembering the current one for rollback.
+    pub fn activate(&self, version: &str) -> Result<Installed, InstallError> {
+        let dir = self.root.join(version);
+        if version.starts_with('.') || version.contains('/') || !dir.is_dir() {
+            return Err(InstallError::NotInstalled(version.to_owned()));
+        }
+        let previous = self.active().map(|i| i.version).filter(|v| v != version);
+        self.write_pointer(&ActivePointer {
+            version: version.to_owned(),
+            previous,
+        })?;
+        Ok(Installed {
+            version: version.to_owned(),
+            dir,
+        })
+    }
+
+    /// Deletes an inactive installation. Returns the bytes freed.
+    pub fn remove(&self, version: &str) -> Result<u64, InstallError> {
+        if self.active().is_some_and(|a| a.version == version) {
+            return Err(InstallError::InUse(version.to_owned()));
+        }
+        let dir = self.root.join(version);
+        if version.starts_with('.') || version.contains('/') || !dir.is_dir() {
+            return Err(InstallError::NotInstalled(version.to_owned()));
+        }
+        let size = crate::models::dir_size(&dir);
+        let doomed = self.root.join(format!(".removing-{version}"));
+        let _ = fs::remove_dir_all(&doomed);
+        fs::rename(&dir, &doomed).map_err(io_err(&dir))?;
+        fs::remove_dir_all(&doomed).map_err(io_err(&doomed))?;
+        Ok(size)
+    }
+
     /// Re-activates the previous installation, if it is still present.
     pub fn rollback(&self) -> Result<Installed, InstallError> {
         let text = fs::read_to_string(self.pointer_path()).map_err(|_| InstallError::NothingActive)?;
@@ -299,6 +351,32 @@ mod tests {
         assert_eq!(comp.active().expect("active").version, "v2");
         assert_eq!(comp.rollback().expect("rollback").version, "v1");
         assert_eq!(comp.active().expect("active").version, "v1");
+    }
+
+    #[test]
+    fn switching_and_removing_versions() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let comp = ComponentDir::new(tmp.path().join("rt"));
+        for v in ["b1-cpu", "b1-cuda"] {
+            let a = make_archive(tmp.path(), &format!("{v}.tgz"), &[("t", v)]);
+            comp.install(v, &[a], |_| Ok(())).expect("install");
+        }
+        assert_eq!(comp.installed(), vec!["b1-cpu", "b1-cuda"]);
+        assert_eq!(comp.active().expect("active").version, "b1-cuda");
+        assert!(matches!(comp.remove("b1-cuda"), Err(InstallError::InUse(_))));
+        comp.activate("b1-cpu").expect("activate");
+        assert_eq!(comp.rollback().expect("rollback").version, "b1-cuda");
+        comp.activate("b1-cpu").expect("activate");
+        assert!(comp.remove("b1-cuda").expect("remove") > 0);
+        assert_eq!(comp.installed(), vec!["b1-cpu"]);
+        assert!(matches!(
+            comp.activate("../x"),
+            Err(InstallError::NotInstalled(_))
+        ));
+        assert!(matches!(
+            comp.remove("missing"),
+            Err(InstallError::NotInstalled(_))
+        ));
     }
 
     #[test]

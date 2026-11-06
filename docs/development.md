@@ -28,5 +28,24 @@ The devtool writes to the normal application data directory (see `docs/architect
 installs the active one; installing several backends keeps each under
 `runtimes/llama.cpp/<release>-<backend>/`.
 
+To validate a new GGUF architecture before adding it to `[compatibility] architectures` in
+`resources/model-catalog.toml`, load any local file with the pinned build and run the standard
+prompt (the reply is run in the sandbox); record the result in `docs/model-compatibility.md`:
+
+```sh
+./target/debug/clojurecraft-devtool smoke-file path/to/model.gguf cuda 8192 20   # backend, context, GPU layers
+./target/debug/clojurecraft-devtool run-reply reply.txt                          # run a saved model reply
+```
+
+`fetch-model` installs a catalog model through the same verified model store the application
+uses, so the application lists it afterwards.
+
+The credential-store round trip writes and deletes a test entry in the real Keychain or Secret
+Service, so it only runs when asked for:
+
+```sh
+cargo test -p clojurecraft-credentials -- --ignored
+```
+
 Inference checks (`smoke-model`) are local and manual: they need real weights and, for GPU
 backends, a GPU. They are never part of automated CI.

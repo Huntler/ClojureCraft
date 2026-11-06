@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+clojurecraft-credentials.workspace = true
 clojurecraft-hardware.workspace = true
 clojurecraft-runtime.workspace = true
 clojurecraft-store.workspace = true

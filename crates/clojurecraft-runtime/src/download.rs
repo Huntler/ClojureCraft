@@ -42,6 +42,10 @@ pub enum DownloadError {
     Cancelled,
     #[error("network error: {0}")]
     Http(String),
+    #[error("the server refused access; the repository may be gated or private")]
+    Unauthorized,
+    #[error("not enough disk space: {needed} bytes needed, {available} available")]
+    InsufficientSpace { needed: u64, available: u64 },
     #[error("file system error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("expected {expected} bytes but the server sent {actual}")]
@@ -63,7 +67,7 @@ fn part_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
@@ -95,6 +99,18 @@ pub fn download_verified(
     artifact: &Artifact,
     dest: &Path,
     cancel: &Cancel,
+    progress: impl FnMut(Progress),
+) -> Result<(), DownloadError> {
+    download_verified_auth(artifact, dest, None, cancel, progress)
+}
+
+/// Like [`download_verified`], sending `bearer` as the `Authorization` token (gated or private
+/// repositories). The token is never logged or included in errors.
+pub fn download_verified_auth(
+    artifact: &Artifact,
+    dest: &Path,
+    bearer: Option<&str>,
+    cancel: &Cancel,
     mut progress: impl FnMut(Progress),
 ) -> Result<(), DownloadError> {
     if dest.exists() {
@@ -117,7 +133,7 @@ pub fn download_verified(
         have = 0;
     }
     if have < artifact.size {
-        fetch_into(artifact, &part, have, cancel, &mut progress)?;
+        fetch_into(artifact, &part, have, bearer, cancel, &mut progress)?;
     }
     let len = fs::metadata(&part).map_err(io_err(&part))?.len();
     if len != artifact.size {
@@ -143,6 +159,7 @@ fn fetch_into(
     artifact: &Artifact,
     part: &Path,
     have: u64,
+    bearer: Option<&str>,
     cancel: &Cancel,
     progress: &mut impl FnMut(Progress),
 ) -> Result<(), DownloadError> {
@@ -150,7 +167,14 @@ fn fetch_into(
     if have > 0 {
         req = req.header("Range", format!("bytes={have}-"));
     }
-    let resp = req.call().map_err(|e| DownloadError::Http(e.to_string()))?;
+    if let Some(token) = bearer {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::StatusCode(401 | 403) => DownloadError::Unauthorized,
+        ureq::Error::StatusCode(code) => DownloadError::Http(format!("server answered HTTP {code}")),
+        other => DownloadError::Http(other.to_string()),
+    })?;
     let resumed = have > 0 && resp.status().as_u16() == 206;
     let mut file = if resumed {
         OpenOptions::new().append(true).open(part).map_err(io_err(part))?

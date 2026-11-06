@@ -5,10 +5,13 @@ mod app;
 mod editor;
 mod edn_view;
 mod implementation;
+mod inference;
 mod jobs;
 mod keys;
 mod library;
+mod models_view;
 mod session;
+mod setup_view;
 mod theme;
 mod views;
 

@@ -22,6 +22,90 @@ pub enum ComponentError {
     Download(#[from] DownloadError),
     #[error(transparent)]
     Install(#[from] InstallError),
+    #[error(
+        "not enough disk space: {} needed, {} available. Free some space and try again.",
+        crate::catalog::format_gib(*needed), crate::catalog::format_gib(*available)
+    )]
+    InsufficientSpace { needed: u64, available: u64 },
+}
+
+/// Refuses to start when the data directory lacks room for the downloads still missing plus their
+/// extracted contents (estimated at twice the archive size).
+fn ensure_space(dirs: &DataDirs, artifacts: &[&Artifact]) -> Result<(), ComponentError> {
+    let missing: u64 = artifacts
+        .iter()
+        .filter(|a| !download_path(dirs, a).is_file())
+        .map(|a| a.size)
+        .sum();
+    let total: u64 = artifacts.iter().map(|a| a.size).sum();
+    let needed = missing + 2 * total + crate::models::DISK_MARGIN;
+    match crate::models::available_space(dirs.root()) {
+        Some(available) if available < needed => Err(ComponentError::InsufficientSpace { needed, available }),
+        _ => Ok(()),
+    }
+}
+
+/// An installed llama.cpp build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlamaBuild {
+    pub version: String,
+    pub release: String,
+    pub backend: Option<Backend>,
+    pub active: bool,
+    /// Built from the release pinned by this application.
+    pub pinned: bool,
+}
+
+/// Every installed llama.cpp build, newest release first.
+pub fn llama_builds(manifest: &Manifest, dirs: &DataDirs) -> Vec<LlamaBuild> {
+    let comp = component(dirs, LLAMA_CPP);
+    let active = comp.active().map(|a| a.version);
+    let backends = [
+        Backend::Metal,
+        Backend::Cuda,
+        Backend::Rocm,
+        Backend::Vulkan,
+        Backend::Cpu,
+    ];
+    let mut out: Vec<LlamaBuild> = comp
+        .installed()
+        .into_iter()
+        .map(|version| {
+            let backend = backends
+                .into_iter()
+                .find(|b| version.ends_with(&format!("-{}", backend_slug(*b))));
+            let release = backend.map_or(version.clone(), |b| {
+                version
+                    .trim_end_matches(&format!("-{}", backend_slug(b)))
+                    .to_owned()
+            });
+            LlamaBuild {
+                active: active.as_deref() == Some(version.as_str()),
+                pinned: release == manifest.llama_cpp.release,
+                version,
+                release,
+                backend,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| b.release.cmp(&a.release).then(a.version.cmp(&b.version)));
+    out
+}
+
+pub fn activate_llama(dirs: &DataDirs, version: &str) -> Result<Installed, ComponentError> {
+    Ok(component(dirs, LLAMA_CPP).activate(version)?)
+}
+
+pub fn remove_llama(dirs: &DataDirs, version: &str) -> Result<u64, ComponentError> {
+    Ok(component(dirs, LLAMA_CPP).remove(version)?)
+}
+
+pub fn rollback_llama(dirs: &DataDirs) -> Result<Installed, ComponentError> {
+    Ok(component(dirs, LLAMA_CPP).rollback()?)
+}
+
+fn backend_slug(backend: Backend) -> String {
+    backend.label().to_lowercase().replace('/', "-")
 }
 
 pub const LLAMA_CPP: &str = "llama.cpp";
@@ -79,11 +163,7 @@ fn smoke(program: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 pub fn llama_version_id(manifest: &Manifest, backend: Backend) -> String {
-    format!(
-        "{}-{}",
-        manifest.llama_cpp.release,
-        backend.label().to_lowercase().replace('/', "-")
-    )
+    format!("{}-{}", manifest.llama_cpp.release, backend_slug(backend))
 }
 
 /// Downloads, verifies, smoke-tests, and activates the pinned llama.cpp build for `backend`.
@@ -105,6 +185,7 @@ pub fn install_llama(
     let artifacts: Vec<&Artifact> = std::iter::once(&asset.artifact)
         .chain(asset.extra.iter().map(|e| &e.artifact))
         .collect();
+    ensure_space(dirs, &artifacts)?;
     let archives = fetch_all(dirs, &artifacts, cancel, progress)?;
     let server = manifest.llama_cpp.server_path.clone();
     let installed = component(dirs, LLAMA_CPP).install_with(
@@ -171,6 +252,7 @@ pub fn install_jre(
     if let Some(active) = component(dirs, JRE).active().filter(|a| a.version == version) {
         return Ok(active);
     }
+    ensure_space(dirs, &[&asset.artifact])?;
     let archives = fetch_all(dirs, &[&asset.artifact], cancel, progress)?;
     let java = asset.java_path.clone();
     Ok(component(dirs, JRE).install(&version, &archives, |dir| {
@@ -233,6 +315,18 @@ pub fn clojure_jars(manifest: &Manifest, dirs: &DataDirs) -> Option<Vec<PathBuf>
         .map(|j| active.dir.join(&j.name))
         .collect();
     jars.iter().all(|j| j.is_file()).then_some(jars)
+}
+
+/// Smoke-tests an installed build: `--version`, and for GPU backends `--list-devices` must report
+/// at least one device. Returns the device lines llama.cpp reported.
+pub fn check_llama(manifest: &Manifest, dirs: &DataDirs, version: &str) -> Result<Vec<String>, String> {
+    let server = dirs
+        .runtimes()
+        .join(LLAMA_CPP)
+        .join(version)
+        .join(&manifest.llama_cpp.server_path);
+    smoke(&server, &["--version"])?;
+    Ok(parse_device_list(&smoke(&server, &["--list-devices"])?))
 }
 
 /// The llama.cpp server of a specific installed backend build, active or not.

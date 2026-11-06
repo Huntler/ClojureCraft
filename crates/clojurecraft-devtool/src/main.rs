@@ -23,7 +23,7 @@ use clojurecraft_clojure::{ClojureRuntime, EvalRequest, Limits};
 use clojurecraft_hardware::{Backend, default_budget};
 use clojurecraft_inference::{Cancel as InfCancel, LlamaServer, Message, ServerConfig, list_devices};
 use clojurecraft_runtime::catalog::{Catalog, format_gib};
-use clojurecraft_runtime::{Cancel, DataDirs, Manifest, components, download_verified, platform_key};
+use clojurecraft_runtime::{Cancel, DataDirs, Manifest, components, platform_key};
 
 fn dirs() -> Result<DataDirs> {
     DataDirs::discover().ok_or_else(|| anyhow!("no data directory could be determined"))
@@ -147,18 +147,30 @@ fn model_paths(
     Ok((files, model.name.clone()))
 }
 
+/// Installs a catalog model exactly as the application does (verified, recorded, atomic).
 fn fetch_model(id: &str, quant: &str) -> Result<()> {
-    let (files, name) = model_paths(id, quant)?;
-    println!("fetching {name} {quant}");
+    let catalog = Catalog::bundled()?;
+    let model = catalog.model(id).ok_or_else(|| anyhow!("unknown model {id}"))?;
+    let q = model
+        .quants
+        .iter()
+        .find(|q| q.name == quant)
+        .ok_or_else(|| anyhow!("unknown quantization {quant}"))?;
+    let d = dirs()?;
+    let store = clojurecraft_runtime::models::ModelStore::new(d.models(), d.downloads());
+    println!("fetching {} {quant}", model.name);
     let mut progress = progress_printer();
-    for (dest, artifact) in files {
-        let label = dest
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        download_verified(&artifact, &dest, &Cancel::default(), |p| progress(&label, p))?;
-        println!("  verified {}", dest.display());
-    }
+    let record = store.install(
+        &clojurecraft_runtime::models::ModelRecord::from_catalog(model, q),
+        &clojurecraft_runtime::hub::Hub::new(None),
+        &Cancel::default(),
+        &mut |f, p| progress(f, p),
+    )?;
+    println!(
+        "  installed {} in {}",
+        record.key,
+        store.dir(&record.key).display()
+    );
     Ok(())
 }
 
@@ -193,6 +205,27 @@ const USER_PROMPT: &str = "Write a function `summarize-orders` that takes a vect
     sorted by customer name.";
 
 fn smoke_model(id: &str, quant: &str, backend: &str, context: u32) -> Result<()> {
+    let (files, name) = model_paths(id, quant)?;
+    let model = files
+        .first()
+        .map(|(p, _)| p.clone())
+        .ok_or_else(|| anyhow!("no files"))?;
+    if !model.is_file() {
+        bail!("{} is missing; run fetch-model {id} {quant}", model.display());
+    }
+    smoke_file(&model, &format!("{name} {quant}"), backend, context, None)
+}
+
+/// Loads any GGUF file with the pinned llama.cpp build for `backend`, generates a Clojure function,
+/// runs it in the sandbox, and checks authentication and cancellation. Used to validate models
+/// and architectures before they are allowed.
+fn smoke_file(
+    model: &std::path::Path,
+    label: &str,
+    backend: &str,
+    context: u32,
+    layers: Option<u32>,
+) -> Result<()> {
     let manifest = Manifest::bundled()?;
     let dirs = dirs()?;
     let backend = backend_arg(backend)?;
@@ -202,17 +235,19 @@ fn smoke_model(id: &str, quant: &str, backend: &str, context: u32) -> Result<()>
             backend.label()
         )
     })?;
-    let (files, name) = model_paths(id, quant)?;
-    let model = files
-        .first()
-        .map(|(p, _)| p.clone())
-        .ok_or_else(|| anyhow!("no files"))?;
-    if !model.is_file() {
-        bail!("{} is missing; run fetch-model {id} {quant}", model.display());
-    }
-    let gpu_layers = if backend == Backend::Cpu { Some(0) } else { None };
+    let header = clojurecraft_runtime::gguf::read_header(model)?;
+    let facts = header.facts();
     println!(
-        "starting {} with {name} {quant}, context {context}",
+        "  GGUF: architecture {:?}, {:?} layers, context {:?}, KV estimate {:?} bytes/token",
+        facts.architecture,
+        facts.block_count,
+        facts.context_length,
+        facts.kv_bytes_per_token()
+    );
+    let model = model.to_owned();
+    let gpu_layers = if backend == Backend::Cpu { Some(0) } else { layers };
+    println!(
+        "starting {} with {label}, context {context}, gpu layers {gpu_layers:?}",
         backend.label()
     );
     let gpu_base = gpu_used_mib();
@@ -432,9 +467,22 @@ fn main() -> Result<()> {
         ["fetch-model", id, q] => fetch_model(id, q),
         ["smoke-model", id, q, b] => smoke_model(id, q, b, 8192),
         ["smoke-model", id, q, b, ctx] => smoke_model(id, q, b, ctx.parse()?),
+        ["smoke-file", path, b] => smoke_file(std::path::Path::new(path), path, b, 8192, None),
+        ["smoke-file", path, b, ctx] => smoke_file(std::path::Path::new(path), path, b, ctx.parse()?, None),
+        ["smoke-file", path, b, ctx, layers] => smoke_file(
+            std::path::Path::new(path),
+            path,
+            b,
+            ctx.parse()?,
+            Some(layers.parse()?),
+        ),
         ["sandbox-demo"] => sandbox_demo(),
+        ["run-reply", path] => {
+            run_generated(&std::fs::read_to_string(path)?);
+            Ok(())
+        }
         _ => bail!(
-            "usage: hardware | install-runtime [backend] | fetch-model <id> <quant> | smoke-model <id> <quant> <backend> [ctx] | sandbox-demo"
+            "usage: hardware | install-runtime [backend] | fetch-model <id> <quant> | smoke-model <id> <quant> <backend> [ctx] | smoke-file <path.gguf> <backend> [ctx] [gpu-layers] | run-reply <reply.txt> | sandbox-demo"
         ),
     }
 }

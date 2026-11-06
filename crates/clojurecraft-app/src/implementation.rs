@@ -4,6 +4,7 @@ use clojurecraft_domain::FunctionDocument;
 use egui::{Id, RichText, Ui};
 
 use crate::edn_view;
+use crate::inference::Missing;
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -28,7 +29,9 @@ impl Tab {
     }
 }
 
-pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>) {
+/// Shows the column; returns true when the user asked to open setup.
+pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>, missing: &[Missing]) -> bool {
+    let mut open_setup = false;
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().button_padding.x = 6.0;
@@ -40,9 +43,31 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>) {
         }
     });
     ui.separator();
+    if !missing.is_empty() {
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, theme::WARN))
+            .corner_radius(theme::RADIUS)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Code generation is not available yet").color(theme::WARN));
+                for m in missing {
+                    ui.label(RichText::new(m.describe()).small().color(theme::MUTED));
+                }
+                ui.label(
+                    RichText::new("Specifications can be written and saved in the meantime.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+                if ui.button("Open setup").clicked() {
+                    open_setup = true;
+                }
+            });
+        ui.add_space(6.0);
+    }
     let Some(doc) = doc else {
         empty(ui, "Open or create a function to see its implementation.");
-        return;
+        return open_setup;
     };
     egui::ScrollArea::vertical()
         .id_salt("right-column")
@@ -53,6 +78,7 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, doc: Option<&FunctionDocument>) {
             Tab::Steps => steps(ui, doc),
             Tab::Sources => sources(ui, doc),
         });
+    open_setup
 }
 
 fn empty(ui: &mut Ui, text: &str) {

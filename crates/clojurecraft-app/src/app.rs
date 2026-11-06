@@ -12,12 +12,16 @@ use egui::{Id, Key, RichText, Ui};
 use crate::editor::{self, Action, EditorContext, ExpandTarget, Focus, Undo};
 use crate::edn_view::EdnCache;
 use crate::implementation::{self, Tab};
+use crate::inference::InferenceState;
 use crate::jobs::{Event, Jobs};
 use crate::keys::{self, DUPLICATE, FIND, NEW_FUNCTION, RENAME, SAVE};
 use crate::library::{Command, Library, LibraryEvent};
+use crate::models_view::ModelsPage;
 use crate::session::{self, OpenDocument};
+use crate::setup_view::{self, SetupAction, SetupPage};
 use crate::theme;
-use crate::views::{self, SystemInfo, TrashAction, WelcomeAction};
+use crate::views::{self, SettingsAction, TrashAction, WelcomeAction};
+use clojurecraft_runtime::settings::SetupState;
 
 /// Toasts stay this long after the pointer or keyboard focus last left them.
 const TOAST_LIFETIME: Duration = Duration::from_secs(12);
@@ -32,6 +36,7 @@ enum View {
     Trash,
     Knowledge,
     Settings,
+    Setup,
 }
 
 enum LibraryState {
@@ -67,7 +72,9 @@ pub struct ClojureCraftApp {
     docs: HashMap<FunctionId, OpenDocument>,
     loading: HashSet<FunctionId>,
     open_errors: HashMap<FunctionId, (String, bool)>,
-    system: Option<SystemInfo>,
+    inference: InferenceState,
+    setup_page: SetupPage,
+    models_page: ModelsPage,
     toasts: Vec<Toast>,
     dialog: Option<Dialog>,
     edn: EdnCache,
@@ -80,19 +87,18 @@ pub struct ClojureCraftApp {
 impl ClojureCraftApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
-        let jobs = Jobs::new(cc.egui_ctx.clone());
-        jobs.check_system();
+        let jobs = Jobs::new();
         // Every credential the application handles is registered here so it can never be
         // written into function history or results.
-        let library = Library::start(
-            jobs.sender(),
-            cc.egui_ctx.clone(),
-            Arc::new(SecretRegistry::new()),
-        );
+        let secrets = Arc::new(SecretRegistry::new());
+        let library = Library::start(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
+        let inference = InferenceState::new(jobs.sender(), cc.egui_ctx.clone(), secrets);
+        let first_run = inference.settings.setup == SetupState::NotStarted;
         let reopen = cc
             .storage
             .and_then(|s| eframe::get_value::<Option<FunctionId>>(s, STORAGE_LAST_FUNCTION))
-            .flatten();
+            .flatten()
+            .filter(|_| !first_run);
         Self {
             jobs,
             library,
@@ -101,12 +107,14 @@ impl ClojureCraftApp {
             functions: Vec::new(),
             trash: Vec::new(),
             search: String::new(),
-            view: View::Welcome,
+            view: if first_run { View::Setup } else { View::Welcome },
             reopen,
             docs: HashMap::new(),
             loading: HashSet::new(),
             open_errors: HashMap::new(),
-            system: None,
+            inference,
+            setup_page: SetupPage::default(),
+            models_page: ModelsPage::default(),
             toasts: Vec::new(),
             dialog: None,
             edn: EdnCache::default(),
@@ -122,19 +130,12 @@ impl ClojureCraftApp {
     fn handle_events(&mut self) {
         for event in self.jobs.drain() {
             match event {
-                Event::SystemChecked {
-                    report,
-                    budget,
-                    runtime,
-                } => {
-                    self.system = Some(SystemInfo {
-                        report: *report,
-                        budget,
-                        runtime,
-                    });
-                }
                 Event::Library(event) => self.library_event(event),
+                Event::Inference(event) => self.inference.handle(*event),
             }
+        }
+        for notice in std::mem::take(&mut self.inference.notices) {
+            self.toast(notice, None);
         }
     }
 
@@ -396,6 +397,29 @@ impl ClojureCraftApp {
                 } else {
                     format!("Trash ({})", self.trash.len())
                 };
+                let missing = self.inference.missing();
+                let r = list_item(ui, self.view == View::Setup, "Setup");
+                if !missing.is_empty() {
+                    ui.label(
+                        RichText::new("Incomplete: no model can run yet")
+                            .small()
+                            .color(theme::WARN),
+                    );
+                }
+                let r = if missing.is_empty() {
+                    r.on_hover_text("Runtime and model are ready.")
+                } else {
+                    r.on_hover_text(
+                        missing
+                            .iter()
+                            .map(|m| m.describe())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                };
+                if r.clicked() {
+                    self.view = View::Setup;
+                }
                 for (view, label) in [
                     (View::Knowledge, "Knowledge sources".to_owned()),
                     (View::Settings, "Settings".to_owned()),
@@ -527,8 +551,27 @@ impl ClojureCraftApp {
                 Some(TrashAction::Purge(f)) => self.dialog = Some(Dialog::Purge(f)),
                 None => {}
             },
-            View::Knowledge => views::knowledge(ui, self.system.as_ref()),
-            View::Settings => views::settings(ui, self.system.as_ref()),
+            View::Knowledge => views::knowledge(ui, &self.inference),
+            View::Settings => {
+                if let SettingsAction::OpenSetup =
+                    views::settings(ui, &mut self.inference, &mut self.models_page)
+                {
+                    self.view = View::Setup;
+                }
+            }
+            View::Setup => {
+                let action = egui::ScrollArea::vertical()
+                    .id_salt("setup")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(900.0));
+                        setup_view::page(ui, &mut self.inference, &mut self.setup_page)
+                    })
+                    .inner;
+                if !matches!(action, SetupAction::None) {
+                    self.view = View::Welcome;
+                }
+            }
             View::Function(id) => self.function_editor(ui, id),
         }
     }
@@ -754,6 +797,7 @@ impl eframe::App for ClojureCraftApp {
             .rect
             .right();
         let right_max = (total - left - MIN_CENTER_WIDTH).clamp(300.0, 720.0);
+        let mut open_setup = false;
         let current = match self.view {
             View::Function(id) => self.docs.get(&id).map(|o| &o.doc),
             _ => None,
@@ -763,7 +807,15 @@ impl eframe::App for ClojureCraftApp {
             .default_size(400.0)
             .size_range(300.0..=right_max)
             .frame(side)
-            .show(ui, |ui| implementation::show(ui, &mut self.right_tab, current));
+            .show(ui, |ui| {
+                let missing = self.inference.missing();
+                if implementation::show(ui, &mut self.right_tab, current, &missing) {
+                    open_setup = true;
+                }
+            });
+        if open_setup {
+            self.view = View::Setup;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(20.0))
             .show(ui, |ui| self.center(ui));

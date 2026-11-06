@@ -1,20 +1,14 @@
 //! Centre-column pages other than the function editor: welcome, trash, knowledge sources, and
 //! settings.
 
-use clojurecraft_hardware::{HardwareReport, MemoryBudget};
-use clojurecraft_runtime::catalog::{Catalog, format_gib};
 use clojurecraft_store::FunctionSummary;
 use egui::{RichText, Ui};
 
-use crate::jobs::RuntimeStatus;
+use crate::inference::InferenceState;
 use crate::keys;
+use crate::models_view::{self, ModelsPage};
+use crate::setup_view;
 use crate::theme;
-
-pub struct SystemInfo {
-    pub report: HardwareReport,
-    pub budget: MemoryBudget,
-    pub runtime: RuntimeStatus,
-}
 
 pub fn page_title(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.label(RichText::new(title).size(24.0).color(theme::INK));
@@ -114,7 +108,7 @@ pub fn display_name(name: &str) -> &str {
     }
 }
 
-pub fn knowledge(ui: &mut Ui, system: Option<&SystemInfo>) {
+pub fn knowledge(ui: &mut Ui, inference: &InferenceState) {
     page_title(
         ui,
         "Knowledge sources",
@@ -127,9 +121,12 @@ pub fn knowledge(ui: &mut Ui, system: Option<&SystemInfo>) {
             ui.label(RichText::new("Clojure documentation").color(theme::MUTED));
             ui.label(RichText::new("not installed").color(theme::WARN));
             ui.end_row();
-            if let Some(sys) = system {
-                ui.label(RichText::new("Clojure runtime").color(theme::MUTED));
-                installed(ui, sys.runtime.clojure, None);
+            if let Some(snapshot) = &inference.snapshot {
+                ui.label(RichText::new("Java runtime").color(theme::MUTED));
+                installed(ui, snapshot.java, None);
+                ui.end_row();
+                ui.label(RichText::new("Clojure").color(theme::MUTED));
+                installed(ui, snapshot.clojure, None);
                 ui.end_row();
             }
         });
@@ -152,11 +149,50 @@ fn installed(ui: &mut Ui, ok: bool, detail: Option<String>) {
     ui.label(RichText::new(detail.unwrap_or_else(|| text.to_owned())).color(color));
 }
 
-pub fn settings(ui: &mut Ui, system: Option<&SystemInfo>) {
+pub enum SettingsAction {
+    None,
+    OpenSetup,
+}
+
+pub fn settings(ui: &mut Ui, inference: &mut InferenceState, page: &mut ModelsPage) -> SettingsAction {
+    let mut action = SettingsAction::None;
     page_title(ui, "Settings", "");
     egui::ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
-        ui.label(RichText::new("Appearance").size(16.0));
-        ui.add_space(4.0);
+        ui.set_max_width(ui.available_width().min(900.0));
+        if let Some(problem) = &inference.settings_problem {
+            ui.label(RichText::new(problem).color(theme::WARN));
+        }
+        section(ui, "Inference");
+        if ui.button("Open guided setup").clicked() {
+            action = SettingsAction::OpenSetup;
+        }
+        ui.add_space(6.0);
+        models_view::generation(ui, inference);
+        section(ui, "Hardware and memory budget");
+        setup_view::hardware(ui, inference);
+        section(ui, "Inference backend");
+        setup_view::backend(ui, inference);
+        section(ui, "llama.cpp runtime");
+        models_view::runtimes(ui, inference);
+        section(ui, "Installed models");
+        models_view::installed(ui, inference, page);
+        section(ui, "Curated models");
+        egui::CollapsingHeader::new("Browse the curated catalog")
+            .id_salt("settings-catalog-open")
+            .show(ui, |ui| {
+                let (mut show_all, mut selection) = ui
+                    .data(|d| d.get_temp::<(bool, Vec<String>)>(egui::Id::unique("settings-catalog")))
+                    .unwrap_or_default();
+                setup_view::models(ui, inference, &mut show_all, &mut selection);
+                ui.data_mut(|d| d.insert_temp(egui::Id::unique("settings-catalog"), (show_all, selection)));
+            });
+        section(ui, "Models from Hugging Face");
+        models_view::hugging_face(ui, inference);
+        section(ui, "Hugging Face access token");
+        models_view::token(ui, inference, page);
+        section(ui, "Storage");
+        models_view::storage(ui, inference);
+        section(ui, "Appearance");
         let ctx = ui.ctx().clone();
         let mut zoom = ctx.zoom_factor();
         ui.horizontal(|ui| {
@@ -176,11 +212,15 @@ pub fn settings(ui: &mut Ui, system: Option<&SystemInfo>) {
         });
         ui.add_space(16.0);
         shortcuts(ui);
-        ui.add_space(16.0);
-        ui.label(RichText::new("System").size(16.0));
-        ui.add_space(4.0);
-        system_panel(ui, system);
+        ui.add_space(24.0);
     });
+    action
+}
+
+fn section(ui: &mut Ui, title: &str) {
+    ui.add_space(18.0);
+    ui.label(RichText::new(title).size(16.0));
+    ui.add_space(4.0);
 }
 
 fn shortcuts(ui: &mut Ui) {
@@ -195,78 +235,5 @@ fn shortcuts(ui: &mut Ui) {
             );
             ui.label(what);
         });
-    }
-}
-
-fn system_panel(ui: &mut Ui, system: Option<&SystemInfo>) {
-    let Some(sys) = system else {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Checking hardware and installed runtimes…");
-        });
-        return;
-    };
-    let r = &sys.report;
-    egui::Grid::new("system")
-        .num_columns(2)
-        .spacing([16.0, 6.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Platform").color(theme::MUTED));
-            ui.label(format!("{} {}", r.os, r.arch));
-            ui.end_row();
-            ui.label(RichText::new("Memory").color(theme::MUTED));
-            ui.label(r.total_ram_bytes.map_or_else(|| "unknown".to_owned(), format_gib));
-            ui.end_row();
-            for g in &r.gpus {
-                ui.label(RichText::new("GPU").color(theme::MUTED));
-                let vram = g
-                    .vram_total_bytes
-                    .map_or_else(|| "memory unknown".to_owned(), format_gib);
-                ui.label(format!(
-                    "{} ({vram}{})",
-                    g.name,
-                    if g.unified_memory { ", unified" } else { "" }
-                ));
-                ui.end_row();
-            }
-            ui.label(RichText::new("Backend").color(theme::MUTED));
-            ui.label(r.recommended_backend().label());
-            ui.end_row();
-            ui.label(RichText::new("Inference budget").color(theme::MUTED));
-            ui.label(format!(
-                "{} on device + {} spill (estimate)",
-                format_gib(sys.budget.device_bytes),
-                format_gib(sys.budget.host_spill_bytes)
-            ));
-            ui.end_row();
-            ui.label(RichText::new("llama.cpp").color(theme::MUTED));
-            installed(ui, sys.runtime.llama_cpp.is_some(), sys.runtime.llama_cpp.clone());
-            ui.end_row();
-            ui.label(RichText::new("Java runtime").color(theme::MUTED));
-            installed(ui, sys.runtime.java, None);
-            ui.end_row();
-            ui.label(RichText::new("Clojure").color(theme::MUTED));
-            installed(ui, sys.runtime.clojure, None);
-            ui.end_row();
-            if let Some(dir) = &sys.runtime.data_dir {
-                ui.label(RichText::new("Data folder").color(theme::MUTED));
-                ui.label(RichText::new(dir).monospace());
-                ui.end_row();
-            }
-        });
-    for note in &r.notes {
-        ui.label(RichText::new(note).color(theme::WARN));
-    }
-    if let Ok(catalog) = Catalog::bundled() {
-        ui.add_space(10.0);
-        match catalog.recommended(&sys.budget, catalog.default_context) {
-            Some(c) => ui.label(format!(
-                "Suggested model: {} {} (est. {})",
-                c.model.name,
-                c.quant.name,
-                format_gib(c.estimate.total())
-            )),
-            None => ui.label(RichText::new("No catalog model fits the current budget.").color(theme::WARN)),
-        };
     }
 }

@@ -111,3 +111,25 @@ unless noted.
 | Text size 120 % and 150 % (Ctrl+Plus): layout wraps, no clipping of controls | works |
 | Simulated HiDPI (`WINIT_X11_SCALE_FACTOR=2`): crisp text, correct layout | works |
 | Wayland | not tested (no compositor available) |
+
+### First-run setup and model management — 2026-11-06
+
+Release build against an empty scratch data directory (`CLOJURECRAFT_DATA_DIR`), real network
+(about 12 MB/s), driven with synthetic X11 input.
+
+| Check | Result |
+| --- | --- |
+| First start opens setup; hardware shows RTX 3070 8 GiB (nvidia-smi), 31.3 GiB RAM, AVX2/FMA; budget 7.2 GiB GPU + 15.6 GiB offload (estimate) | works |
+| Backend list: CUDA recommended; Vulkan, CPU offered; ROCm marked "no matching GPU detected" | works |
+| llama.cpp b12138 CUDA (162 MiB + 420 MiB): download with progress, cancel during the second archive (first archive and a 66 MB `.part` kept), "Try again" resumed from the partial file, verified, smoke-tested, activated; llama.cpp reports `CUDA0: NVIDIA GeForce RTX 3070 (7833 MiB)` | works |
+| Catalog ranked for the budget: 7B Q4_K_M recommended and highlighted; partial-offload splits shown (e.g. 30B-A3B Q4_K_M: 14 of 48 layers); unverified entries and license notes marked | works |
+| Qwen2.5-Coder 1.5B Q4_K_M (1.1 GB) downloaded in about 60 s, hash-verified, activated atomically, selected automatically; "Finish setup" enabled | works |
+| Restart: setup not shown again; settings, active model, and runtime intact | works |
+| `unsloth/gemma-3-1b-it-GGUF`: architecture `gemma3` rejected after reading only the header | works |
+| `Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF` Q4_0: header check (24 layers, est. 1005 MiB at 16k), installed under its pinned commit with the Hub's SHA-256; the record was briefly visible only in `.staging-Q4_0` before the rename | works |
+| `Qwen/Qwen2.5-Coder-0.5B-Instruct` (safetensors only) explained; nonexistent repository reports "not found, or private or gated"; malformed id rejected before any request | works |
+| Truncated an installed model file: listed as "needs repair"; Repair re-downloaded it and the hash matched | works |
+| Token saved through the UI: stored in GNOME Keyring (Secret Service), masked while typing, absent from every file in the data directory and from the log, restored after restart, removed from the keyring by "Remove token" | works |
+| Clipboard: text copied in another application pasted into a field with Ctrl+V, and text copied from a field read back from the X clipboard (X11) | works |
+| CPU-only and Apple Silicon recommendations | covered by tests with mock hardware reports only |
+| macOS (Keychain, Metal, setup) | not tested (no Mac available) |

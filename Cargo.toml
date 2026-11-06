@@ -17,17 +17,19 @@ clojurecraft-runtime = { path = "crates/clojurecraft-runtime" }
 clojurecraft-inference = { path = "crates/clojurecraft-inference" }
 clojurecraft-sandbox = { path = "crates/clojurecraft-sandbox" }
 clojurecraft-clojure = { path = "crates/clojurecraft-clojure" }
+clojurecraft-credentials = { path = "crates/clojurecraft-credentials" }
 clojurecraft-domain = { path = "crates/clojurecraft-domain" }
 clojurecraft-edn = { path = "crates/clojurecraft-edn" }
 clojurecraft-store = { path = "crates/clojurecraft-store" }
 
 anyhow = "1"
 directories = "6"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "wayland", "x11", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard", "wayland", "x11", "persistence"] }
 egui = "0.37"
 flate2 = "1"
 hex = "0.4"
 libc = "0.2"
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

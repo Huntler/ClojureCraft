@@ -44,6 +44,12 @@ Notable obligations:
   feature); SQLite itself is public domain, the Rust bindings are MIT.
 - `seccompiler` (Apache-2.0, from Firecracker) and `landlock` (MIT OR Apache-2.0) are used
   unmodified.
+- Credential storage: `keyring-core`, `zbus-secret-service-keyring-store` and `secret-service`
+  (Linux, pure Rust over the `zbus` already used by accesskit; session encryption through the
+  RustCrypto `aes`, `cbc`, `hkdf` crates), `apple-native-keyring-store` and `security-framework`
+  (macOS only). All MIT OR Apache-2.0.
+- `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) for free-space queries
+  (`statvfs`) without unsafe code.
 
 A machine-checked inventory (`cargo deny check licenses` with an allowlist) belongs in CI.
 

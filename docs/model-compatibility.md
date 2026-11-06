@@ -16,9 +16,53 @@ compute allowance. Measured observations are in `docs/platform-validation.md`.
 | `qwen3moe` | Qwen3-Coder 30B-A3B Instruct | supported upstream; unverified here |
 | `mistral3` | Devstral Small 2 24B Instruct (2512) | supported upstream; unverified here |
 | `qwen3next` | Qwen3-Coder-Next 80B-A3B | supported upstream; unverified here; split GGUF (4 files) |
+| `mellum` | JetBrains Mellum2.1 12B-A2.5B Thinking (`JetBrains/Mellum2.1-12B-A2.5B-Thinking-GGUF`, not in the catalog) | loads and generates with b12138 CUDA; see below |
 
-Anything else is rejected by default. Custom Hugging Face repositories must resolve to a GGUF
-whose `general.architecture` is in this table.
+Anything else is rejected. The list ships as `[compatibility] architectures` in
+`resources/model-catalog.toml`; catalog parsing fails if a catalog entry uses an architecture that
+is not listed.
+
+## Mellum validation (2026-11-06)
+
+`JetBrains/Mellum2.1-12B-A2.5B-Thinking-GGUF` Q4_K_M (commit `4159d684`, 7.5 GiB, Apache-2.0),
+llama.cpp b12138 CUDA on the RTX 3070 8 GB, context 8192, 20 of 28 layers on the GPU (the
+application's offload estimate for a 7.2 GiB budget):
+
+- Loads in 2.2 s; 52 tok/s; GPU peak 5.7 GiB; server peak RSS 7.9 GiB. Header: 28 layers,
+  131k context, KV estimate 56 KiB per token.
+- It is a reasoning model: llama-server returns its thinking in `reasoning_content` and the answer
+  in `content`. The standard prompt took 1,450–5,100 completion tokens (about 30–100 s) per answer.
+- Code quality on the standard `summarize-orders` prompt: 0 of 3 samples ran in the sandbox (two
+  compile errors from invalid map destructuring, one wrong call shape). Qwen2.5-Coder 7B passes
+  the same prompt.
+- With every layer requested on the GPU it fails with a CUDA out-of-memory error; it needs
+  partial offload on 8 GB cards.
+
+The architecture is therefore allowed for installation from its repository, but the model is not
+offered in the curated catalog.
+
+## Models from other Hugging Face repositories
+
+1. The repository id (`owner/name`) and optional branch, tag, or commit are validated, and the
+   revision is resolved to a commit that every later download uses.
+2. GGUF files are grouped into options: one file per option, or all parts of a split model
+   (`-0000N-of-0000M.gguf`). Vision projector files (`mmproj`) are not offered. A repository
+   without GGUF files is explained (for example safetensors-only repositories).
+3. Before downloading, the first file's header is read with HTTP range requests (2 MiB, growing
+   only when the metadata is larger). The option is rejected when the architecture is missing or
+   not in the list above, when split parts are missing, when the header's `split.count` disagrees
+   with the file names, when a file has no SHA-256 in the Hub's LFS metadata, or when a
+   single-file option holds fewer than two tensors per declared layer (an add-on such as a
+   speculative-decoding head published next to the model, not a model of its own). Each option
+   shows its file path, since a repository can hold several files with the same quantization.
+4. Memory is estimated from the file sizes and the header's layer and attention geometry
+   (`block_count`, `attention.head_count_kv`, key/value lengths), labelled as an estimate, and
+   compared with the budget, including the partial-offload split.
+5. Files are verified against the Hub's SHA-256; the hash and commit are recorded in `model.json`.
+
+Gated or private repositories need a Hugging Face token (stored in the OS credential store).
+ClojureCraft never accepts a repository's license or access conditions; the user must do that on
+huggingface.co.
 
 ## Curated catalog
 

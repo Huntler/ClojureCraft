@@ -1,6 +1,7 @@
 # Curated coding models offered during setup.
 #
 # Every file is pinned to a repository revision, size, and SHA-256 (the Hugging Face LFS object id).
+# `layers` is the transformer block count, used to estimate partial GPU offload.
 # Memory figures derived from this file are estimates:
 #   kv_bytes_per_token = attention_layers * kv_heads * head_dim * 2 (K and V) * 2 (f16 cache)
 # taken from each model's published configuration.
@@ -11,6 +12,11 @@
 
 schema_version = 1
 default_context = 16384
+
+# GGUF architectures validated with the pinned llama.cpp release (see docs/model-compatibility.md).
+# Models from other repositories are accepted only when their `general.architecture` is listed.
+[compatibility]
+architectures = ["qwen2", "qwen3moe", "mistral3", "qwen3next", "mellum"]
 
 [[models]]
 id = "qwen2.5-coder-1.5b-instruct"
@@ -23,6 +29,7 @@ architecture = "qwen2"
 parameters_b = 1.5
 active_parameters_b = 1.5
 max_context = 32768
+layers = 28
 kv_bytes_per_token = 28672
 quality_rank = 10
 status = "smoke-tested"
@@ -47,6 +54,7 @@ architecture = "qwen2"
 parameters_b = 7.6
 active_parameters_b = 7.6
 max_context = 32768
+layers = 28
 kv_bytes_per_token = 57344
 quality_rank = 30
 status = "smoke-tested"
@@ -75,6 +83,7 @@ architecture = "qwen2"
 parameters_b = 14.7
 active_parameters_b = 14.7
 max_context = 32768
+layers = 48
 kv_bytes_per_token = 196608
 quality_rank = 40
 status = "unverified"
@@ -100,6 +109,7 @@ architecture = "mistral3"
 parameters_b = 24.0
 active_parameters_b = 24.0
 max_context = 262144
+layers = 40
 kv_bytes_per_token = 163840
 quality_rank = 55
 status = "unverified"
@@ -124,6 +134,7 @@ architecture = "qwen3moe"
 parameters_b = 30.5
 active_parameters_b = 3.3
 max_context = 262144
+layers = 48
 kv_bytes_per_token = 98304
 quality_rank = 60
 status = "unverified"
@@ -155,6 +166,7 @@ parameters_b = 80.0
 active_parameters_b = 3.0
 max_context = 262144
 # Hybrid attention: only one layer in four keeps a KV cache; recurrent state is in the overhead.
+layers = 48
 kv_bytes_per_token = 24576
 quality_rank = 80
 status = "unverified"

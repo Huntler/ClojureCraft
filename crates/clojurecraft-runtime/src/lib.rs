@@ -9,9 +9,16 @@
 pub mod catalog;
 pub mod components;
 pub mod download;
+pub mod gguf;
+pub mod hub;
 pub mod install;
 pub mod manifest;
+pub mod models;
 pub mod paths;
+pub mod settings;
+#[cfg(test)]
+mod test_http;
+pub mod usage;
 
 pub use download::{Cancel, DownloadError, Progress, download_verified};
 pub use install::{InstallError, Installed};
