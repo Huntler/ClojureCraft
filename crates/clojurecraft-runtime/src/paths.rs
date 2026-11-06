@@ -41,4 +41,9 @@ impl DataDirs {
     pub fn models(&self) -> PathBuf {
         self.root.join("models")
     }
+
+    /// Saved functions, revision history, and results.
+    pub fn library(&self) -> PathBuf {
+        self.root.join("library")
+    }
 }

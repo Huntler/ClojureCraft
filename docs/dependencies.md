@@ -40,6 +40,8 @@ Notable obligations:
 - `option-ext` (MPL-2.0): file-level copyleft; unmodified use only requires making its source
   available, which crates.io already does. Do not vendor-modify it.
 - `webpki-roots` (CDLA-Permissive-2.0): include the license text in the third-party notices.
+- SQLite 3.54 is compiled into the application through `libsqlite3-sys` (`rusqlite`'s `bundled`
+  feature); SQLite itself is public domain, the Rust bindings are MIT.
 - `seccompiler` (Apache-2.0, from Firecracker) and `landlock` (MIT OR Apache-2.0) are used
   unmodified.
 

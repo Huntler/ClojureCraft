@@ -1,8 +1,12 @@
 //! The application shell: function library on the left, specification in the centre, and
 //! implementation and results on the right.
 
+use std::sync::Arc;
+
+use clojurecraft_domain::SecretRegistry;
 use clojurecraft_hardware::{HardwareReport, MemoryBudget};
 use clojurecraft_runtime::catalog::{Catalog, format_gib};
+use clojurecraft_store::FunctionSummary;
 use egui::{Color32, RichText, Ui};
 
 use crate::jobs::{Event, Jobs, RuntimeStatus};
@@ -17,6 +21,8 @@ struct SystemInfo {
 pub struct ClojureCraftApp {
     jobs: Jobs,
     system: Option<SystemInfo>,
+    /// `None` while loading.
+    library: Option<Result<Vec<FunctionSummary>, String>>,
 }
 
 impl ClojureCraftApp {
@@ -24,7 +30,14 @@ impl ClojureCraftApp {
         theme::apply(&cc.egui_ctx);
         let jobs = Jobs::new(cc.egui_ctx.clone());
         jobs.check_system();
-        Self { jobs, system: None }
+        // Every credential the application handles is registered here so it can never be
+        // written into function history or results.
+        jobs.load_library(Arc::new(SecretRegistry::new()));
+        Self {
+            jobs,
+            system: None,
+            library: None,
+        }
     }
 
     fn handle_events(&mut self) {
@@ -41,15 +54,37 @@ impl ClojureCraftApp {
                         runtime,
                     });
                 }
+                Event::LibraryLoaded(result) => self.library = Some(result),
             }
         }
     }
 
-    fn library(ui: &mut Ui) {
+    fn library(&self, ui: &mut Ui) {
         ui.add_space(8.0);
         ui.heading("Functions");
         ui.add_space(4.0);
-        ui.label(RichText::new("No saved functions yet.").color(theme::MUTED));
+        match &self.library {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Opening library…").color(theme::MUTED));
+                });
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new("The function library could not be opened.").color(theme::BAD));
+                ui.label(RichText::new(e).color(theme::MUTED).small());
+            }
+            Some(Ok(functions)) if functions.is_empty() => {
+                ui.label(RichText::new("No saved functions yet.").color(theme::MUTED));
+            }
+            Some(Ok(functions)) => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for f in functions {
+                        ui.label(&f.name).on_hover_text(&f.description);
+                    }
+                });
+            }
+        }
     }
 
     fn system_panel(&self, ui: &mut Ui) {
@@ -149,7 +184,7 @@ impl eframe::App for ClojureCraftApp {
             .default_size(240.0)
             .size_range(200.0..=360.0)
             .frame(side)
-            .show(ui, Self::library);
+            .show(ui, |ui| self.library(ui));
         egui::Panel::right("implementation")
             .resizable(true)
             .default_size(420.0)

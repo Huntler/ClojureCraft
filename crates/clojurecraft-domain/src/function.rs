@@ -1,0 +1,405 @@
+//! The editable content of a function: specification, implementation, tests, and benchmark
+//! configurations. A [`FunctionDocument`] is what a draft holds and what a revision freezes.
+
+use serde::{Deserialize, Serialize};
+
+use crate::DomainError;
+use crate::fingerprint::Fingerprint;
+use crate::ids::{
+    BenchmarkConfigId, BenchmarkInputId, ExampleId, FunctionId, RevisionId, StepId, TestCaseId,
+};
+use crate::time::Timestamp;
+
+/// EDN source text exactly as the user (or a tool) wrote it. It is stored unparsed so that invalid
+/// EDN never loses what was typed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Edn(pub String);
+
+impl Edn {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDocument {
+    pub id: FunctionId,
+    /// Display name; also the basis of the exported function name.
+    pub name: String,
+    pub description: String,
+    pub contract: Option<Contract>,
+    pub steps: Vec<Step>,
+    pub examples: Vec<Example>,
+    pub implementation: Option<Implementation>,
+    pub tests: Vec<TestCase>,
+    pub benchmarks: Vec<BenchmarkConfig>,
+}
+
+impl FunctionDocument {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: FunctionId::generate(),
+            name: name.into(),
+            description: String::new(),
+            contract: None,
+            steps: Vec::new(),
+            examples: Vec::new(),
+            implementation: None,
+            tests: Vec::new(),
+            benchmarks: Vec::new(),
+        }
+    }
+
+    pub fn example(&self, id: ExampleId) -> Option<&Example> {
+        self.examples.iter().find(|e| e.id == id)
+    }
+
+    pub fn test(&self, id: TestCaseId) -> Option<&TestCase> {
+        self.tests.iter().find(|t| t.id == id)
+    }
+
+    pub fn benchmark(&self, id: BenchmarkConfigId) -> Option<&BenchmarkConfig> {
+        self.benchmarks.iter().find(|b| b.id == id)
+    }
+
+    /// Every reference from an example input to another function's output.
+    pub fn output_references(&self) -> impl Iterator<Item = (ExampleId, &OutputReference)> {
+        self.examples.iter().filter_map(|e| match &e.input {
+            ExampleInput::FunctionOutput { source, .. } => Some((e.id, source)),
+            ExampleInput::Direct { .. } => None,
+        })
+    }
+}
+
+/// Explicit input/output requirements. Only an accepted contract is a user requirement; a
+/// proposal is shown for review and has no effect on validation until accepted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Contract {
+    pub status: ContractStatus,
+    pub input: Shape,
+    pub output: Shape,
+    pub ordering: OrderingRequirement,
+    /// Namespaces the implementation may require beyond `clojure.core`.
+    pub allowed_dependencies: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractStatus {
+    Accepted,
+    Proposed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Shape {
+    pub description: String,
+    pub keys: Vec<KeySpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeySpec {
+    /// The key as EDN, for example `:user/id` or `"name"`.
+    pub key: Edn,
+    pub required: bool,
+    pub value_type: ValueType,
+    pub nil: NilBehavior,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "name")]
+pub enum ValueType {
+    Any,
+    Nil,
+    Boolean,
+    Integer,
+    Number,
+    String,
+    Keyword,
+    Symbol,
+    Map,
+    Vector,
+    List,
+    Set,
+    Sequential,
+    /// A type described in the user's own words.
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum NilBehavior {
+    Unspecified,
+    /// `nil` is not a valid value here.
+    Disallowed,
+    /// `nil` is treated the same as an absent key.
+    TreatAsMissing,
+    /// `nil` passes through unchanged.
+    PassThrough,
+    /// `nil` (or absence) is replaced by this value.
+    Default(Edn),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
+pub enum OrderingRequirement {
+    Unspecified,
+    /// Output order follows input order.
+    PreserveInput,
+    /// Output order is irrelevant; compare as unordered.
+    Unordered,
+    /// Output is sorted as described.
+    Sorted(String),
+}
+
+/// One natural-language transformation step. The identifier survives reordering and rewording.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub id: StepId,
+    pub text: String,
+}
+
+impl Step {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            id: StepId::generate(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Example {
+    pub id: ExampleId,
+    pub name: String,
+    pub input: ExampleInput,
+    pub expected: Edn,
+}
+
+impl Example {
+    pub fn direct(name: impl Into<String>, input: Edn, expected: Edn) -> Self {
+        Self {
+            id: ExampleId::generate(),
+            name: name.into(),
+            input: ExampleInput::Direct { value: input },
+            expected,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ExampleInput {
+    /// Input written directly as EDN.
+    Direct { value: Edn },
+    /// Input taken from the output of another saved function's example.
+    ///
+    /// The value used for validation is the recorded `snapshot`, so upstream changes never alter
+    /// this example until the user explicitly refreshes it.
+    FunctionOutput {
+        source: OutputReference,
+        snapshot: Option<ReferencedValue>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputReference {
+    pub function: FunctionId,
+    pub revision: RevisionPin,
+    pub example: ExampleId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "revision")]
+pub enum RevisionPin {
+    /// Follow the latest revision when the user refreshes.
+    Latest,
+    /// Always use this revision.
+    Pinned(RevisionId),
+}
+
+/// An executed upstream output, recorded with where it came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencedValue {
+    pub value: Edn,
+    pub revision: RevisionId,
+    pub resolved_at: Timestamp,
+}
+
+/// The current implementation and, if it came from the model, the generation that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Implementation {
+    pub source: String,
+    pub generation: Option<GenerationRecord>,
+}
+
+impl Implementation {
+    pub fn manual(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            generation: None,
+        }
+    }
+
+    /// Whether the code differs from what the model generated. Hand-written code (no generation)
+    /// counts as manually edited.
+    pub fn is_manually_edited(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_none_or(|g| g.generated_source != self.source)
+    }
+}
+
+/// Provenance of model-generated code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenerationRecord {
+    /// The code exactly as generated, kept so manual edits can be reviewed against it.
+    pub generated_source: String,
+    pub model: ModelIdentity,
+    pub runtime: InferenceRuntime,
+    pub settings: GenerationSettings,
+    pub documentation: Vec<DocumentationRef>,
+    /// The specification fingerprint the code was generated from.
+    pub spec_basis: Fingerprint,
+    /// 1 for the initial generation, plus one per repair attempt.
+    pub attempts: u32,
+    pub created_at: Timestamp,
+}
+
+/// Which model produced a result. Locations are repository coordinates, never download URLs, so
+/// no access tokens or signed query strings can be recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelIdentity {
+    pub display_name: String,
+    pub repository: String,
+    pub revision: String,
+    pub file: String,
+    pub sha256: String,
+    pub quantization: String,
+    pub architecture: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRuntime {
+    /// llama.cpp release tag, for example `b12138`.
+    pub llama_cpp_release: String,
+    /// `metal`, `cuda`, `vulkan`, `rocm`, or `cpu`.
+    pub backend: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenerationSettings {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: Option<u64>,
+    pub context_length: u32,
+    pub max_output_tokens: u32,
+}
+
+/// A retrieved documentation excerpt that informed a generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentationRef {
+    pub source_url: String,
+    pub title: String,
+    pub symbol: Option<String>,
+    pub namespace: Option<String>,
+    pub clojure_version: String,
+    /// Version of the installed documentation collection.
+    pub collection_revision: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCase {
+    pub id: TestCaseId,
+    pub name: String,
+    pub input: Edn,
+    pub expectation: Expectation,
+    pub status: TestStatus,
+    pub origin: TestOrigin,
+    pub notes: String,
+}
+
+impl TestCase {
+    /// Accepts the case as a regression test. A case whose expected result is still an open
+    /// question cannot be accepted, so ambiguities never become hidden requirements.
+    pub fn accept(&mut self) -> Result<(), DomainError> {
+        match self.expectation {
+            Expectation::Value { .. } => {
+                self.status = TestStatus::Accepted;
+                Ok(())
+            }
+            Expectation::NeedsClarification { .. } => Err(DomainError::AmbiguousTest(self.id)),
+        }
+    }
+
+    /// Whether this case takes part in validation.
+    pub fn is_active(&self) -> bool {
+        self.status == TestStatus::Accepted && matches!(self.expectation, Expectation::Value { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Expectation {
+    Value {
+        expected: Edn,
+    },
+    /// The specification does not determine the result; the user must decide.
+    NeedsClarification {
+        question: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Proposed,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestOrigin {
+    User,
+    Model,
+    /// Proposed by the model, then changed by the user.
+    ModelEdited,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkConfig {
+    pub id: BenchmarkConfigId,
+    pub name: String,
+    pub inputs: Vec<BenchmarkInput>,
+    pub warmup_runs: u32,
+    pub measured_runs: u32,
+    /// Upper bound on the whole benchmark's wall-clock time.
+    pub max_duration_ms: u64,
+    pub max_heap_mib: u32,
+    pub realization: Realization,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkInput {
+    pub id: BenchmarkInputId,
+    pub label: String,
+    pub value: Edn,
+    /// The user's description of the input size, for example "10k orders".
+    pub size_label: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Realization {
+    /// Fully realize lazy results inside the measurement.
+    Full,
+    /// Measure the call only, as returned.
+    AsReturned,
+}

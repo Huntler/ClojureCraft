@@ -8,6 +8,8 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | Crate | Responsibility |
 | --- | --- |
 | `clojurecraft-app` | egui/eframe UI, application state, background job dispatch (binary `clojurecraft`) |
+| `clojurecraft-domain` | Versioned function records, results, content fingerprints, staleness rules, credential guard (no I/O) |
+| `clojurecraft-store` | SQLite library: drafts, immutable revisions, results, migrations, autosave |
 | `clojurecraft-hardware` | RAM, CPU feature, and GPU/VRAM detection; backend recommendation; default memory budget |
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates |
 | `clojurecraft-inference` | `llama-server` child process lifecycle, loopback HTTP client, streaming, cancellation |
@@ -15,7 +17,7 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions; Clojure-side static checks (harness) |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
 
-Later boundaries (domain model, storage, documentation retrieval, export, benchmarking, updates)
+Later boundaries (documentation retrieval, export, benchmarking, updates)
 get their own crates when they are implemented. Long-running work runs on background threads that
 report typed events over a channel; the UI drains the channel each frame and never blocks
 (`clojurecraft-app/src/jobs.rs`).
@@ -26,7 +28,8 @@ Data lives outside the repository in the platform data directory, overridable wi
 - Linux: `~/.local/share/clojurecraft/`
 - macOS: `~/Library/Application Support/ClojureCraft/`
 
-with `downloads/`, `runtimes/<component>/<version>/`, `models/<id>/<quant>/`, and `harness/`.
+with `downloads/`, `runtimes/<component>/<version>/`, `models/<id>/<quant>/`, `harness/`, and
+`library/library.sqlite3` (saved functions, history, results).
 
 ## Decisions
 
@@ -163,7 +166,64 @@ schema migrations, and the built-in FTS5 full-text index for documentation. The 
 corpus is small (thousands of chunks), so embedding vectors can be stored in SQLite and searched
 by exact cosine similarity in memory, avoiding a separate vector-index dependency. Embeddings will
 be produced by a small GGUF embedding model through `llama-server --embedding` (for example
-Qwen3-Embedding-0.6B), reusing the inference runtime. Not yet implemented.
+Qwen3-Embedding-0.6B), reusing the inference runtime. The function library is implemented (see
+below); the documentation index is not yet.
+
+### Domain model and persistence
+
+**Records** (`clojurecraft-domain`). A function is a `FunctionDocument`: name, description,
+optional contract (proposed or accepted), ordered steps with stable `StepId`s, examples (direct
+EDN input, or a reference to another function's example output with a recorded snapshot of the
+value), the implementation (current source plus, when generated, the generated source and its
+provenance: model repository/revision/file hash/quantization, llama.cpp release and backend,
+generation settings, documentation excerpts used), edge-case tests (proposed/accepted/rejected,
+user- or model-originated), and benchmark configurations. EDN is stored as the exact text typed,
+never re-serialised, so invalid EDN is never lost. Validation reports and benchmark results are
+separate append-only records.
+
+**Draft + immutable revisions.** Each function has one draft, written as a single JSON document
+per save, and a linear history of revisions that freeze a document. Restoring an old revision
+never deletes history: the current draft is first recorded (`BeforeRestore`) if it has
+unrevisioned changes, then the restored content is appended as the newest revision. Revisions and
+results are protected by SQLite triggers against `UPDATE`.
+
+**Fingerprints and staleness.** Specification, code, and accepted tests are each hashed
+(SHA-256 over a versioned canonical projection). The specification fingerprint covers the
+description, the *accepted* contract, step texts in order, and examples (validated input value and
+expected output); names, step identifiers, proposals, and rejected or ambiguous tests are
+excluded. Every result stores the fingerprints it was computed from, so freshness is decided by
+comparison: results are never deleted when content changes, they become `Stale([components])` and
+stay inspectable. Benchmarks additionally depend on their configuration fingerprint.
+
+**Durability.** SQLite (bundled 3.54) in WAL mode with `synchronous = FULL` and foreign keys on;
+`quick_check` on open. Multi-row operations (commit, restore, purge) are single transactions. A
+crash test kills a writer process at random points and verifies database integrity and that the
+draft and every revision are internally consistent.
+
+**Ordering.** Draft writes carry the editor's monotonic edit sequence; a write older than the
+stored sequence is ignored (`Superseded`), so a delayed autosave cannot overwrite a restored
+draft. The autosaver runs on its own thread and connection, coalesces edits (quiet period, with a
+maximum wait while typing continues), retries transient failures with back-off, reports every
+outcome as an event, and flushes on shutdown.
+
+**Versioning.** Schema migrations are tracked in `PRAGMA user_version`; each runs in its own
+transaction with its version bump, after a `VACUUM INTO` backup
+(`library.sqlite3.v<N>.bak`). A library from a newer application is refused untouched. Each
+stored JSON record carries a format number; older formats are upgraded in memory on read
+(immutable records are never rewritten), newer formats are refused. An unreadable draft is
+reported and can be replaced by its latest revision; a draft from a newer format cannot.
+
+**References.** Example inputs referencing another function are indexed for the draft and every
+revision. Functions are deleted to a trash and can be restored; permanent deletion is refused
+while any other function's draft or history references them. `check_references` reports missing
+or trashed functions, missing or mismatched revisions, and missing upstream examples. Cycle
+detection is part of the referenced-input workflow, not yet implemented.
+
+**Credentials.** No record has a credential field; provenance uses repository coordinates, never
+download URLs. A process-wide `SecretRegistry` holds every secret the application knows (inference
+API keys, access tokens). Drafts and revisions containing a registered secret are refused;
+machine-produced results are redacted (registered secrets and `hf_…` token shapes) before
+storage. The same guard is intended for exports.
 
 ### Hardware detection and budgets
 
