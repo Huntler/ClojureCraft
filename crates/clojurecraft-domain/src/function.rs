@@ -67,6 +67,77 @@ impl FunctionDocument {
         self.benchmarks.iter().find(|b| b.id == id)
     }
 
+    /// Inserts a new step after `after` (or at the end) and returns its identifier.
+    pub fn add_step(&mut self, after: Option<StepId>, text: impl Into<String>) -> StepId {
+        let step = Step::new(text);
+        let id = step.id;
+        let index = after
+            .and_then(|a| self.steps.iter().position(|s| s.id == a))
+            .map_or(self.steps.len(), |i| i + 1);
+        self.steps.insert(index, step);
+        id
+    }
+
+    /// Moves a step to `index` (clamped to the valid range). The step keeps its identifier, so
+    /// anything that refers to it still does after reordering. Returns whether anything moved.
+    pub fn move_step(&mut self, id: StepId, index: usize) -> bool {
+        let Some(from) = self.steps.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        let to = index.min(self.steps.len() - 1);
+        if from == to {
+            return false;
+        }
+        let step = self.steps.remove(from);
+        self.steps.insert(to, step);
+        true
+    }
+
+    /// Removes a step, returning it with its former position so the removal can be undone with
+    /// [`Self::insert_step`].
+    pub fn remove_step(&mut self, id: StepId) -> Option<(usize, Step)> {
+        let index = self.steps.iter().position(|s| s.id == id)?;
+        Some((index, self.steps.remove(index)))
+    }
+
+    /// Reinserts a previously removed step at `index` (clamped). A step whose identifier is
+    /// already present is not inserted twice.
+    pub fn insert_step(&mut self, index: usize, step: Step) -> bool {
+        if self.steps.iter().any(|s| s.id == step.id) {
+            return false;
+        }
+        self.steps.insert(index.min(self.steps.len()), step);
+        true
+    }
+
+    /// Appends an empty direct-input example and returns its identifier.
+    pub fn add_example(&mut self, name: impl Into<String>) -> ExampleId {
+        let example = Example::direct(name, Edn::default(), Edn::default());
+        let id = example.id;
+        self.examples.push(example);
+        id
+    }
+
+    pub fn example_mut(&mut self, id: ExampleId) -> Option<&mut Example> {
+        self.examples.iter_mut().find(|e| e.id == id)
+    }
+
+    /// Removes an example, returning it with its former position for undo.
+    pub fn remove_example(&mut self, id: ExampleId) -> Option<(usize, Example)> {
+        let index = self.examples.iter().position(|e| e.id == id)?;
+        Some((index, self.examples.remove(index)))
+    }
+
+    /// Reinserts a previously removed example at `index` (clamped), unless its identifier is
+    /// already present.
+    pub fn insert_example(&mut self, index: usize, example: Example) -> bool {
+        if self.examples.iter().any(|e| e.id == example.id) {
+            return false;
+        }
+        self.examples.insert(index.min(self.examples.len()), example);
+        true
+    }
+
     /// Every reference from an example input to another function's output.
     pub fn output_references(&self) -> impl Iterator<Item = (ExampleId, &OutputReference)> {
         self.examples.iter().filter_map(|e| match &e.input {
@@ -87,6 +158,20 @@ pub struct Contract {
     /// Namespaces the implementation may require beyond `clojure.core`.
     pub allowed_dependencies: Vec<String>,
     pub notes: String,
+}
+
+impl Contract {
+    /// A contract with no requirements yet.
+    pub fn empty(status: ContractStatus) -> Self {
+        Self {
+            status,
+            input: Shape::default(),
+            output: Shape::default(),
+            ordering: OrderingRequirement::Unspecified,
+            allowed_dependencies: Vec::new(),
+            notes: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

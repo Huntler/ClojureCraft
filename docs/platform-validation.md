@@ -91,3 +91,23 @@ toolchain to check and could not be cross-checked from Linux.
 Outstanding on an Apple Silicon Mac: window, Metal inference, Seatbelt profile against the same
 attack list, JRE and llama.cpp execution from the app data directory under Gatekeeper, peak memory
 of a ~30B model within the 18 GB budget.
+
+### Specification workspace — 2026-11-06
+
+Driven with synthetic X11 input against a scratch library (`CLOJURECRAFT_DATA_DIR`), release build
+unless noted.
+
+| Check | Result |
+| --- | --- |
+| Create (Ctrl+N), name selected for typing, rename, duplicate, move to trash, undo, restore, permanent delete with confirmation | works |
+| Edits survive restart, including after the process was killed with SIGTERM once "Saved" showed | works |
+| Last open function, column widths, and text size restored after a normal close | works |
+| Steps: add, Ctrl+Enter inserts after the focused step, Alt+Up/Down reorders with focus following the step, remove and undo at the original position | works |
+| Invalid EDN: text kept, problems listed with line/column, offending text underlined, click selects it | works |
+| 3 000-item example (≈300 KB): text and tree views | ~60 fps (release); about 1.5 s per frame in a debug build |
+| 30 000-item example (≈3 MB): text and tree views | ~60 fps (release); ~50–100 ms per keystroke |
+| Read-only library file: save fails with a visible, non-retrying error and "Try again"; closing asks before discarding | works |
+| Minimum window 1024 × 640: all three columns usable, centre column 440 points | works |
+| Text size 120 % and 150 % (Ctrl+Plus): layout wraps, no clipping of controls | works |
+| Simulated HiDPI (`WINIT_X11_SCALE_FACTOR=2`): crisp text, correct layout | works |
+| Wayland | not tested (no compositor available) |

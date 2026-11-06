@@ -2,8 +2,15 @@
 //! coding model.
 
 mod app;
+mod editor;
+mod edn_view;
+mod implementation;
 mod jobs;
+mod keys;
+mod library;
+mod session;
 mod theme;
+mod views;
 
 const APP_ID: &str = "org.clojurecraft.ClojureCraft";
 
@@ -24,6 +31,9 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport,
         persist_window: true,
+        // Kept with the rest of the application data (and its override) rather than in a
+        // separate per-toolkit location.
+        persistence_path: clojurecraft_runtime::DataDirs::discover().map(|d| d.ui_state()),
         ..Default::default()
     };
     eframe::run_native(

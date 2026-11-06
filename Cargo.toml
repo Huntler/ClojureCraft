@@ -18,6 +18,7 @@ clojurecraft-inference = { path = "crates/clojurecraft-inference" }
 clojurecraft-sandbox = { path = "crates/clojurecraft-sandbox" }
 clojurecraft-clojure = { path = "crates/clojurecraft-clojure" }
 clojurecraft-domain = { path = "crates/clojurecraft-domain" }
+clojurecraft-edn = { path = "crates/clojurecraft-edn" }
 clojurecraft-store = { path = "crates/clojurecraft-store" }
 
 anyhow = "1"

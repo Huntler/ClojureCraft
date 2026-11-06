@@ -267,3 +267,68 @@ fn benchmarks_go_stale_on_content_or_configuration_changes() {
         stale(&[Component::BenchmarkConfiguration])
     );
 }
+
+#[test]
+fn reordering_steps_keeps_identities_and_marks_results_stale() {
+    let mut doc = sample();
+    let third = doc.add_step(None, "sort by total");
+    let ids: Vec<StepId> = doc.steps.iter().map(|s| s.id).collect();
+    let report = report_for(&doc);
+
+    assert!(doc.move_step(third, 0));
+    let moved: Vec<StepId> = doc.steps.iter().map(|s| s.id).collect();
+    assert_eq!(moved, [ids[2], ids[0], ids[1]]);
+    assert_eq!(doc.steps[0].text, "sort by total");
+    // Order is part of the specification.
+    assert_eq!(report.freshness(&doc.basis()), stale(&[Component::Specification]));
+
+    // Moving back restores the original fingerprint exactly.
+    assert!(doc.move_step(third, usize::MAX));
+    assert_eq!(report.freshness(&doc.basis()), Freshness::Current);
+    assert!(!doc.move_step(third, 99), "already last: nothing to move");
+    assert!(!doc.move_step(StepId::generate(), 0));
+}
+
+#[test]
+fn inserted_steps_land_after_their_anchor() {
+    let mut doc = sample();
+    let first = doc.steps[0].id;
+    let new = doc.add_step(Some(first), "drop cancelled orders");
+    assert_eq!(doc.steps[1].id, new);
+    let unknown_anchor = doc.add_step(Some(StepId::generate()), "last");
+    assert_eq!(doc.steps.last().map(|s| s.id), Some(unknown_anchor));
+}
+
+#[test]
+fn undoing_a_removal_restores_the_same_step_and_example() {
+    let mut doc = sample();
+    let before = doc.basis();
+    let step = doc.steps[0].id;
+    let (index, removed) = doc.remove_step(step).expect("step exists");
+    assert_ne!(doc.basis(), before);
+    assert!(doc.insert_step(index, removed.clone()));
+    assert!(!doc.insert_step(index, removed), "never duplicated");
+    assert_eq!(doc.steps[0].id, step);
+    assert_eq!(doc.basis(), before);
+
+    let example = doc.examples[0].id;
+    let (index, removed) = doc.remove_example(example).expect("example exists");
+    assert!(doc.examples.is_empty());
+    assert!(doc.insert_example(index, removed));
+    assert_eq!(doc.examples[0].id, example);
+    assert_eq!(doc.basis(), before);
+}
+
+#[test]
+fn a_new_example_is_empty_and_direct() {
+    let mut doc = FunctionDocument::new("f");
+    let id = doc.add_example("Example 1");
+    let example = doc.example(id).expect("added");
+    assert_eq!(
+        example.input,
+        ExampleInput::Direct {
+            value: Edn::default()
+        }
+    );
+    assert!(example.expected.as_str().is_empty());
+}

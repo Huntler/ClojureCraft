@@ -9,6 +9,7 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | --- | --- |
 | `clojurecraft-app` | egui/eframe UI, application state, background job dispatch (binary `clojurecraft`) |
 | `clojurecraft-domain` | Versioned function records, results, content fingerprints, staleness rules, credential guard (no I/O) |
+| `clojurecraft-edn` | Tolerant EDN/Clojure lexing for highlighting; recovering EDN parser with positioned diagnostics and a value tree (no I/O) |
 | `clojurecraft-store` | SQLite library: drafts, immutable revisions, results, migrations, autosave |
 | `clojurecraft-hardware` | RAM, CPU feature, and GPU/VRAM detection; backend recommendation; default memory budget |
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates |
@@ -28,8 +29,9 @@ Data lives outside the repository in the platform data directory, overridable wi
 - Linux: `~/.local/share/clojurecraft/`
 - macOS: `~/Library/Application Support/ClojureCraft/`
 
-with `downloads/`, `runtimes/<component>/<version>/`, `models/<id>/<quant>/`, `harness/`, and
-`library/library.sqlite3` (saved functions, history, results).
+with `downloads/`, `runtimes/<component>/<version>/`, `models/<id>/<quant>/`, `harness/`,
+`library/library.sqlite3` (saved functions, history, results), and `ui-state.ron` (window
+geometry, column widths, text size, last open function).
 
 ## Decisions
 
@@ -225,6 +227,52 @@ API keys, access tokens). Drafts and revisions containing a registered secret ar
 machine-produced results are redacted (registered secrets and `hf_…` token shapes) before
 storage. The same guard is intended for exports.
 
+### Main workspace
+
+Three resizable columns: the function library (search, new function, and navigation to knowledge
+sources, settings, and trash) on the left; the specification editor (name, description, example
+tabs, contract, ordered steps) in the centre; implementation, result, step, and source views on the
+right. Column widths persist. The centre keeps at least 440 points; the side columns give way
+first. The documented minimum window is 1024 × 640 points; increasing the text size reduces the
+available points, and the layout then wraps rather than clipping.
+
+**Editing model.** The library worker thread owns one store connection and performs library
+operations in order (open, create, duplicate, trash, restore, purge, recover); the autosaver owns a
+second connection. Every edit bumps the document's edit sequence and is submitted to the autosaver
+(600 ms quiet period). The editor keeps every document opened in the session in memory and never
+reloads it from disk, so reopening a function cannot resurrect an older draft that is still waiting
+to be written. Save state is shown per function (saved, saving, retrying, not saved, conflict); a
+non-retryable failure shows the error and a retry action, and closing the window with unsaved
+changes asks first. Edits are flushed on exit.
+
+**Recovery.** Moving a function to the trash, removing a step, removing an example, and removing
+the contract are undoable from a notification. Notifications stay while hovered or focused, and
+trashed functions remain restorable from the trash page; permanent deletion asks for confirmation
+with the safe choice focused.
+
+**Identity.** Steps and examples are edited through `FunctionDocument` operations that preserve
+identifiers: reordering moves the same `Step`, and undoing a removal reinserts the same identifier
+at its old position, so the specification fingerprint returns to its previous value.
+
+**EDN fields.** Text is stored exactly as typed. Each field shows syntax highlighting with
+depth-coloured brackets, a status (empty, valid with a summary such as `map · 3 entries`, or the
+number of problems), and positioned diagnostics; clicking a diagnostic selects the offending text.
+The parser accepts what `clojure.edn/read` accepts without custom readers (including `#:ns{}`,
+`#_`, `#inst`, `#uuid`, `##Inf`, ratios, radix and octal integers) and reports Clojure code syntax
+(`'`, `#(`, `@`, `^`, regex literals, `::kw`, `#=`), unknown tags, duplicate map keys and set
+elements (using Clojure equality: `1` = `1N`, `[1]` = `(1)`), odd map forms, and more than one
+top-level value. Nesting deeper than 256 levels is reported instead of parsed. A tree inspector
+shows the parsed value with children paged 100 at a time; an expanded editor shows text and
+inspector side by side. In a release build, a 3 MB example with 30 000 maps renders at the display
+frame rate in both text and tree views; each keystroke in such a value costs roughly 50–100 ms
+(re-layout and re-parse). Debug builds are much slower with large values.
+
+**Keyboard.** Every control is reachable with Tab/Shift+Tab and shows an accent focus outline;
+text editors do not trap Tab. Shortcuts (Cmd on macOS, Ctrl elsewhere): New function (N), Search
+(F), Duplicate (D), Save now (S), Rename (F2), move the focused step (Alt/Option+Up/Down), add a step
+after it (Cmd/Ctrl+Enter), text size (Cmd/Ctrl +, −, 0), Esc to close dialogs or clear the search.
+Labels use words rather than symbols such as ⌘ because the bundled fonts lack them.
+
 ### Hardware detection and budgets
 
 Linux: `/proc/meminfo`, `/proc/cpuinfo`, `nvidia-smi` (when installed), and
@@ -244,7 +292,7 @@ cross-checked against GGUF metadata when models are installed.
 | --- | --- | --- |
 | Minimum version | macOS 14 Sonoma (proposed, unverified) | glibc ≥ 2.34 and kernel ≥ 5.13 with Landlock enabled (Ubuntu 22.04+, Fedora 36+, Debian 12+) |
 | Reference machine | 36 GB M-series (not yet tested) | Ubuntu 24.04.5, kernel 7.0, RTX 3070 8 GB, 31 GiB RAM (tested) |
-| UI | unverified | verified (X11); Wayland compiled, unverified |
+| UI | unverified | verified on X11 at 1× and simulated 2× scale; Wayland compiled, unverified |
 | Inference backends | Metal (unverified) | CUDA, Vulkan, CPU (verified); ROCm (pinned, unverified) |
 | Sandbox | Seatbelt via `sandbox-exec` (unverified) | Landlock + seccomp + rlimits (verified) |
 | Packaging | signed + notarized `.app` in `.dmg`/`.zip` | AppImage (primary) and `.tar.gz` |
@@ -276,3 +324,7 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
 4. cgroup v2 limits for thread count and memory on Linux, when a delegated cgroup is available.
 5. Catalog entries marked `unverified` must be smoke-tested on suitable hardware (≥ 16 GB VRAM or
    unified memory) before release.
+6. Wayland rendering, fonts, and shortcuts are compiled in but unverified; no Wayland session or
+   compositor was available on the reference Linux machine.
+7. The bundled fonts lack some symbols (⌘, arrows, ✕); the interface uses words instead. Adding a
+   symbol font (or system fonts) is optional polish.

@@ -46,4 +46,9 @@ impl DataDirs {
     pub fn library(&self) -> PathBuf {
         self.root.join("library")
     }
+
+    /// File holding window geometry, panel sizes, text size, and the last open function.
+    pub fn ui_state(&self) -> PathBuf {
+        self.root.join("ui-state.ron")
+    }
 }

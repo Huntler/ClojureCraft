@@ -573,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clojurecraft-domain",
+ "clojurecraft-edn",
  "clojurecraft-hardware",
  "clojurecraft-runtime",
  "clojurecraft-store",
@@ -617,6 +618,10 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
 ]
+
+[[package]]
+name = "clojurecraft-edn"
+version = "0.1.0"
 
 [[package]]
 name = "clojurecraft-hardware"

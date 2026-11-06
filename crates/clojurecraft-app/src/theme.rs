@@ -34,8 +34,28 @@ pub const ACCENT_INK: Color32 = hex(0x7fd3a0);
 pub const WARN: Color32 = hex(0xf2c14e);
 pub const BAD: Color32 = hex(0xf87171);
 
+/// Syntax colours for code and EDN on `SUNKEN`; all keep at least 7:1 contrast.
+pub mod syntax {
+    use super::{Color32, alpha, hex};
+
+    pub const KEYWORD: Color32 = hex(0x7fd3a0);
+    pub const STRING: Color32 = hex(0xe8c887);
+    pub const NUMBER: Color32 = hex(0x9cc4f5);
+    pub const LITERAL: Color32 = hex(0xcfb0f5);
+    pub const TAG: Color32 = hex(0xf2ab7c);
+    pub const SYMBOL: Color32 = hex(0xeeedea);
+    pub const COMMENT: Color32 = alpha(0xeeedea, 150);
+    pub const MACRO: Color32 = hex(0xf2ab7c);
+    pub const INVALID: Color32 = hex(0xf87171);
+    /// Bracket colours cycle with nesting depth so deep data stays readable.
+    pub const DELIMITERS: [Color32; 4] = [hex(0xc8c6c0), hex(0x9cc4f5), hex(0xcfb0f5), hex(0xe8c887)];
+}
+
 pub const RADIUS: CornerRadius = CornerRadius::same(3);
 pub const CONTROL_H: f32 = 30.0;
+
+/// Text-size range offered in settings (egui zoom factor).
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=2.0;
 
 pub fn hairline() -> Stroke {
     Stroke::new(1.0, LINE)
@@ -70,8 +90,11 @@ fn visuals() -> Visuals {
         w.corner_radius = RADIUS;
         w.expansion = 0.0;
     }
-    // Keyboard focus must stay visible on every control.
+    // Keyboard focus must stay visible on every control: egui draws focused widgets with the
+    // `active` visuals, so they get an accent outline.
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, ACCENT_INK);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     v
 }
 

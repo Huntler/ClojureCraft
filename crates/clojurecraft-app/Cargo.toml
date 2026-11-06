@@ -17,6 +17,7 @@ clojurecraft-hardware.workspace = true
 clojurecraft-runtime.workspace = true
 clojurecraft-store.workspace = true
 clojurecraft-domain.workspace = true
+clojurecraft-edn.workspace = true
 eframe.workspace = true
 egui.workspace = true
 tracing.workspace = true
