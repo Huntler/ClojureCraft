@@ -204,8 +204,8 @@ fn referenced_inputs_use_the_recorded_snapshot() {
     {
         s.resolved_at = Timestamp(2);
     }
-    // The resolution time and revision are provenance, but the value is what is validated; a
-    // refresh that changes the value marks results stale.
+    // The resolution time is provenance only; a refresh that changes the value (or the upstream
+    // revision it came from) marks results stale.
     let after_time = doc.spec_fingerprint();
     if let ExampleInput::FunctionOutput {
         snapshot: Some(s), ..

@@ -77,7 +77,7 @@ pub struct Expectations<'a> {
 }
 
 #[derive(Clone, Debug)]
-enum Form {
+pub(crate) enum Form {
     Seq {
         delim: Delim,
         items: Vec<Form>,
@@ -99,7 +99,7 @@ enum Form {
 }
 
 impl Form {
-    fn span(&self) -> Range<usize> {
+    pub(crate) fn span(&self) -> Range<usize> {
         match self {
             Self::Seq { span, .. } | Self::Atom { span, .. } | Self::Prefixed { span, .. } => span.clone(),
             Self::Meta { target, .. } => target.span(),
@@ -107,14 +107,14 @@ impl Form {
     }
 
     /// The form without metadata.
-    fn bare(&self) -> &Form {
+    pub(crate) fn bare(&self) -> &Form {
         match self {
             Self::Meta { target, .. } => target.bare(),
             other => other,
         }
     }
 
-    fn symbol(&self) -> Option<&str> {
+    pub(crate) fn symbol(&self) -> Option<&str> {
         match self.bare() {
             Self::Atom {
                 kind: TokenKind::Symbol,
@@ -136,7 +136,7 @@ impl Form {
         }
     }
 
-    fn list(&self) -> Option<&[Form]> {
+    pub(crate) fn list(&self) -> Option<&[Form]> {
         match self.bare() {
             Self::Seq {
                 delim: Delim::Paren,
@@ -147,7 +147,7 @@ impl Form {
         }
     }
 
-    fn vector(&self) -> Option<&[Form]> {
+    pub(crate) fn vector(&self) -> Option<&[Form]> {
         match self.bare() {
             Self::Seq {
                 delim: Delim::Bracket,
@@ -197,7 +197,7 @@ struct Reader<'a> {
     pos: usize,
 }
 
-type ReadError = (String, usize);
+pub(crate) type ReadError = (String, usize);
 
 impl Reader<'_> {
     fn skip_trivia(&mut self) {
@@ -300,7 +300,7 @@ impl Reader<'_> {
     }
 }
 
-fn read_all(src: &str) -> Result<Vec<Form>, ReadError> {
+pub(crate) fn read_all(src: &str) -> Result<Vec<Form>, ReadError> {
     let mut r = Reader {
         src,
         tokens: tokenize(src),

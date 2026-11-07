@@ -10,6 +10,8 @@ use egui::{Id, RichText, Ui};
 
 use crate::edn_view;
 use crate::implementation::{ValidationContext, current_report};
+use crate::review::{ReviewAction, ReviewState};
+use crate::review_view;
 use crate::theme;
 use crate::validation_view;
 use clojurecraft_workflow::assistant::{Assistant, Job, JobKind, Pending, Report};
@@ -79,6 +81,9 @@ fn running(ui: &mut Ui, doc: &FunctionDocument, job: &Job, actions: &mut Option<
     boxed(ui, theme::LINE_STRONG, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spinner();
+            if job.fixing() {
+                ui.label(RichText::new("Fixing failing cases:").color(theme::WARN));
+            }
             match job.attempt() {
                 Some((n, max))
                     if n > 1 || job.phase == clojurecraft_workflow::assistant::Phase::Validating =>
@@ -130,7 +135,20 @@ fn running(ui: &mut Ui, doc: &FunctionDocument, job: &Job, actions: &mut Option<
 
 fn pending(ui: &mut Ui, doc: &FunctionDocument, p: &Pending, actions: &mut Option<PanelAction>) {
     boxed(ui, theme::WARN, |ui| {
-        ui.label(RichText::new("New code is waiting for your review").color(theme::WARN));
+        ui.label(
+            RichText::new(if p.fix {
+                "A fix for the failing cases is waiting for your review"
+            } else {
+                "New code is waiting for your review"
+            })
+            .color(theme::WARN),
+        );
+        if doc.is_accepted_code() {
+            ui.label(
+                "It would replace the version accepted for edge-case testing, which stays recoverable \
+                 from History.",
+            );
+        }
         if !p.needs_approval.is_empty() {
             ui.label(format!(
                 "It requires {}, which this function is not allowed to use yet. Allowing it adds it to \
@@ -163,7 +181,10 @@ fn pending(ui: &mut Ui, doc: &FunctionDocument, p: &Pending, actions: &mut Optio
         if !p.attempts.is_empty() {
             validation_view::attempts(ui, doc, &p.attempts, "pending");
         }
-        code_box(ui, Id::unique(("pending-code", doc.id)), &p.candidate.code);
+        review_view::replacement(ui, doc, &p.candidate.code);
+        ui.collapsing("Complete new code", |ui| {
+            code_box(ui, Id::unique(("pending-code", doc.id)), &p.candidate.code);
+        });
         ui.horizontal_wrapped(|ui| {
             let label = if p.needs_approval.is_empty() {
                 "Use this code".to_owned()
@@ -210,6 +231,9 @@ fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mut Op
             );
             notes(ui, n);
             validation_view::attempts(ui, doc, attempts, "unresolved");
+            if let Some(best) = best {
+                review_view::replacement(ui, doc, &best.candidate.code);
+            }
             ui.horizontal_wrapped(|ui| {
                 if let Some(best) = best {
                     let attempt = best
@@ -282,7 +306,7 @@ fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mut Op
         }),
         Report::Cancelled => muted(ui, "Cancelled."),
         // Shown in the specification editor.
-        Report::Interpreted { .. } | Report::ContractProposed { .. } => {}
+        Report::Interpreted { .. } | Report::ContractProposed { .. } | Report::TestsProposed { .. } => {}
     }
 }
 
@@ -294,6 +318,8 @@ pub fn panel(
     assistant: &Assistant,
     blocked: Option<&str>,
     validation: &ValidationContext<'_>,
+    review: &mut ReviewState,
+    review_action: &mut Option<ReviewAction>,
 ) -> Option<PanelAction> {
     let mut action = None;
     let job = assistant
@@ -341,7 +367,7 @@ pub fn panel(
         crate::implementation::runtime_controls(ui, doc, validation, &mut action);
     }
     ui.add_space(8.0);
-    implementation(ui, doc, validation);
+    implementation(ui, doc, validation, review, review_action);
     action
 }
 
@@ -377,13 +403,20 @@ fn check_status(ui: &mut Ui, doc: &FunctionDocument, v: &ValidationContext<'_>) 
     ui.label(RichText::new(text).small().color(color));
 }
 
-fn implementation(ui: &mut Ui, doc: &FunctionDocument, v: &ValidationContext<'_>) {
+fn implementation(
+    ui: &mut Ui,
+    doc: &FunctionDocument,
+    v: &ValidationContext<'_>,
+    review: &mut ReviewState,
+    review_action: &mut Option<ReviewAction>,
+) {
     let Some(implementation) = &doc.implementation else {
         muted(
             ui,
             "No implementation yet. Implementations are generated from the specification by the local \
              model and checked against your examples.",
         );
+        review_view::code(ui, doc, review, review_action);
         return;
     };
     muted(ui, origin(implementation));
@@ -398,7 +431,7 @@ fn implementation(ui: &mut Ui, doc: &FunctionDocument, v: &ValidationContext<'_>
         );
     }
     ui.add_space(4.0);
-    code_box(ui, Id::unique(("implementation", doc.id)), &implementation.source);
+    review_view::code(ui, doc, review, review_action);
     if let Some(g) = &implementation.generation {
         generation_details(ui, g);
     }

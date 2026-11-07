@@ -7,12 +7,14 @@ use crate::execution::ExecutionEvent;
 use crate::inference::InferenceEvent;
 use crate::knowledge::KnowledgeEvent;
 use crate::library::LibraryEvent;
+use crate::references::ReferenceEvent;
 
 pub enum Event {
     Library(LibraryEvent),
     Inference(Box<InferenceEvent>),
     Knowledge(Box<KnowledgeEvent>),
     Execution(Box<ExecutionEvent>),
+    References(Box<ReferenceEvent>),
 }
 
 pub struct Jobs {

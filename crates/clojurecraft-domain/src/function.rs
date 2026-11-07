@@ -47,6 +47,10 @@ pub struct FunctionDocument {
     pub implementation: Option<Implementation>,
     pub tests: Vec<TestCase>,
     pub benchmarks: Vec<BenchmarkConfig>,
+    /// The implementation accepted for edge-case testing, kept so that later changes are
+    /// compared with it instead of replacing it silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<crate::review::AcceptedCode>,
 }
 
 impl FunctionDocument {
@@ -63,6 +67,7 @@ impl FunctionDocument {
             implementation: None,
             tests: Vec::new(),
             benchmarks: Vec::new(),
+            accepted: None,
         }
     }
 

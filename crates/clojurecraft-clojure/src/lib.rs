@@ -18,8 +18,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub mod policy;
+pub mod probe;
 
 pub use policy::{HarnessPolicy, harness_policy};
+pub use probe::{ProbeCall, ProbeCapture, ProbeStatus, ProbeValue, ValueKind};
 
 pub const HARNESS_SOURCE: &str = include_str!("../../../resources/clojure/harness.clj");
 
@@ -218,6 +220,11 @@ pub struct EvalRequest {
     /// Elements a result may have once realized; more is reported as too large (and is how an
     /// infinite lazy sequence shows up).
     pub max_elements: u64,
+    /// Print each result without collection or nesting bounds, cut at this many characters
+    /// (reported as [`CallResult::truncated`]), so that a complete print is the exact value.
+    pub output_chars: Option<usize>,
+    /// An instrumented copy of `code` whose intermediate values are recorded (see [`probe`]).
+    pub probe_code: Option<String>,
 }
 
 impl EvalRequest {
@@ -233,6 +240,8 @@ impl EvalRequest {
             equality: Equality::default(),
             call_timeout: Duration::from_secs(5),
             max_elements: 1_000_000,
+            output_chars: None,
+            probe_code: None,
         }
     }
 
@@ -249,8 +258,15 @@ impl EvalRequest {
             Some(r) if !r.is_empty() => format!(" :contract {}", r.to_edn()),
             _ => String::new(),
         };
+        let mut extra = String::new();
+        if let Some(n) = self.output_chars {
+            extra.push_str(&format!(" :output-chars {n}"));
+        }
+        if let Some(code) = &self.probe_code {
+            extra.push_str(&format!(" :probe-code {}", edn_string(code)));
+        }
         format!(
-            "{{:code {} :fn {} :calls [{}] :checks {} :lint {}{contract} :equality {{:float-tolerance {:e} :unordered {}}} :call-ms {} :max-elements {}}}",
+            "{{:code {} :fn {} :calls [{}] :checks {} :lint {}{contract} :equality {{:float-tolerance {:e} :unordered {}}} :call-ms {} :max-elements {}{extra}}}",
             edn_string(&self.code),
             edn_string(&self.function),
             calls.join(" "),
@@ -334,6 +350,9 @@ pub struct CallResult {
     /// The result printed readably, bounded in length.
     #[serde(default)]
     pub actual: Option<String>,
+    /// With [`EvalRequest::output_chars`]: whether `actual` was cut at that length.
+    #[serde(default)]
+    pub truncated: bool,
     /// Whether the result equals the expected value; absent without an expected value.
     #[serde(default, rename = "match")]
     pub matches: Option<bool>,
@@ -380,6 +399,13 @@ enum Line {
         index: usize,
     },
     Result(CallResult),
+    #[serde(rename = "probe-setup")]
+    ProbeSetup {
+        ok: bool,
+        #[serde(default)]
+        message: String,
+    },
+    Probe(ProbeCall),
     Halted,
     Done,
 }
@@ -400,6 +426,10 @@ pub struct HarnessReport {
     pub done: bool,
     /// Output lines that were not part of the protocol (at most a few, shortened).
     pub stray: Vec<String>,
+    /// With [`EvalRequest::probe_code`]: whether the instrumented code was accepted and loaded.
+    pub probe_setup: Option<Result<(), String>>,
+    /// The instrumented run of each call.
+    pub probes: Vec<ProbeCall>,
 }
 
 impl HarnessReport {
@@ -425,6 +455,10 @@ impl HarnessReport {
                     }
                     r.results.push(result);
                 }
+                Line::ProbeSetup { ok, message } => {
+                    r.probe_setup = Some(if ok { Ok(()) } else { Err(message) });
+                }
+                Line::Probe(call) => r.probes.push(call),
                 Line::Halted => r.halted = true,
                 Line::Done => r.done = true,
             }

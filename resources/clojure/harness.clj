@@ -6,11 +6,14 @@
 ;;    :checks true :lint true
 ;;    :contract {:output {:type :map :keys [{:key "<edn>" :required true :type :integer :nil :disallowed}]}}
 ;;    :equality {:float-tolerance 1e-9 :unordered false}
-;;    :call-ms 5000 :max-elements 1000000}
+;;    :call-ms 5000 :max-elements 1000000
+;;    :output-chars 4000000                              ; optional: print results unbounded up to this length
+;;    :probe-code "<source with probes>"}               ; optional: record intermediate values
 ;; and writes one JSON object per line to stdout as it goes:
 ;;   read, check, lint, load       the stages before any call
 ;;   start {index}                 a call begins (so a process that dies mid-call is attributable)
 ;;   result {index ...}            a call's outcome, comparison, and contract findings
+;;   probe-setup, probe {index}    with :probe-code: the instrumented run of each call
 ;;   halted                        a call exceeded its time limit; the process stops without running the rest
 ;;   done                          everything ran
 ;;
@@ -664,11 +667,19 @@
 
       :else
       (let [v (:ok run)
-            shown (bounded-str v 100000 1000 max-shown-chars)
+            ;; With :output-chars the value is printed without length or nesting bounds (it is
+            ;; already realized within the element limit) and cut only at that many characters,
+            ;; so a print that is not truncated is the exact value.
+            [shown truncated] (if-let [n (:output-chars opts)]
+                                (let [s (binding [*print-length* nil *print-level* nil
+                                                  *print-namespace-maps* false]
+                                          (pr-str v))]
+                                  (if (> (count s) n) [(subs s 0 n) true] [s false]))
+                                [(bounded-str v 100000 1000 max-shown-chars) false])
             ;; Comparing can itself fail, for example looking up a key in a sorted map of
             ;; another key type.
             guarded (fn [f] (try (f) (catch Throwable t (str "could not compare: " (.getMessage t)))))]
-        (cond-> (assoc base :status "ok" :actual shown)
+        (cond-> (assoc base :status "ok" :actual shown :truncated truncated ::value v)
           (:error expected-value)
           (assoc :status "error"
                  :error {:phase "expected" :class "" :message (str "the expected value is not valid EDN: "
@@ -680,10 +691,155 @@
           (assoc :contract (let [p (guarded #(contract-problems contract v))]
                              (if (string? p) [p] p))))))))
 
+(defn- call-outcome
+  "What a call produced, kept so that an instrumented run can be compared with it."
+  [r]
+  (case (:status r)
+    "ok" (if (contains? r ::value) {:value (::value r)} {:other "ok"})
+    "error" {:error (select-keys (:error r) [:class :message])}
+    {:other (:status r)}))
+
+;; ---------------------------------------------------------------------------------------------
+;; Intermediate values. An instrumented copy of the code (the checked code with probe calls
+;; around selected expressions) records what those expressions evaluate to while each call runs.
+;; The copy is used only when removing the probes gives back exactly the checked forms, and each
+;; call's values are reported together with whether its result equals the result of the
+;; uninstrumented code.
+
+(def ^:private probe-state (atom nil))
+(def ^:private probe-values-kept 3)
+(def ^:private probe-print-length 20)
+(def ^:private probe-print-level 6)
+(def ^:private probe-print-chars 4000)
+
+(defn- fully-shown?
+  "Whether printing `x` within the probe bounds shows all of it."
+  [x depth]
+  (cond
+    (map? x) (and (< depth probe-print-level)
+                  (<= (bounded-count (inc probe-print-length) x) probe-print-length)
+                  (every? (fn [[k v]] (and (fully-shown? k (inc depth)) (fully-shown? v (inc depth)))) x))
+    (or (coll? x) (seq? x)) (and (< depth probe-print-level)
+                                 (<= (bounded-count (inc probe-print-length) x) probe-print-length)
+                                 (every? #(fully-shown? % (inc depth)) (take probe-print-length x)))
+    :else true))
+
+(defn- preview
+  "A bounded print of an intermediate value, and whether it shows the whole value."
+  [x]
+  (if (fn? x)
+    {:kind "function" :text "" :complete false}
+    (let [sw (StringWriter.)
+          w (bounded-writer sw probe-print-chars)]
+      (try
+        (binding [*print-length* probe-print-length *print-level* probe-print-level
+                  *print-namespace-maps* false *out* w]
+          (pr x))
+        {:kind "value" :text (str sw) :complete (fully-shown? x 0)}
+        (catch clojure.lang.ExceptionInfo e
+          (if (= "printed output exceeds the capture limit" (.getMessage e))
+            {:kind "value" :text (str sw) :complete false}
+            {:kind "error" :text (str sw) :complete false :message (str (.getMessage e))}))
+        (catch Throwable t
+          {:kind "error" :text (str sw) :complete false :message (str (.getMessage t))})))))
+
+(defn probe!
+  "Records `v` as a value of probe `id` during an instrumented call and returns it unchanged."
+  [id v]
+  (when-let [state @probe-state]
+    (let [{:keys [n values] :or {n 0 values []}} (get state id)]
+      (reset! probe-state
+              (assoc state id {:n (inc n)
+                               :values (if (< (count values) probe-values-kept)
+                                         (conj values (preview v))
+                                         values)}))))
+  v)
+
+(defn probe-first
+  "probe! with the value first, for use as a step of `->`."
+  [v id]
+  (probe! id v))
+
+(def ^:private probe-heads '#{clojurecraft.harness/probe! clojurecraft.harness/probe-first})
+
+(defn- threaded-probe? [x]
+  (and (seq? x) (contains? probe-heads (first x)) (= 2 (count x))))
+
+(defn- strip-probes [form]
+  (walk/postwalk
+   (fn [x]
+     (cond
+       (and (seq? x) (= 'clojurecraft.harness/probe! (first x)) (= 3 (count x))) (nth x 2)
+       (and (seq? x) (some threaded-probe? x)) (apply list (remove threaded-probe? x))
+       :else x))
+   form))
+
+(defn- comparable
+  "Forms with reader-generated names and regular expressions made comparable between reads."
+  [form]
+  (walk/postwalk
+   (fn [x]
+     (cond
+       (instance? java.util.regex.Pattern x) (list ::regex (str x))
+       (and (symbol? x) (nil? (namespace x)) (re-matches #"(p\d+|rest)__\d+#" (name x)))
+       (symbol (str (second (re-matches #"(p\d+|rest)__\d+#" (name x))) "__#"))
+       :else x))
+   form))
+
+(defn- same-outcome? [original run]
+  (cond
+    (contains? original :value) (and (contains? run :ok)
+                                     (nil? (difference (:value original) (:ok run) []
+                                                       {:float-tolerance 0.0 :unordered false})))
+    (contains? original :error) (and (contains? run :error)
+                                     (= (:class (:error original))
+                                        (:class (error-map :call (:error run)))))
+    :else false))
+
+(defn- run-probes [{:keys [forms probe-code fname calls outcomes opts]}]
+  (let [{:keys [call-ms max-elements]} opts
+        setup (try
+                (let [probe-forms (read-all probe-code)]
+                  (if (= (comparable (map strip-probes probe-forms)) (comparable forms))
+                    (binding [*ns* (create-ns 'clojurecraft.scratch)]
+                      (refer-clojure)
+                      (doseq [form probe-forms] (eval form))
+                      (let [v (ns-resolve (the-ns (second (first forms))) (symbol fname))]
+                        (if (and v (fn? @v))
+                          {:fn @v}
+                          {:error (str "no public function named " fname)})))
+                    {:error "the instrumented code is not the checked code with probes added"}))
+                (catch Throwable t
+                  {:error (str "the instrumented code could not be loaded: " (.getMessage t))}))]
+    (if-let [e (:error setup)]
+      (emit {:event "probe-setup" :ok false :message e})
+      (do
+        (emit {:event "probe-setup" :ok true})
+        (doseq [[i call original] (map vector (range) calls outcomes)]
+          (reset! probe-state {})
+          (let [run (in-thread
+                     (fn []
+                       (let [v ((:fn setup) (edn/read-string (:input call)))]
+                         (realize! v (long-array [max-elements]) 0)
+                         v))
+                     call-ms)
+                captured @probe-state]
+            (reset! probe-state nil)
+            (emit {:event "probe"
+                   :index i
+                   :status (cond (= run ::timeout) "timeout" (:error run) "error" :else "ok")
+                   :message (when-let [t (and (map? run) (:error run))] (str (.getMessage ^Throwable t)))
+                   :consistent (and (not= run ::timeout) (same-outcome? original run))
+                   :probes (vec (for [[id {:keys [n values]}] (sort-by key captured)]
+                                  {:id id :count n :values values}))})
+            (when (= run ::timeout)
+              (emit {:event "halted"})
+              (.halt (Runtime/getRuntime) 0))))))))
+
 (defn run-request [{code :code fname :fn calls :calls checks :checks lint? :lint :as request}]
   (let [opts (merge {:call-ms 5000 :max-elements 1000000
                      :equality {:float-tolerance 1e-9 :unordered false}}
-                    (select-keys request [:call-ms :max-elements :equality :contract]))
+                    (select-keys request [:call-ms :max-elements :equality :contract :output-chars]))
         forms (try (read-all code)
                    (catch Throwable t (emit (assoc (error-map :read t) :event "read" :ok false)) nil))]
     (when forms
@@ -717,16 +873,21 @@
                          (emit (assoc (error-map :load t) :event "load" :ok false))
                          nil))]
           (when loaded
-            (loop [i 0 calls (seq calls)]
-              (when calls
-                (emit {:event "start" :index i})
-                (let [r (call-once loaded (first calls) (assoc opts :ns ns-sym))]
-                  (emit (assoc r :event "result" :index i))
-                  (if (= "timeout" (:status r))
-                    (do (emit {:event "halted"})
-                        ;; The timed-out call cannot be stopped from outside its thread.
-                        (.halt (Runtime/getRuntime) 0))
-                    (recur (inc i) (next calls))))))))))
+            (let [outcomes (loop [i 0 calls (seq calls) outcomes []]
+                             (if-not calls
+                               outcomes
+                               (do
+                                 (emit {:event "start" :index i})
+                                 (let [r (call-once loaded (first calls) (assoc opts :ns ns-sym))]
+                                   (emit (assoc (dissoc r ::value) :event "result" :index i))
+                                   (if (= "timeout" (:status r))
+                                     (do (emit {:event "halted"})
+                                         ;; The timed-out call cannot be stopped from outside its thread.
+                                         (.halt (Runtime/getRuntime) 0))
+                                     (recur (inc i) (next calls) (conj outcomes (call-outcome r))))))))]
+              (when-let [probe-code (:probe-code request)]
+                (run-probes {:forms forms :probe-code probe-code :fname fname :calls calls
+                             :outcomes outcomes :opts opts})))))))
     (emit {:event "done"})))
 
 (let [request (edn/read-string (slurp *in*))]

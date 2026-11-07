@@ -92,8 +92,10 @@ The sandboxed Clojure tests (`crates/clojurecraft-clojure/tests/sandboxed_eval.r
 harness: comparison rules, lazy and infinite results, per-call time limits, memory and output
 limits, lint findings, contract checks, call-error locations, and cancellation. The repair loop
 is tested with scripted model answers and real sandboxed execution in
-`crates/clojurecraft-workflow/tests/repair_loop.rs`. Both skip themselves without the Java runtime
-or the sandbox helper.
+`crates/clojurecraft-workflow/tests/repair_loop.rs`. Exact output printing and instrumented runs
+are covered in `crates/clojurecraft-clojure/tests/probes.rs`, and referenced inputs and step values
+end to end in `crates/clojurecraft-workflow/tests/references_and_steps.rs`. All of these skip
+themselves without the Java runtime or the sandbox helper.
 
 The application runs the API extraction through the sandbox helper next to its own executable, so
 build the whole workspace (`cargo build --workspace`) before `cargo run` when installing the

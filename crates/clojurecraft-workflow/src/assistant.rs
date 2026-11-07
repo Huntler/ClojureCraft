@@ -16,7 +16,11 @@
 //!   the model generated earlier, when it uses no namespace the user has not allowed, and when
 //!   the specification did not change while the job ran; otherwise it is held for review;
 //! - code that still fails after the last attempt is never applied automatically; the attempts
-//!   and their diagnostics are shown, and the user may still choose a candidate.
+//!   and their diagnostics are shown, and the user may still choose a candidate;
+//! - code accepted for edge-case testing is never replaced without review, and a fix for failing
+//!   cases (the same loop, starting from the current code and its failures) is always shown
+//!   for review;
+//! - proposed edge cases are added as unaccepted proposals (see [`crate::edge_cases`]).
 //!
 //! Every attempt's validation report (with the code it checked) is handed to the application to
 //! be stored, so all candidates remain inspectable. Examples, contracts, and accepted tests are
@@ -30,6 +34,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::time::Instant;
 
 use crate::answers::{self, InterpretationAnswer};
+use crate::edge_cases;
 use crate::requests::{self, DOCUMENTATION_DROP_ORDER};
 use crate::validation::{self, Plan, ReportContext};
 use crate::{Candidate, GenerationInput, Names, Provenance, deps, readiness};
@@ -193,6 +198,7 @@ pub enum JobKind {
     Interpret,
     ProposeContract,
     Generate,
+    ProposeTests,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +212,7 @@ pub enum Phase {
     Validating,
     Repairing,
     Explaining,
+    ProposingTests,
 }
 
 impl Phase {
@@ -220,6 +227,7 @@ impl Phase {
             Self::Validating => "Checking the code",
             Self::Repairing => "Repairing the code",
             Self::Explaining => "Explaining the code",
+            Self::ProposingTests => "Proposing edge cases",
         }
     }
 }
@@ -260,6 +268,11 @@ struct GenState {
     /// The candidate of the attempt in progress and its validation plan.
     candidate: Option<Candidate>,
     plan: Option<Plan>,
+    /// For a fix: the current code and the report of its failing checks, which the first
+    /// attempt repairs instead of writing code afresh.
+    start: Option<(String, ValidationReport)>,
+    /// The namespace and function of the code being fixed.
+    start_names: Option<Names>,
 }
 
 impl GenState {
@@ -309,6 +322,11 @@ impl Job {
     pub fn attempts(&self) -> &[Attempt] {
         self.generation.as_ref().map_or(&[], |g| g.attempts.as_slice())
     }
+
+    /// Whether this generation fixes the current code for failing checks.
+    pub fn fixing(&self) -> bool {
+        self.generation.as_ref().is_some_and(|g| g.start.is_some())
+    }
 }
 
 /// Generated code waiting for the user.
@@ -322,6 +340,10 @@ pub struct Pending {
     pub needs_approval: Vec<String>,
     /// The current implementation was written or edited by hand.
     pub replaces_manual: bool,
+    /// The current implementation is the code accepted for edge-case testing.
+    pub replaces_accepted: bool,
+    /// A fix of the current code for failing checks; always reviewed before it is used.
+    pub fix: bool,
     /// The specification or accepted tests changed while the code was generated and checked.
     pub spec_changed: bool,
     /// The candidate's validation report; `None` when it could not be run.
@@ -345,6 +367,12 @@ pub enum Report {
         notes: Vec<String>,
     },
     ContractProposed {
+        notes: Vec<String>,
+    },
+    /// Edge cases were proposed and added for review.
+    TestsProposed {
+        added: usize,
+        ambiguous: usize,
         notes: Vec<String>,
     },
     /// Code was applied to the function.
@@ -402,6 +430,7 @@ fn job_label(kind: JobKind) -> &'static str {
         JobKind::Interpret => "check the specification",
         JobKind::ProposeContract => "propose a contract",
         JobKind::Generate => "generate the implementation",
+        JobKind::ProposeTests => "propose edge cases",
     }
 }
 
@@ -500,6 +529,37 @@ impl Assistant {
         }
     }
 
+    /// Proposes edge cases from the specification. They are added to the function as
+    /// unaccepted proposals.
+    pub fn propose_tests(&mut self, doc: &FunctionDocument, ports: &mut dyn Ports) {
+        if self
+            .begin(doc, JobKind::ProposeTests, Phase::ProposingTests)
+            .is_ok()
+        {
+            self.send(edge_cases::proposal_request(doc), Phase::ProposingTests, ports);
+        }
+    }
+
+    /// Generates edge cases from the title, description, and examples only (no steps, contract,
+    /// answers, accepted tests, or code). They are added as unaccepted proposals, like
+    /// [`Self::propose_tests`]; no accepted or passing code is needed.
+    pub fn generate_tests_from_examples(&mut self, doc: &FunctionDocument, ports: &mut dyn Ports) {
+        if let Some(why) = edge_cases::examples_blocker(doc) {
+            self.reports.insert(doc.id, Report::Blocked(vec![why.to_owned()]));
+            return;
+        }
+        if self
+            .begin(doc, JobKind::ProposeTests, Phase::ProposingTests)
+            .is_ok()
+        {
+            self.send(
+                edge_cases::example_proposal_request(doc),
+                Phase::ProposingTests,
+                ports,
+            );
+        }
+    }
+
     /// Starts a generation; `documentation` says whether a documentation collection is installed.
     pub fn generate(
         &mut self,
@@ -508,9 +568,47 @@ impl Assistant {
         documentation: bool,
         ports: &mut dyn Ports,
     ) {
+        self.start_generation(doc, model, documentation, None, ports);
+    }
+
+    /// Repairs the current implementation so that it passes the checks that failed in `failing`
+    /// (a report about exactly the current content), with the same attempts as a generation.
+    /// The result is always held for review.
+    pub fn fix_failing(
+        &mut self,
+        doc: &FunctionDocument,
+        model: ModelContext,
+        documentation: bool,
+        failing: &ValidationReport,
+        ports: &mut dyn Ports,
+    ) {
+        let Some(code) = doc.implementation.as_ref().map(|i| i.source.clone()) else {
+            return;
+        };
+        if failing.basis != doc.basis() || failing.passed() {
+            self.reports.insert(
+                doc.id,
+                Report::Blocked(vec![
+                    "Run the checks on the current code first; a fix starts from its failures.".into(),
+                ]),
+            );
+            return;
+        }
+        self.start_generation(doc, model, documentation, Some((code, failing.clone())), ports);
+    }
+
+    fn start_generation(
+        &mut self,
+        doc: &FunctionDocument,
+        model: ModelContext,
+        documentation: bool,
+        start: Option<(String, ValidationReport)>,
+        ports: &mut dyn Ports,
+    ) {
         if self.begin(doc, JobKind::Generate, Phase::Planning).is_err() {
             return;
         }
+        let start_names = start.as_ref().and_then(|_| current_names(doc));
         if let Some(job) = &mut self.job {
             job.generation = Some(GenState {
                 model,
@@ -526,6 +624,8 @@ impl Assistant {
                 attempts: Vec::new(),
                 candidate: None,
                 plan: None,
+                start,
+                start_names,
             });
             if !documentation {
                 job.notes
@@ -584,9 +684,24 @@ impl Assistant {
     fn write_code(&mut self, core: &BTreeSet<String>, ports: &mut dyn Ports) {
         let Some(job) = &mut self.job else { return };
         let Some(g) = &mut job.generation else { return };
-        g.names = Some(Names::for_document(&g.spec, |s| core.contains(s)));
-        let request = requests::generation_request(g.input());
-        self.send(request, Phase::Generating, ports);
+        g.names = Some(
+            g.start_names
+                .clone()
+                .unwrap_or_else(|| Names::for_document(&g.spec, |s| core.contains(s))),
+        );
+        let (request, phase) = match &g.start {
+            Some((code, report)) => {
+                let names = g.names.as_ref().expect("names were just set");
+                let plan = validation::plan(&g.spec, code, names);
+                let failures = validation::failure_summary(&plan, report, MAX_FAILURE_CHARS);
+                (
+                    requests::repair_request(g.input(), code, &failures, 1, MAX_ATTEMPTS, None),
+                    Phase::Repairing,
+                )
+            }
+            None => (requests::generation_request(g.input()), Phase::Generating),
+        };
+        self.send(request, phase, ports);
     }
 
     /// Applies documentation found for the running generation.
@@ -875,6 +990,32 @@ impl Assistant {
                 self.retrieve(planned, ports);
                 Vec::new()
             }
+            Phase::ProposingTests => match edge_cases::parse_proposals(value, doc) {
+                Ok(proposals) => {
+                    let function = job.function;
+                    let mut notes = std::mem::take(&mut job.notes);
+                    notes.extend(proposals.notes.iter().cloned());
+                    if doc.spec_fingerprint() != job.spec_basis {
+                        notes.push(
+                            "The specification changed while the cases were being proposed; check \
+                             them against the current specification."
+                                .into(),
+                        );
+                    }
+                    let (added, ambiguous) = (proposals.cases.len(), proposals.ambiguous());
+                    doc.tests.extend(proposals.cases);
+                    self.end(Report::TestsProposed {
+                        added,
+                        ambiguous,
+                        notes,
+                    });
+                    vec![Update::Edited(function)]
+                }
+                Err(e) => {
+                    self.malformed(e, &g.text);
+                    Vec::new()
+                }
+            },
             Phase::Retrieving | Phase::Validating => Vec::new(),
             Phase::Generating | Phase::Repairing => {
                 let Some(gen_state) = &mut job.generation else {
@@ -1168,6 +1309,8 @@ impl Assistant {
             Some(Box::new(Pending {
                 needs_approval: candidate.structure.needs_approval.clone(),
                 replaces_manual: false,
+                replaces_accepted: false,
+                fix: g.start.is_some(),
                 spec_changed: false,
                 validation: attempt.report.clone(),
                 candidate,
@@ -1229,9 +1372,15 @@ impl Assistant {
             .last()
             .filter(|a| a.code.as_deref() == Some(candidate.code.as_str()))
             .and_then(|a| a.report.clone());
+        let fix = g.start.is_some();
+        if fix {
+            notes.push("This is a fix of the current code; review the changes before using it.".into());
+        }
         let pending = Pending {
             needs_approval: candidate.structure.needs_approval.clone(),
             replaces_manual: !crate::replaces_silently(doc),
+            replaces_accepted: doc.is_accepted_code(),
+            fix,
             spec_changed,
             validation,
             candidate,
@@ -1241,7 +1390,12 @@ impl Assistant {
             attempts: g.attempts,
             notes,
         };
-        if pending.needs_approval.is_empty() && !pending.replaces_manual && !pending.spec_changed {
+        if pending.needs_approval.is_empty()
+            && !pending.replaces_manual
+            && !pending.replaces_accepted
+            && !pending.fix
+            && !pending.spec_changed
+        {
             self.apply(job.function, doc, pending)
         } else {
             self.reports
@@ -1252,20 +1406,31 @@ impl Assistant {
 
     fn apply(&mut self, function: FunctionId, doc: &mut FunctionDocument, pending: Pending) -> Vec<Update> {
         let attempts = pending.attempts.clone();
+        let passing_fix = pending
+            .validation
+            .as_ref()
+            .filter(|r| pending.fix && r.passed())
+            .cloned();
         match crate::implementation(&pending.candidate, pending.explanation, pending.provenance) {
             Some(implementation) => {
                 doc.implementation = Some(implementation);
-                self.reports.insert(
-                    function,
-                    Report::Generated {
-                        notes: pending.notes,
-                        attempts,
-                    },
-                );
-                vec![Update::Commit(
-                    function,
-                    RevisionReason::with_note(RevisionKind::Generated, "Generated by the local model"),
-                )]
+                let mut notes = pending.notes;
+                // A reviewed fix that passes every accepted case (checked against exactly the
+                // current specification and tests) becomes the accepted version; the previous one
+                // stays in the history.
+                let reason = match passing_fix.map(|r| doc.accept_implementation(&r)) {
+                    Some(Ok(())) => {
+                        notes.push("The fixed code is now the accepted version.".into());
+                        RevisionReason::with_note(
+                            RevisionKind::Accepted,
+                            "Fix for failing edge cases, reviewed and accepted",
+                        )
+                    }
+                    _ => RevisionReason::with_note(RevisionKind::Generated, "Generated by the local model"),
+                };
+                self.reports
+                    .insert(function, Report::Generated { notes, attempts });
+                vec![Update::Commit(function, reason)]
             }
             None => {
                 let notes = vec![format!(
@@ -1334,6 +1499,35 @@ impl Assistant {
             self.reports.remove(&function);
         }
     }
+}
+
+/// The namespace and function the current implementation defines: as recorded when it was
+/// generated, or as read from the code.
+fn current_names(doc: &FunctionDocument) -> Option<Names> {
+    let i = doc.implementation.as_ref()?;
+    if let Some(g) = &i.generation
+        && !i.is_manually_edited()
+        && !g.namespace.is_empty()
+        && !g.function_name.is_empty()
+    {
+        return Some(Names {
+            namespace: g.namespace.clone(),
+            function: g.function_name.clone(),
+        });
+    }
+    let allowed = deps::allowed(doc);
+    let s = crate::structure::check(
+        &i.source,
+        &crate::structure::Expectations {
+            namespace: "",
+            function: "",
+            allowed: &allowed,
+        },
+    );
+    Some(Names {
+        namespace: s.namespace?,
+        function: s.function?,
+    })
 }
 
 /// The description and steps, the text searched for related documentation.
@@ -2289,4 +2483,7 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert!(notes[0].contains("Could not generate"), "{notes:?}");
     }
+
+    /// Edge cases, accepted code, and fixes for failing cases.
+    mod review;
 }

@@ -37,6 +37,8 @@ pub enum RevisionKind {
     CodeEdited,
     /// Edge-case tests were accepted.
     TestsAccepted,
+    /// The implementation was accepted for edge-case testing after passing its checks.
+    Accepted,
     /// A benchmarked implementation was chosen.
     ImplementationChosen,
     /// The draft as it was immediately before an older revision was restored.

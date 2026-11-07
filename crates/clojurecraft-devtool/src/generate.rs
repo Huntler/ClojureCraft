@@ -44,6 +44,13 @@ struct ExampleFile {
 
 fn document(path: &str) -> Result<FunctionDocument> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    if path.ends_with(".json") {
+        // A library draft as stored by the application, including its contract.
+        let mut doc: FunctionDocument =
+            serde_json::from_str(&text).with_context(|| format!("parsing {path}"))?;
+        doc.implementation = None;
+        return Ok(doc);
+    }
     let spec: SpecFile = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
     let mut doc = FunctionDocument::new(spec.name);
     doc.description = spec.description;
@@ -62,6 +69,8 @@ pub struct Options {
     pub interpret: bool,
     pub contract: bool,
     pub documentation: bool,
+    /// Generate edge cases from the examples instead of code.
+    pub edge_cases: bool,
 }
 
 struct DevPorts<'a> {
@@ -426,6 +435,31 @@ pub fn run(
     let id = doc.id;
     let mut docs = HashMap::from([(id, doc)]);
     let mut assistant = Assistant::default();
+
+    if options.edge_cases {
+        println!("\nedge cases from the title, description, and examples");
+        let t = Instant::now();
+        assistant.generate_tests_from_examples(&docs[&id], &mut ports);
+        drive(&mut assistant, &mut docs, &mut ports, &rx, options.verbose);
+        print_report(assistant.report(id));
+        for c in &docs[&id].tests {
+            let expectation = match &c.expectation {
+                clojurecraft_domain::Expectation::Value { expected } => expected.as_str().to_owned(),
+                clojurecraft_domain::Expectation::NeedsClarification { question } => {
+                    format!("? {question}")
+                }
+            };
+            println!(
+                "  {}\n    in:  {}\n    out: {}\n    ({})",
+                c.name,
+                c.input.as_str(),
+                expectation,
+                c.notes
+            );
+        }
+        println!("  total {:.1?}", t.elapsed());
+        return Ok(());
+    }
 
     if options.interpret {
         println!("\ninterpretation");

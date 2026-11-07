@@ -722,8 +722,14 @@ impl Store {
     /// Checks every example input of the function's draft that references another function.
     pub fn check_references(&self, function: FunctionId) -> Result<Vec<ReferenceProblem>> {
         let draft = self.load_draft(function)?;
+        self.check_document_references(&draft.document)
+    }
+
+    /// Checks every referenced example input of `document`, which may be newer than its stored
+    /// draft (for example an editor's copy that is still waiting to be saved).
+    pub fn check_document_references(&self, document: &FunctionDocument) -> Result<Vec<ReferenceProblem>> {
         let mut problems = Vec::new();
-        for (example, reference) in draft.document.output_references() {
+        for (example, reference) in document.output_references() {
             let target = reference.function;
             let deleted: Option<Option<i64>> = self
                 .conn
@@ -785,6 +791,22 @@ impl Store {
             }
         }
         Ok(problems)
+    }
+
+    /// Every reference from a function's current draft to another function, as (referencing,
+    /// referenced) pairs, for finding dependency cycles. Functions in the trash are included,
+    /// because they can be restored with their references.
+    pub fn reference_edges(&self) -> Result<Vec<(FunctionId, FunctionId)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source_function, target_function FROM output_references
+             WHERE source_revision IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (from, to) = row?;
+            Ok((parse_id(from)?, parse_id(to)?))
+        })
+        .collect()
     }
 
     // ---- helpers --------------------------------------------------------------------------

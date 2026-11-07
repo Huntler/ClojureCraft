@@ -23,10 +23,13 @@ impl RecordKind {
         match self {
             // 2: clarifications, interpretation, a whole-value type in contract shapes, and the
             // generated code's namespace, requirements, assumptions, and explanation.
-            Self::Document => 2,
+            // 3: the implementation accepted for edge-case testing.
+            Self::Document => 3,
             // 2: the generation run, the checked source, and the comparison settings.
             Self::ValidationReport => 2,
-            Self::RevisionReason | Self::BenchmarkResult => 1,
+            // 2: revisions recording an accepted implementation.
+            Self::RevisionReason => 2,
+            Self::BenchmarkResult => 1,
         }
     }
 
@@ -97,6 +100,10 @@ fn upgrade(kind: RecordKind, from: u32, value: serde_json::Value) -> Result<serd
         // empty when absent.
         (RecordKind::Document, 1) => Ok(value),
         (RecordKind::ValidationReport, 1) => Ok(value),
+        // Format 3 documents add an optional accepted implementation, absent in older ones.
+        (RecordKind::Document, 2) => Ok(value),
+        // Format 2 revision reasons add a kind; every format 1 reason is still valid.
+        (RecordKind::RevisionReason, 1) => Ok(value),
         _ => Err(FormatError::Unknown {
             kind: kind.label(),
             found: from,
@@ -113,11 +120,11 @@ mod tests {
     fn newer_formats_are_refused() {
         let doc = FunctionDocument::new("f");
         let json = encode(&doc).unwrap();
-        let back: FunctionDocument = decode(RecordKind::Document, 2, &json).unwrap();
+        let back: FunctionDocument = decode(RecordKind::Document, 3, &json).unwrap();
         assert_eq!(back, doc);
-        let err = decode::<FunctionDocument>(RecordKind::Document, 3, &json).unwrap_err();
-        assert!(matches!(err, FormatError::TooNew { found: 3, .. }), "{err}");
-        assert!(decode::<FunctionDocument>(RecordKind::Document, 2, "{").is_err());
+        let err = decode::<FunctionDocument>(RecordKind::Document, 4, &json).unwrap_err();
+        assert!(matches!(err, FormatError::TooNew { found: 4, .. }), "{err}");
+        assert!(decode::<FunctionDocument>(RecordKind::Document, 3, "{").is_err());
     }
 
     /// A document as format 1 wrote it: no clarifications, interpretation, shape types, or
@@ -155,6 +162,41 @@ mod tests {
         // The upgrade adds nothing that changes what the specification means.
         let reencoded: serde_json::Value = serde_json::from_str(&encode(contract).unwrap()).unwrap();
         assert!(reencoded["input"].get("value_type").is_none());
+    }
+
+    #[test]
+    fn format_2_documents_upgrade_without_an_accepted_implementation() {
+        let mut doc = FunctionDocument::new("f");
+        let json = encode(&doc).unwrap();
+        // Nothing is written for an absent acceptance, so the content of older documents (and
+        // their content fingerprints) is unchanged.
+        assert!(!json.contains("accepted"));
+        let back: FunctionDocument = decode(RecordKind::Document, 2, &json).unwrap();
+        assert!(back.accepted.is_none());
+        doc.implementation = Some(crate::Implementation::manual("(ns a)"));
+        doc.accepted = Some(crate::AcceptedCode {
+            source: "(ns a)".into(),
+            basis: doc.basis(),
+            report: crate::ValidationId::generate(),
+            accepted_at: crate::Timestamp(1),
+        });
+        let json = encode(&doc).unwrap();
+        let back: FunctionDocument = decode(RecordKind::Document, 3, &json).unwrap();
+        assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn format_1_revision_reasons_upgrade_and_accepted_kinds_need_format_2() {
+        let old = r#"{"kind": {"kind": "code_edited"}, "note": ""}"#;
+        let r: crate::RevisionReason = decode(RecordKind::RevisionReason, 1, old).unwrap();
+        assert_eq!(r.kind, crate::RevisionKind::CodeEdited);
+        let accepted = encode(&crate::RevisionReason::new(crate::RevisionKind::Accepted)).unwrap();
+        let r: crate::RevisionReason = decode(RecordKind::RevisionReason, 2, &accepted).unwrap();
+        assert_eq!(r.kind, crate::RevisionKind::Accepted);
+        assert!(matches!(
+            decode::<crate::RevisionReason>(RecordKind::RevisionReason, 3, &accepted),
+            Err(FormatError::TooNew { found: 3, .. })
+        ));
     }
 
     #[test]

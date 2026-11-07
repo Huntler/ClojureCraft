@@ -8,10 +8,11 @@ use std::thread;
 use std::time::Duration;
 
 use clojurecraft_domain::format::FormatError;
-use clojurecraft_domain::{FunctionDocument, FunctionId, SecretRegistry, ValidationReport};
+use clojurecraft_domain::{FunctionDocument, FunctionId, RevisionId, SecretRegistry, ValidationReport};
 use clojurecraft_runtime::DataDirs;
 use clojurecraft_store::{
-    AutosaveEvent, Autosaver, DATABASE_FILE, Draft, FunctionSummary, Listing, Store, StoreError,
+    AutosaveEvent, Autosaver, DATABASE_FILE, Draft, FunctionSummary, Listing, Revision, RevisionSummary,
+    Store, StoreError,
 };
 
 use crate::jobs::Event;
@@ -41,6 +42,10 @@ pub enum Command {
     RecordValidation(FunctionId, Box<ValidationReport>),
     /// Reads a function's validation reports, newest first.
     LoadValidations(FunctionId),
+    /// Lists a function's revisions, newest first.
+    LoadRevisions(FunctionId),
+    /// Reads one revision with its content.
+    LoadRevision(RevisionId),
 }
 
 pub enum LibraryEvent {
@@ -76,6 +81,12 @@ pub enum LibraryEvent {
         function: FunctionId,
         reports: Vec<ValidationReport>,
     },
+    /// A function's revisions, newest first.
+    Revisions {
+        function: FunctionId,
+        revisions: Vec<RevisionSummary>,
+    },
+    Revision(Box<Revision>),
 }
 
 /// Validation reports kept per function for display; older ones stay in the library.
@@ -134,6 +145,20 @@ fn run(rx: &Receiver<Command>, events: &Sender<Event>, ctx: &egui::Context, secr
                         emit(LibraryEvent::Validations { function, reports });
                     }
                     Err(e) => emit(failed("read the validation results", &e)),
+                }
+                continue;
+            }
+            Command::LoadRevisions(function) => {
+                match store.revisions(function) {
+                    Ok(revisions) => emit(LibraryEvent::Revisions { function, revisions }),
+                    Err(e) => emit(failed("read the history", &e)),
+                }
+                continue;
+            }
+            Command::LoadRevision(id) => {
+                match store.load_revision(id) {
+                    Ok(revision) => emit(LibraryEvent::Revision(Box::new(revision))),
+                    Err(e) => emit(failed("read the revision", &e)),
                 }
                 continue;
             }

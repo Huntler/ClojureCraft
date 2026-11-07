@@ -27,14 +27,21 @@ use crate::library::{Command, Library, LibraryEvent, VALIDATIONS_SHOWN};
 use crate::model::RemedyAction;
 use crate::model_view;
 use crate::models_view::ModelsPage;
+use crate::references::{ReferencesState, Request};
 use crate::session::{self, OpenDocs, OpenDocument};
 use crate::setup_view::{self, SetupAction, SetupPage};
+use crate::step_inspection::StepInspections;
+use crate::step_preview_view::{StepAction, StepsContext};
 use crate::theme;
 use crate::views::{self, SettingsAction, TrashAction, WelcomeAction};
 use clojurecraft_runtime::settings::SetupState;
 use clojurecraft_workflow::Names;
 use clojurecraft_workflow::assistant::{Assistant, Gather, JobKind, ModelContext, Ports, Update};
 use clojurecraft_workflow::validation::{self, Plan, ReportContext};
+
+use crate::review::ReviewState;
+
+mod review_actions;
 
 /// Toasts stay this long after the pointer or keyboard focus last left them.
 const TOAST_LIFETIME: Duration = Duration::from_secs(12);
@@ -100,6 +107,10 @@ pub struct ClojureCraftApp {
     /// Stored validation reports of open functions, newest first.
     validations: HashMap<FunctionId, Vec<ValidationReport>>,
     checks: HashMap<FunctionId, ManualCheck>,
+    /// Example inputs taken from other functions.
+    references: ReferencesState,
+    /// Executed intermediate values of transformation steps.
+    step_inspections: StepInspections,
     /// Reports of finished checks, applied with the frame's other updates.
     pending_reports: Vec<(FunctionId, ValidationReport)>,
     setup_page: SetupPage,
@@ -111,6 +122,7 @@ pub struct ClojureCraftApp {
     expanded: Option<ExpandTarget>,
     right_tab: Tab,
     allow_close: bool,
+    review: ReviewState,
 }
 
 impl ClojureCraftApp {
@@ -121,6 +133,7 @@ impl ClojureCraftApp {
         // written into function history or results.
         let secrets = Arc::new(SecretRegistry::new());
         let library = Library::start(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
+        let references = ReferencesState::new(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
         let inference = InferenceState::new(jobs.sender(), cc.egui_ctx.clone(), secrets);
         let knowledge = KnowledgeState::new(jobs.sender(), cc.egui_ctx.clone());
         let execution = ExecutionState::new(jobs.sender(), cc.egui_ctx.clone());
@@ -149,6 +162,8 @@ impl ClojureCraftApp {
             execution,
             validations: HashMap::new(),
             checks: HashMap::new(),
+            references,
+            step_inspections: StepInspections::default(),
             pending_reports: Vec::new(),
             setup_page: SetupPage::default(),
             models_page: ModelsPage::default(),
@@ -159,6 +174,7 @@ impl ClojureCraftApp {
             expanded: None,
             right_tab: Tab::default(),
             allow_close: false,
+            review: ReviewState::default(),
         }
     }
 
@@ -182,6 +198,12 @@ impl ClojureCraftApp {
                 Event::Inference(event) => self.inference.handle(*event),
                 Event::Knowledge(event) => self.knowledge.handle(*event),
                 Event::Execution(event) => self.execution.handle(*event),
+                Event::References(event) => {
+                    if let Some((function, example, plan)) = self.references.handle(*event) {
+                        self.references
+                            .start(&mut self.execution, function, example, plan);
+                    }
+                }
             }
         }
         // Responses for the assistant, routed after the services updated their own state.
@@ -208,6 +230,14 @@ impl ClojureCraftApp {
             }
             false
         });
+        // Upstream runs and step inspections are not the assistant's either.
+        for function in self.references.claim(&mut executed, &mut self.docs) {
+            self.submit(function, false);
+        }
+        self.step_inspections.claim(&mut executed);
+        for notice in std::mem::take(&mut self.references.notices) {
+            self.toast(notice, None);
+        }
         let mut updates: Vec<Update> = std::mem::take(&mut self.pending_reports)
             .into_iter()
             .map(|(f, r)| Update::Validated(f, Box::new(r)))
@@ -415,7 +445,25 @@ impl ClojureCraftApp {
                 self.assistant.generate(&doc, model, documentation, &mut ports)
             }
             (JobKind::Generate, None) => {}
+            (JobKind::ProposeTests, _) => self.assistant.propose_tests(&doc, &mut ports),
         }
+    }
+
+    /// Generates edge cases from the title, description, and examples only.
+    fn generate_cases(&mut self, id: FunctionId) {
+        let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
+            return;
+        };
+        if let Some(why) = self.assist_blocked(id) {
+            self.toast(why, None);
+            return;
+        }
+        let mut ports = AppPorts {
+            inference: &mut self.inference,
+            knowledge: &mut self.knowledge,
+            execution: &mut self.execution,
+        };
+        self.assistant.generate_tests_from_examples(&doc, &mut ports);
     }
 
     fn cancel_job(&mut self) {
@@ -460,6 +508,7 @@ impl ClojureCraftApp {
             }
             LibraryEvent::Unavailable(e) => self.library_state = LibraryState::Unavailable(e),
             LibraryEvent::Listed { active, trash } => {
+                self.references.library_changed();
                 self.functions = active;
                 self.trash = trash;
                 // Keep names and descriptions typed since the listing was read.
@@ -482,6 +531,7 @@ impl ClojureCraftApp {
                 // The in-memory copy is never older than the stored draft.
                 if !self.docs.contains_key(&id) {
                     self.library.send(Command::LoadValidations(id));
+                    self.library.send(Command::LoadRevisions(id));
                 }
                 self.docs.entry(id).or_insert_with(|| OpenDocument::new(*draft));
                 self.view = View::Function(id);
@@ -542,10 +592,21 @@ impl ClojureCraftApp {
                         shown_at: Instant::now(),
                     });
                 }
+                if matches!(event, clojurecraft_store::AutosaveEvent::Committed { .. }) {
+                    // A new revision may be newer than outputs other functions recorded.
+                    self.references.library_changed();
+                }
                 if let Some(open) = self.docs.get_mut(&id) {
                     open.apply(&event);
                 }
+                if matches!(event, clojurecraft_store::AutosaveEvent::Committed { .. }) {
+                    self.library.send(Command::LoadRevisions(id));
+                }
             }
+            LibraryEvent::Revisions { function, revisions } => {
+                self.review.revisions.insert(function, revisions);
+            }
+            LibraryEvent::Revision(revision) => self.revision_loaded(*revision),
         }
     }
 
@@ -938,9 +999,11 @@ impl ClojureCraftApp {
             job: self.assistant.busy_with(id).map(|j| (j.kind, j.phase)),
             report: self.assistant.report(id).cloned(),
         };
+        let unavailable = self.execution.runtime().err();
         let Some(open) = self.docs.get_mut(&id) else {
             return;
         };
+        self.references.ensure_checked(&open.doc);
         let changed = egui::ScrollArea::vertical()
             .id_salt(("editor", id))
             .auto_shrink([false, false])
@@ -953,12 +1016,33 @@ impl ClojureCraftApp {
                     expanded: &mut self.expanded,
                     actions: &mut actions,
                     assist: &assist,
+                    references: crate::reference_view::ReferenceUi {
+                        state: &mut self.references,
+                        functions: &self.functions,
+                        unavailable: unavailable.as_deref(),
+                    },
                 };
                 editor::show(ui, open, &mut cx)
             })
             .inner;
         if changed {
             self.submit(id, false);
+        }
+        for request in std::mem::take(&mut self.references.requests) {
+            match request {
+                Request::Resolve {
+                    function,
+                    example,
+                    source,
+                } => {
+                    if let Some(open) = self.docs.get(&function) {
+                        self.references.resolve(&open.doc, example, source);
+                    }
+                }
+                Request::Cancel { function, example } => {
+                    self.references.cancel(&mut self.execution, function, example);
+                }
+            }
         }
         for action in actions {
             match action {
@@ -1160,6 +1244,7 @@ impl eframe::App for ClojureCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_events();
+        self.review_frame();
         self.handle_close(&ctx);
         self.shortcuts(&ctx);
 
@@ -1191,6 +1276,8 @@ impl eframe::App for ClojureCraftApp {
             _ => None,
         };
         let mut panel = None;
+        let mut review_action = None;
+        let mut step_action = None;
         egui::Panel::right("implementation")
             .resizable(true)
             .default_size(400.0)
@@ -1224,14 +1311,37 @@ impl eframe::App for ClojureCraftApp {
                         installable: self.execution.installable(),
                         install: &self.execution.install,
                     },
+                    review: &mut self.review,
+                    steps: StepsContext {
+                        inspections: &self.step_inspections,
+                        unavailable: self.execution.runtime().err(),
+                    },
                 };
                 match implementation::show(ui, &mut self.right_tab, current, cx) {
                     implementation::ColumnAction::OpenSetup => open_setup = true,
                     implementation::ColumnAction::OpenKnowledge => open_knowledge = true,
                     implementation::ColumnAction::Generation(a) => panel = current.map(|d| (d.id, a)),
+                    implementation::ColumnAction::Review(a) => review_action = current.map(|d| (d.id, a)),
+                    implementation::ColumnAction::Steps(a) => step_action = current.map(|d| (d.id, a)),
                     implementation::ColumnAction::None => {}
                 }
             });
+        if let Some((id, action)) = review_action {
+            self.review_action(id, action);
+        }
+        if let Some((id, action)) = step_action {
+            match action {
+                StepAction::Run => {
+                    if let Some(open) = self.docs.get(&id) {
+                        self.step_inspections.start(&open.doc, &mut self.execution);
+                    }
+                }
+                StepAction::Cancel => self.step_inspections.cancel(id, &mut self.execution),
+                StepAction::Select(example) => {
+                    self.step_inspections.selected.insert(id, example);
+                }
+            }
+        }
         if let Some((id, action)) = panel {
             let r = self.panel_action(id, action);
             if r != RemedyAction::None {

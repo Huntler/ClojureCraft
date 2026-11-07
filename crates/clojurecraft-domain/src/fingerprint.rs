@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::function::{
     BenchmarkConfig, Contract, ContractStatus, Edn, ExampleInput, FunctionDocument, OutputReference,
 };
-use crate::ids::{ExampleId, TestCaseId};
+use crate::ids::{ExampleId, RevisionId, TestCaseId};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -127,9 +127,12 @@ struct ExampleProjection<'a> {
 #[derive(Serialize)]
 enum InputProjection<'a> {
     Direct(&'a Edn),
+    /// The recorded value and the upstream revision it was produced by, so refreshing a
+    /// reference from a newer revision makes earlier results stale even when the value is equal.
     Referenced {
         source: &'a OutputReference,
         value: Option<&'a Edn>,
+        revision: Option<RevisionId>,
     },
 }
 
@@ -162,6 +165,7 @@ impl FunctionDocument {
                         ExampleInput::FunctionOutput { source, snapshot } => InputProjection::Referenced {
                             source,
                             value: snapshot.as_ref().map(|s| &s.value),
+                            revision: snapshot.as_ref().map(|s| s.revision),
                         },
                     },
                     expected: &e.expected,

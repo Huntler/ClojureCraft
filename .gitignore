@@ -3,3 +3,6 @@
 /.clojurecraft-dev/
 *.gguf
 *.part
+
+# Claude Code local state (worktrees, settings).
+/.claude/

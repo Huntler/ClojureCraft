@@ -12,7 +12,7 @@
 //! clojurecraft-devtool knowledge-build [text|cpu|gpu]
 //! clojurecraft-devtool knowledge-search <query> [--all]
 //! clojurecraft-devtool knowledge-eval
-//! clojurecraft-devtool generate <spec.toml> <model-id> <quant> <backend> [context] [--interpret] [--contract] [--no-docs]
+//! clojurecraft-devtool generate <spec.toml> <model-id> <quant> <backend> [context] [--interpret] [--contract] [--no-docs] [--edge-cases]
 //! ```
 
 mod generate;
@@ -593,6 +593,7 @@ fn main() -> Result<()> {
                     interpret: rest.contains(&"--interpret"),
                     contract: rest.contains(&"--contract"),
                     documentation: !rest.contains(&"--no-docs"),
+                    edge_cases: rest.contains(&"--edge-cases"),
                 },
             )
         }

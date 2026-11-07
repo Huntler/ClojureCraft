@@ -15,6 +15,7 @@ clojurecraft-inference.workspace = true
 clojurecraft-knowledge.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 clojurecraft-runtime.workspace = true

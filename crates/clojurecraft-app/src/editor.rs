@@ -1,14 +1,13 @@
 //! The specification editor in the centre column: name, description, examples, contract,
 //! ordered transformation steps, and the model's interpretation with its questions.
 
-use clojurecraft_domain::{
-    Contract, Example, ExampleId, ExampleInput, FunctionId, RevisionPin, Step, StepId,
-};
+use clojurecraft_domain::{Contract, Example, ExampleId, ExampleInput, FunctionId, Step, StepId};
 use egui::text::{CCursor, CCursorRange};
 use egui::{Id, RichText, TextStyle, Ui};
 
 use crate::edn_view::{self, EdnCache};
 use crate::keys::{self, ADD_STEP_AFTER, MOVE_STEP_DOWN, MOVE_STEP_UP};
+use crate::reference_view;
 use crate::session::{OpenDocument, SaveStatus};
 use crate::theme;
 use clojurecraft_workflow::assistant::{JobKind, Phase, Report};
@@ -84,6 +83,7 @@ pub struct EditorContext<'a> {
     pub expanded: &'a mut Option<ExpandTarget>,
     pub actions: &'a mut Vec<Action>,
     pub assist: &'a AssistStatus,
+    pub references: crate::reference_view::ReferenceUi<'a>,
 }
 
 pub fn name_id(function: FunctionId) -> Id {
@@ -316,6 +316,7 @@ fn examples(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
         changed = true;
     }
     changed |= expanded(ui, open, cx);
+    reference_view::large_view(ui.ctx(), &open.doc, cx.cache, cx.references.state);
     changed
 }
 
@@ -338,70 +339,30 @@ fn example_input(
     example: &mut Example,
     cx: &mut EditorContext<'_>,
 ) -> bool {
-    match &mut example.input {
-        ExampleInput::Direct { value } => {
-            let out = edn_view::edn_field(
-                ui,
-                field_id(example.id, ExampleField::Input),
-                "Input",
-                "{:orders [{:id 1 :amount 10}]}",
-                &mut value.0,
-                cx.cache,
-                260.0,
-            );
-            if out.expand {
-                *cx.expanded = Some(ExpandTarget {
-                    function,
-                    example: example.id,
-                    field: ExampleField::Input,
-                });
-            }
-            out.changed
+    let mut changed = reference_view::source_selector(ui, function, example, &mut cx.references);
+    if let ExampleInput::Direct { value } = &mut example.input {
+        let out = edn_view::edn_field(
+            ui,
+            field_id(example.id, ExampleField::Input),
+            "",
+            "{:orders [{:id 1 :amount 10}]}",
+            &mut value.0,
+            cx.cache,
+            260.0,
+        );
+        if out.expand {
+            *cx.expanded = Some(ExpandTarget {
+                function,
+                example: example.id,
+                field: ExampleField::Input,
+            });
         }
-        ExampleInput::FunctionOutput { source, snapshot } => {
-            ui.label(RichText::new("Input").strong());
-            let pin = match source.revision {
-                RevisionPin::Latest => "latest revision".to_owned(),
-                RevisionPin::Pinned(r) => format!("revision {}", short(&r.to_string())),
-            };
-            ui.label(
-                RichText::new(format!(
-                    "Taken from the output of another function ({}, {pin}).",
-                    short(&source.function.to_string())
-                ))
-                .small()
-                .color(theme::MUTED),
-            );
-            match snapshot {
-                Some(value) => {
-                    let id = field_id(example.id, ExampleField::Input);
-                    let parsed = cx.cache.parsed(id, value.value.as_str());
-                    egui::Frame::new()
-                        .fill(theme::SUNKEN)
-                        .stroke(theme::hairline())
-                        .inner_margin(6.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
-                                .id_salt(id.with("snapshot"))
-                                .max_height(260.0)
-                                .show(ui, |ui| {
-                                    edn_view::inspector(
-                                        ui,
-                                        id.with("snapshot-tree"),
-                                        &parsed,
-                                        value.value.as_str(),
-                                    );
-                                });
-                        });
-                }
-                None => {
-                    ui.label(RichText::new("No output has been recorded yet.").color(theme::WARN));
-                }
-            }
-            false
-        }
+        changed |= out.changed;
+    } else {
+        changed |= reference_view::referenced_input(ui, function, example, cx.cache, &mut cx.references);
     }
+    reference_view::picker(ui, function, example, &mut cx.references);
+    changed
 }
 
 fn expected_ui(ui: &mut Ui, function: FunctionId, example: &mut Example, cx: &mut EditorContext<'_>) -> bool {
@@ -422,10 +383,6 @@ fn expected_ui(ui: &mut Ui, function: FunctionId, example: &mut Example, cx: &mu
         });
     }
     out.changed
-}
-
-fn short(s: &str) -> &str {
-    &s[..s.len().min(8)]
 }
 
 /// The large editor for the expanded example field, if it belongs to this document.

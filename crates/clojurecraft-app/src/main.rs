@@ -3,6 +3,7 @@
 
 mod app;
 mod contract_view;
+mod edge_cases_view;
 mod editor;
 mod edn_view;
 mod execution;
@@ -18,8 +19,14 @@ mod library;
 mod model;
 mod model_view;
 mod models_view;
+mod reference_view;
+mod references;
+mod review;
+mod review_view;
 mod session;
 mod setup_view;
+mod step_inspection;
+mod step_preview_view;
 mod theme;
 mod validation_view;
 mod views;

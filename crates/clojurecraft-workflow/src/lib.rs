@@ -14,6 +14,13 @@
 //! - [`candidate`]: a checked generation, its provenance, and when it may replace current code;
 //! - [`validation`]: the automatic validation sequence (parse, structure, lint, load, examples,
 //!   tests, contract) and its report;
+//! - [`edge_cases`]: proposing edge-case tests from the specification, reviewing them, and
+//!   fixing code that fails accepted cases;
+//! - [`diff`]: line differences for reviewing replacement code;
+//! - [`references`]: example inputs taken from another function's executed output (planning
+//!   the upstream run, cycle and contract checks, recording the snapshot);
+//! - [`intermediate`]: executed intermediate values of transformation steps, observed with an
+//!   instrumented copy of the code;
 //! - [`assistant`]: the sequence of requests for interpreting, proposing a contract, and
 //!   generating, reaching inference and documentation only through [`assistant::Ports`].
 
@@ -21,8 +28,12 @@ pub mod answers;
 pub mod assistant;
 pub mod candidate;
 pub mod deps;
+pub mod diff;
+pub mod edge_cases;
+pub mod intermediate;
 pub mod locate;
 pub mod naming;
+pub mod references;
 pub mod requests;
 pub mod spec;
 pub mod structure;

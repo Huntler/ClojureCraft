@@ -16,9 +16,9 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-runtime` | Runtime manifest, resumable SHA-256-verified downloads, atomic install/rollback, model catalog and fit estimates, GGUF header reading, Hugging Face resolution, model store, inference settings, disk usage |
 | `clojurecraft-inference` | Replaceable inference interface; `llama-server` process on a private Unix socket; inference service (lifecycle, crash recovery, streaming, cancellation, timeouts); context policy; roles; structured output and tool validation |
 | `clojurecraft-sandbox` | OS-level restriction of untrusted processes (library + `clojurecraft-sandbox` helper binary) |
-| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions: static checks, lint, loading, calls with per-call limits, structural comparison with expected EDN, output-contract checks (harness); trusted scripts in the same sandbox |
+| `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions: static checks, lint, loading, calls with per-call limits, structural comparison with expected EDN, output-contract checks, exact output printing, instrumented runs recording intermediate values (harness); trusted scripts in the same sandbox |
 | `clojurecraft-knowledge` | Versioned Clojure documentation: pinned sources, API extraction, chunking, SQLite/FTS5 index, embeddings, merged retrieval, atomic collection updates, prompt formatting |
-| `clojurecraft-workflow` | Specification readiness and prompt sections, model requests and answer schemas (interpretation, questions, retrieval planning, contract proposals, generation, explanation), structural checks of generated code, allowed namespaces, validation plans and reports, and the assistant that sequences these requests with validation and repair (no I/O; inference, retrieval, and execution are reached through a trait) |
+| `clojurecraft-workflow` | Specification readiness and prompt sections, model requests and answer schemas (interpretation, questions, retrieval planning, contract proposals, generation, explanation), structural checks of generated code, allowed namespaces, validation plans and reports, edge-case proposals and review, line diffs (`similar`), referenced example inputs (planning, cycle and contract checks, snapshots), intermediate step values, and the assistant that sequences these requests with validation and repair (no I/O; inference, retrieval, and execution are reached through a trait) |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
 
 Later boundaries (export, benchmarking, updates)
@@ -315,8 +315,9 @@ reported and can be replaced by its latest revision; a draft from a newer format
 **References.** Example inputs referencing another function are indexed for the draft and every
 revision. Functions are deleted to a trash and can be restored; permanent deletion is refused
 while any other function's draft or history references them. `check_references` reports missing
-or trashed functions, missing or mismatched revisions, and missing upstream examples. Cycle
-detection is part of the referenced-input workflow, not yet implemented.
+or trashed functions, missing or mismatched revisions, and missing upstream examples, for the
+stored draft or for an editor's unsaved copy (`check_document_references`); `reference_edges`
+returns the drafts' reference graph for cycle detection (see "Referenced inputs").
 
 **Validation report format 2.** Reports gained the generation run they belong to, the checked
 source (so candidates that were never applied stay inspectable), and the comparison settings
@@ -329,6 +330,12 @@ and explanation. All new fields default to empty, so format 1 records upgrade un
 application that only knows format 1 refuses format 2 documents instead of dropping the new
 fields on save. The specification fingerprint includes answered clarifications but omits them
 (and a shape type of "any") when absent, so fingerprints of existing specifications did not change.
+
+**Format 3.** Documents gained the implementation accepted for edge-case testing (`accepted`:
+the exact source, the basis of the passing report, the report's identifier, and when). It is
+written only when present, so older documents and their content fingerprints are unchanged; it is
+not part of any result basis, so accepting never makes results stale. Revision reasons (format 2)
+gained the `accepted` kind. Neither change needs a schema migration (formats are stored per row).
 
 **Revisions from background work.** The autosaver also records revisions: a commit is queued on
 the same worker as draft writes, replaces an older queued edit of that function, and is reported
@@ -603,14 +610,144 @@ offers to install the pinned Java runtime and Clojure.
 and shows the newest report for exactly the current code with its freshness, plus earlier reports
 (including unapplied candidates and their code).
 
+### Review, manual editing, and edge cases
+
+**Manual editing.** The implementation can be edited by hand (or written from a skeleton with the
+expected namespace and function). Every keystroke updates the draft, so the code fingerprint
+changes and earlier reports become outdated at once; closing the editor records a `CodeEdited`
+revision when the code changed, and cancelling puts the original back. Generation provenance is
+kept, so the code shows as generated and then edited. If the code is replaced elsewhere while the
+editor is open (held code accepted, a restore), the editor closes instead of overwriting it.
+
+**Reviewing replacements.** Held code (hand-edited code, accepted code, a namespace approval, a
+changed specification, or any fix) is shown as a line diff against the current code
+(`clojurecraft_workflow::diff`, three lines of context) before the user chooses it.
+
+**History.** The History tab lists revisions with their kind, compares any revision with the
+current draft (which of specification, code, and accepted tests differ, plus a code diff), and
+restores either everything or only the code. Restoring goes through the autosaver in order: the
+current draft is committed as `BeforeRestore` (a no-op if it equals the latest revision), then
+the restored content as `Restored { from }`, the same history the store's `restore_revision`
+produces, without racing queued draft writes.
+
+**Accepted version.** *Test edge cases* is enabled only when the newest report about exactly the
+current specification, code, and accepted tests passed. It records the code as accepted (an
+`Accepted` revision) and starts a proposal. Generated code never replaces the accepted code
+without review (`Pending::replaces_accepted`), and the code view shows any changes since the
+accepted version with a way to put it back; the History tab offers the latest accepted revision.
+
+**Edge-case proposals** (`clojurecraft_workflow::edge_cases`, Interpretation role, 3,000-token
+answer). The request carries the specification (description, steps, accepted contract, answers,
+examples, accepted tests) and the inputs already proposed or rejected, never the implementation,
+and asks for at most ten cases covering empty, missing, nil, duplicate, boundary, ordering, and
+nested data. Each case has an EDN input and either a defined expected output or an open question.
+Unreadable EDN and inputs already covered (compared token by token, ignoring whitespace, commas,
+and comments) are left out with a note. Cases are added as `Proposed` with origin `Model`; they
+are not part of the tests fingerprint, any prompt as a requirement, or validation. Expected
+outputs are never taken from running the code.
+
+**Generating cases from examples.** *Generate* on the Edge cases tab
+(`edge_cases::example_proposal_request`, `Assistant::generate_tests_from_examples`) asks for the
+same kind of cases from the title, description, and usable examples only: no steps, contract,
+answers, accepted tests' expectations, or code. Existing cases are listed by input only so they are
+not repeated. It needs at least one usable example but no implementation or accepted code, and its
+answer is handled exactly like a proposal above.
+
+**Reviewing cases.** Cases are grouped as *needs your decision* (open question; cannot be
+accepted, can be turned into a specification question whose answer becomes a requirement),
+*proposed expectations* (awaiting acceptance), *accepted* (regression tests run by every check,
+generation, and repair), and rejected (kept so they are not proposed again). Model cases stay
+labelled as proposals until accepted; edits require valid single EDN values and mark a model case
+`ModelEdited`. Accepting records a `TestsAccepted` revision.
+
+**Fixing failing cases.** Starts from the newest report about exactly the current content when
+it failed. The same loop as generation runs (planning, retrieval, then one attempt plus three
+repairs), but the first attempt is a repair of the current code with its failures, every attempt
+is validated against all examples and accepted cases from the job's snapshot, and the result is
+always held for review with its diff. A reviewed fix that passes every check of the unchanged
+specification becomes the accepted version (`Accepted` revision); the previous one stays in
+history.
+
+### Referenced inputs
+
+An example's input can be the output of another saved function: a function, a revision pin (the
+latest revision when refreshed, or one pinned revision), and one example of that revision. The
+upstream revision's code is run on that example's input (its typed input, or its own recorded
+snapshot if it is itself a reference, so chains never execute transitively) in the sandbox, and
+the printed output is recorded in the downstream document as a snapshot with the revision it came
+from. Validation, readiness, generation prompts, and step inspection use only the snapshot.
+References only supply example data; no upstream call is ever added to generated or exported code.
+
+- **Exact values.** Upstream runs ask the harness for `:output-chars` (4,000,000): the result is
+  printed without `*print-length*`/`*print-level*` bounds (it is already realized within the
+  element limit) and marked `truncated` if cut. A cut output, one that is not EDN data (functions,
+  `#object`, regular expressions), a call error, a timeout, a crash, or an unavailable runtime is
+  reported and nothing is recorded.
+- **Checks before running** (`clojurecraft_workflow::references::plan`): self-reference, dependency
+  cycles (breadth-first over the drafts' reference graph, with the open document's own references
+  and the upstream revision's references added; the message names the path), a missing upstream
+  example, a revision without implementation, an upstream example without a usable input, upstream
+  code that fails the structural check, and accepted contracts whose value types cannot match
+  (`map` vs `vector` is an error; `number` vs `integer` or keys the upstream contract does not
+  promise are notes). The library's problems (missing or trashed function, missing revision or
+  example) come from the store.
+- **Checks after running:** the output is checked against the downstream accepted input contract
+  (value type; for a map, or each map in a collection, required keys, value types, and disallowed
+  nils). An output that differs from the upstream example's expected output is recorded with a note.
+- **No silent changes.** A newer upstream revision changes nothing: the editor shows that a newer
+  revision exists and offers "Refresh from the latest revision". The specification fingerprint
+  covers the snapshot's value and revision, so refreshing (even to an equal value from a newer
+  revision) marks earlier results stale. A run's output is applied only if the example's input is
+  still exactly what it was when the run started; switching from written input or to another source
+  takes effect only when the run succeeds, so a failed run never loses typed input.
+- **Application.** A `references` worker thread with its own store connection lists revisions and
+  examples to choose from, checks the open document's references (re-checked when they change and
+  after library changes or new revisions), and plans runs; runs go through the shared execution
+  worker and can be cancelled. The editor shows provenance (function, example, followed or pinned
+  revision, the revision and time the output was recorded), state, the recorded value with a tree
+  inspector and a large read-only view, "Change source…", and "Use as written input" (keeps the
+  value as text).
+
+### Intermediate step values
+
+The Steps tab can run a step inspection: every usable example is run in the sandbox with an
+instrumented copy of the code, and each step shows the values its code produced.
+
+- **Locating steps.** Only for generated code that is unchanged since it was explained: the
+  explanation's located line range for a step selects, among expressions in evaluated positions
+  (function bodies, `let`/`loop`/`when-let`/`for` values, call arguments, branches, map and vector
+  elements; not binding names, parameters, `case` constants, quoted data, or `cond->`/`as->`/
+  `condp`/`letfn` internals) and steps of `->`/`->>`/`some->`/`some->>` pipelines, the outermost
+  ones inside the range, then the one that ends last. Forms containing a `recur` for an enclosing
+  loop are never wrapped (that would move the `recur` out of tail position).
+- **Instrumentation.** The source text gets `(clojurecraft.harness/probe! id expr)` around chosen
+  expressions and `(probe! id)` / `(probe-first id)` after chosen pipeline steps. The harness reads
+  both the checked code and the instrumented copy, removes the probes from the copy, and runs it
+  only if the result equals the checked forms (with reader-generated `#()` parameter names and
+  regular expressions made comparable); the checked code itself still goes through the static
+  checks and lint. After the ordinary calls, each call runs again with the instrumented code; a
+  call's values are shown only when its instrumented run ended exactly like the ordinary one (equal
+  result with zero float tolerance, or the same exception class).
+- **Bounds and labels.** Each probe records how often it was evaluated and its first 3 values, each
+  printed with at most 20 elements per collection, 6 levels, and 4,000 characters, and marked as
+  complete or a shortened preview. Function values (for example a transducer built by `comp`) are
+  shown as functions without data. Steps attributed to the same expression are marked as carried
+  out together, with the shared value. Unlocated steps, steps whose lines hold no observable
+  expression, hand-written or edited code, and inconsistent or refused runs are shown as
+  unavailable with the reason; expressions not evaluated in a call are shown as not reached.
+  Results are kept for the session and marked outdated when the code or specification changes.
+  "Validated stage functions" (running each step as its own function) were not adopted: generated
+  code is one function, and splitting it would show values of code other than the one checked.
+
 ### Main workspace
 
 Three resizable columns: the function library (search, new function, and navigation to knowledge
 sources, settings, and trash) on the left; the specification editor (name, description, example
 tabs, contract, ordered steps, interpretation and questions) in the centre; implementation
-(generation, live output, review of held or rejected code, explanation, assumptions, provenance),
-result (validation: run checks, every check with diagnostics and expected/actual values, freshness,
-earlier reports and candidates), step (step-to-code mapping), and source views on the right. Column widths persist. The centre keeps at least 440 points; the side columns give way
+(generation, live output, review of held or rejected code with a diff, manual editing, changes
+since the accepted version, explanation, assumptions, provenance), result (validation: run checks,
+every check with diagnostics and expected/actual values, freshness, earlier reports and
+candidates), edge cases, step (step-to-code mapping and executed step values), source, and history views on the right. Column widths persist. The centre keeps at least 440 points; the side columns give way
 first. The documented minimum window is 1024 × 640 points; increasing the text size reduces the
 available points, and the layout then wraps rather than clipping.
 
@@ -816,3 +953,9 @@ time of writing and covers all Apple Silicon Macs; it must be confirmed on hardw
     that validation.
 20. The sandbox on macOS (Seatbelt) has not run the new harness; thread creation inside the JVM is
     needed for per-call limits.
+21. Step values depend on the explanation's line ranges; a step whose code is spread over lines that
+    also hold other steps' code may be observed at a neighbouring expression (the label always names
+    the observed expression). Hand-written code has no step mapping and so no step values.
+22. Step inspection results and the last reference run results are kept for the session only;
+    recorded snapshots are part of the document and persist.
+23. Revisions offered when pinning are limited to the newest 50.

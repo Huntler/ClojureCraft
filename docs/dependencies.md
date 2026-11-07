@@ -55,6 +55,8 @@ Notable obligations:
   of Clojure docstrings and clojure.org pages, with attribution in the fixture README.
 - `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) for free-space queries
   (`statvfs`) and for signalling the llama.cpp server process, without unsafe code.
+- `similar` (Apache-2.0) computes line differences for reviewing code changes
+  (`clojurecraft-workflow`), used unmodified.
 - The local inference client (`clojurecraft-inference`) has its own small HTTP/1.1
   implementation over Unix sockets; it adds no HTTP or TLS dependency.
 

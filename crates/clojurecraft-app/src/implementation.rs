@@ -4,11 +4,14 @@ use clojurecraft_domain::{FunctionDocument, ValidationReport};
 use clojurecraft_knowledge::Query;
 use egui::{RichText, Ui};
 
+use crate::edge_cases_view::{self, EdgeCaseContext};
 use crate::execution::InstallState;
 use crate::generation_view::{self, PanelAction};
 use crate::inference::Missing;
 use crate::knowledge::{KnowledgeState, Slot};
 use crate::knowledge_view;
+use crate::review::{ReviewAction, ReviewState};
+use crate::review_view;
 use crate::theme;
 use crate::validation_view;
 use clojurecraft_workflow::assistant::Assistant;
@@ -21,6 +24,8 @@ pub enum ColumnAction {
     OpenSetup,
     OpenKnowledge,
     Generation(PanelAction),
+    Review(ReviewAction),
+    Steps(crate::step_preview_view::StepAction),
 }
 
 /// What the column shows besides the function itself.
@@ -31,6 +36,8 @@ pub struct ColumnContext<'a> {
     /// Why generation cannot start right now.
     pub blocked: Option<String>,
     pub validation: ValidationContext<'a>,
+    pub review: &'a mut ReviewState,
+    pub steps: crate::step_preview_view::StepsContext<'a>,
 }
 
 /// Validation results and whether checks can run.
@@ -51,17 +58,28 @@ pub enum Tab {
     #[default]
     Implementation,
     Result,
+    EdgeCases,
     Steps,
     Sources,
+    History,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Implementation, Self::Result, Self::Steps, Self::Sources];
+    const ALL: [Self; 6] = [
+        Self::Implementation,
+        Self::Result,
+        Self::EdgeCases,
+        Self::Steps,
+        Self::Sources,
+        Self::History,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Implementation => "Implementation",
             Self::Result => "Result",
+            Self::EdgeCases => "Edge cases",
+            Self::History => "History",
             Self::Steps => "Steps",
             Self::Sources => "Sources",
         }
@@ -81,6 +99,8 @@ pub fn show(
         assistant,
         blocked,
         validation,
+        review,
+        steps,
     } = cx;
     let mut action = ColumnAction::None;
     ui.add_space(8.0);
@@ -125,8 +145,39 @@ pub fn show(
         .auto_shrink([false, false])
         .show(ui, |ui| match tab {
             Tab::Implementation => {
-                if let Some(a) = generation_view::panel(ui, doc, assistant, blocked.as_deref(), &validation) {
+                let mut review_action = None;
+                if let Some(a) = generation_view::panel(
+                    ui,
+                    doc,
+                    assistant,
+                    blocked.as_deref(),
+                    &validation,
+                    review,
+                    &mut review_action,
+                ) {
                     action = ColumnAction::Generation(a);
+                }
+                if let Some(a) = review_action {
+                    action = ColumnAction::Review(a);
+                }
+            }
+            Tab::EdgeCases => {
+                let cx = EdgeCaseContext {
+                    assistant,
+                    blocked: blocked.as_deref(),
+                    reports: validation.reports,
+                    checking: validation.running,
+                    unavailable: validation.unavailable.as_deref(),
+                };
+                if let Some(a) = edge_cases_view::show(ui, doc, review, &cx) {
+                    action = ColumnAction::Review(a);
+                }
+            }
+            Tab::History => {
+                let mut review_action = None;
+                review_view::history(ui, doc, review, &mut review_action);
+                if let Some(a) = review_action {
+                    action = ColumnAction::Review(a);
                 }
             }
             Tab::Result => {
@@ -134,7 +185,11 @@ pub fn show(
                     action = ColumnAction::Generation(a);
                 }
             }
-            Tab::Steps => steps(ui, doc),
+            Tab::Steps => {
+                if let Some(a) = crate::step_preview_view::show(ui, doc, &steps) {
+                    action = ColumnAction::Steps(a);
+                }
+            }
             Tab::Sources => {
                 if sources(ui, doc, knowledge) {
                     action = ColumnAction::OpenKnowledge;
@@ -305,20 +360,6 @@ pub fn runtime_controls(
             *action = Some(PanelAction::RunChecks);
         }
     });
-}
-
-fn steps(ui: &mut Ui, doc: &FunctionDocument) {
-    if doc.steps.is_empty() {
-        empty(ui, "This function has no transformation steps.");
-        return;
-    }
-    generation_view::step_mapping(ui, doc);
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Intermediate values appear here once the implementation has been run.")
-            .small()
-            .color(theme::MUTED),
-    );
 }
 
 /// The text searched for a function's related documentation: description, then steps.
