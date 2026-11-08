@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "clojurecraft": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "-p", "clojurecraft-app", "--", "mcp"]
+    }
+  }
+}

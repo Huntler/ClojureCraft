@@ -75,6 +75,9 @@ pub struct GenerateRequest {
     pub sections: Vec<Section>,
     /// Constrains and validates the answer as JSON.
     pub schema: Option<Schema>,
+    /// A GBNF grammar sent instead of the schema to constrain sampling; the answer must still
+    /// match `schema`.
+    pub grammar: Option<String>,
     pub tools: ToolSet,
     pub max_output_tokens: Option<u32>,
     pub timeout: Option<Duration>,
@@ -89,6 +92,7 @@ impl GenerateRequest {
             role,
             sections,
             schema: None,
+            grammar: None,
             tools: ToolSet::default(),
             max_output_tokens: None,
             timeout: None,
@@ -303,6 +307,7 @@ impl TokenCounter for Counter<'_> {
             temperature: 0.0,
             top_p: None,
             response_schema: None,
+            grammar: None,
             tools: self.tools.to_vec(),
             seed: None,
         };
@@ -537,6 +542,7 @@ impl Worker {
                 temperature: req.temperature.unwrap_or(profile.temperature),
                 top_p: Some(profile.top_p),
                 response_schema: req.schema.clone(),
+                grammar: req.grammar.clone(),
                 tools: specs.clone(),
                 seed: req.seed,
             };

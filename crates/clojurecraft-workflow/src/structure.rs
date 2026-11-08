@@ -125,7 +125,7 @@ impl Form {
         }
     }
 
-    fn keyword(&self) -> Option<&str> {
+    pub(crate) fn keyword(&self) -> Option<&str> {
         match self.bare() {
             Self::Atom {
                 kind: TokenKind::Keyword,
@@ -169,7 +169,7 @@ impl Form {
     }
 
     /// Whether metadata on this form marks it private (`^:private` or `^{:private true}`).
-    fn is_private(&self) -> bool {
+    pub(crate) fn is_private(&self) -> bool {
         match self {
             Self::Meta { meta, target } => {
                 let here = match meta.bare() {

@@ -21,7 +21,7 @@ pub mod policy;
 pub mod probe;
 
 pub use policy::{HarnessPolicy, harness_policy};
-pub use probe::{ProbeCall, ProbeCapture, ProbeStatus, ProbeValue, ValueKind};
+pub use probe::{LocalValue, ProbeCall, ProbeCapture, ProbeStatus, ProbeValue, ValueKind};
 
 pub const HARNESS_SOURCE: &str = include_str!("../../../resources/clojure/harness.clj");
 
@@ -71,7 +71,11 @@ impl Limits {
     /// Limits for a request: start-up plus every call's own time limit, so the process limit is
     /// only a backstop behind the per-call limits enforced inside the JVM.
     pub fn for_request(req: &EvalRequest) -> Self {
-        let calls = u32::try_from(req.calls.len()).unwrap_or(u32::MAX);
+        // An instrumented copy may run every call a second time.
+        let runs = if req.probe_code.is_some() { 2 } else { 1 };
+        let calls = u32::try_from(req.calls.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(runs);
         let wall = STARTUP_ALLOWANCE
             .saturating_add(
                 req.call_timeout
@@ -225,6 +229,9 @@ pub struct EvalRequest {
     pub output_chars: Option<usize>,
     /// An instrumented copy of `code` whose intermediate values are recorded (see [`probe`]).
     pub probe_code: Option<String>,
+    /// Run the instrumented copy only for calls that failed (threw, returned a wrong value, or
+    /// broke the output contract).
+    pub probe_failing_only: bool,
 }
 
 impl EvalRequest {
@@ -242,6 +249,7 @@ impl EvalRequest {
             max_elements: 1_000_000,
             output_chars: None,
             probe_code: None,
+            probe_failing_only: false,
         }
     }
 
@@ -264,6 +272,9 @@ impl EvalRequest {
         }
         if let Some(code) = &self.probe_code {
             extra.push_str(&format!(" :probe-code {}", edn_string(code)));
+            if self.probe_failing_only {
+                extra.push_str(" :probe-failing-only true");
+            }
         }
         format!(
             "{{:code {} :fn {} :calls [{}] :checks {} :lint {}{contract} :equality {{:float-tolerance {:e} :unordered {}}} :call-ms {} :max-elements {}{extra}}}",
@@ -313,6 +324,10 @@ pub struct HarnessError {
     /// For a call error, the `clojure.core` function the exception surfaced in.
     #[serde(default, rename = "in")]
     pub within: Option<String>,
+    /// For a call error, the lines of every frame in the candidate's code, innermost first: the
+    /// calls of its functions that were running when the exception was thrown.
+    #[serde(default)]
+    pub lines: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]

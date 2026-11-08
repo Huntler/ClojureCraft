@@ -190,7 +190,11 @@ fn a_fix_repairs_the_current_code_with_every_accepted_case_and_waits_for_review(
     let job = a.job().unwrap();
     assert!(job.fixing());
     assert_eq!(job.phase, Phase::Repairing);
-    assert_eq!(job.attempt(), Some((1, MAX_ATTEMPTS)));
+    assert_eq!(
+        job.attempt(),
+        Some((1, 1 + MAX_REPAIRS)),
+        "a fix writes no fresh candidates"
+    );
     let text = p.last_text();
     for needle in [
         "attempt 1 of 4",
@@ -242,7 +246,7 @@ fn a_fix_that_never_passes_changes_nothing_and_never_weakens_the_cases() {
     let before = d.0[&id].clone();
 
     a.fix_failing(&d.0[&id], model(), false, &failing, &mut p);
-    for _ in 1..=MAX_ATTEMPTS {
+    for _ in 1..=1 + MAX_REPAIRS {
         reply(&mut a, &mut p, &mut d, json!({"code": WRONG, "assumptions": []}));
         // Every attempt is checked against the accepted case with its original expectation.
         let req = p.validations.last().unwrap();
@@ -253,7 +257,7 @@ fn a_fix_that_never_passes_changes_nothing_and_never_weakens_the_cases() {
     let Some(Report::Unresolved { attempts, best, .. }) = a.report(id) else {
         panic!("{:?}", a.report(id))
     };
-    assert_eq!(attempts.len(), MAX_ATTEMPTS as usize);
+    assert_eq!(attempts.len(), 1 + MAX_REPAIRS as usize);
     assert!(best.as_ref().is_some_and(|b| b.fix));
     assert_eq!(d.0[&id], before, "nothing was applied or changed");
     assert!(d.0[&id].test(case_id).unwrap().is_active());

@@ -41,6 +41,7 @@ use clojurecraft_workflow::validation::{self, Plan, ReportContext};
 
 use crate::review::ReviewState;
 
+mod mcp_actions;
 mod review_actions;
 
 /// Toasts stay this long after the pointer or keyboard focus last left them.
@@ -123,6 +124,15 @@ pub struct ClojureCraftApp {
     right_tab: Tab,
     allow_close: bool,
     review: ReviewState,
+    /// Serves MCP clients while the application runs; `None` when the socket is unavailable.
+    _mcp_server: Option<clojurecraft_mcp::Server>,
+    mcp_requests: Option<std::sync::mpsc::Receiver<clojurecraft_mcp::Request>>,
+    /// Tool calls waiting for the library or a function to open.
+    mcp_waiting: Vec<mcp_actions::Parked>,
+    /// Generations requested by MCP clients while the model was busy, run in order.
+    mcp_queue: mcp_actions::Queue,
+    /// Functions opened for an MCP client; opening them does not change the view.
+    quiet_open: HashSet<FunctionId>,
 }
 
 impl ClojureCraftApp {
@@ -138,6 +148,7 @@ impl ClojureCraftApp {
         let knowledge = KnowledgeState::new(jobs.sender(), cc.egui_ctx.clone());
         let execution = ExecutionState::new(jobs.sender(), cc.egui_ctx.clone());
         let first_run = inference.settings.setup == SetupState::NotStarted;
+        let (mcp_server, mcp_requests) = start_mcp(&cc.egui_ctx);
         let reopen = cc
             .storage
             .and_then(|s| eframe::get_value::<Option<FunctionId>>(s, STORAGE_LAST_FUNCTION))
@@ -175,6 +186,11 @@ impl ClojureCraftApp {
             right_tab: Tab::default(),
             allow_close: false,
             review: ReviewState::default(),
+            _mcp_server: mcp_server,
+            mcp_requests,
+            mcp_waiting: Vec::new(),
+            mcp_queue: mcp_actions::Queue::default(),
+            quiet_open: HashSet::new(),
         }
     }
 
@@ -270,6 +286,7 @@ impl ClojureCraftApp {
         for notice in std::mem::take(&mut self.inference.notices) {
             self.toast(notice, None);
         }
+        self.handle_mcp();
     }
 
     // ---- assistant --------------------------------------------------------------------------
@@ -291,14 +308,22 @@ impl ClojureCraftApp {
 
     /// Checks the current code of `id` in the sandbox.
     fn run_checks(&mut self, id: FunctionId) {
+        if let Err(e) = self.try_run_checks(id) {
+            self.toast(e, None);
+        }
+    }
+
+    /// Starts checking the current code of `id`, or says why it cannot be checked. A check
+    /// already running counts as started.
+    fn try_run_checks(&mut self, id: FunctionId) -> Result<(), String> {
         if self.checks.contains_key(&id) {
-            return;
+            return Ok(());
         }
         let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
-            return;
+            return Err("The function is not open.".into());
         };
         let Some(source) = doc.implementation.as_ref().map(|i| i.source.clone()) else {
-            return;
+            return Err("The function has no code yet.".into());
         };
         let names = match doc.implementation.as_ref().and_then(|i| i.generation.as_ref()) {
             Some(g) if !g.namespace.is_empty() && !g.function_name.is_empty() => Names {
@@ -322,14 +347,11 @@ impl ClojureCraftApp {
                 },
             );
             self.apply_updates(vec![Update::Validated(id, Box::new(report))]);
-            return;
+            return Ok(());
         };
-        match self.execution.start(request) {
-            Ok(run) => {
-                self.checks.insert(id, ManualCheck { run, plan, basis });
-            }
-            Err(e) => self.toast(e, None),
-        }
+        let run = self.execution.start(request)?;
+        self.checks.insert(id, ManualCheck { run, plan, basis });
+        Ok(())
     }
 
     fn cancel_checks(&mut self, id: FunctionId) {
@@ -415,21 +437,22 @@ impl ClojureCraftApp {
     }
 
     fn start_job(&mut self, id: FunctionId, kind: JobKind) {
+        if let Err(e) = self.try_start_job(id, kind) {
+            self.toast(e, None);
+        }
+    }
+
+    /// Starts a model job, or says why it cannot start. The assistant may still end it at once
+    /// (an incomplete specification); its report says so.
+    fn try_start_job(&mut self, id: FunctionId, kind: JobKind) -> Result<(), String> {
         let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
-            return;
+            return Err("The function is not open.".into());
         };
         if let Some(why) = self.assist_blocked(id) {
-            self.toast(why, None);
-            return;
+            return Err(why);
         }
         let model = match kind {
-            JobKind::Generate => match self.model_context() {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    self.toast(e, None);
-                    return;
-                }
-            },
+            JobKind::Generate => Some(self.model_context()?),
             _ => None,
         };
         let documentation = self.knowledge.active().is_some();
@@ -447,16 +470,22 @@ impl ClojureCraftApp {
             (JobKind::Generate, None) => {}
             (JobKind::ProposeTests, _) => self.assistant.propose_tests(&doc, &mut ports),
         }
+        Ok(())
     }
 
     /// Generates edge cases from the title, description, and examples only.
     fn generate_cases(&mut self, id: FunctionId) {
+        if let Err(e) = self.try_generate_cases(id) {
+            self.toast(e, None);
+        }
+    }
+
+    fn try_generate_cases(&mut self, id: FunctionId) -> Result<(), String> {
         let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
-            return;
+            return Err("The function is not open.".into());
         };
         if let Some(why) = self.assist_blocked(id) {
-            self.toast(why, None);
-            return;
+            return Err(why);
         }
         let mut ports = AppPorts {
             inference: &mut self.inference,
@@ -464,6 +493,7 @@ impl ClojureCraftApp {
             execution: &mut self.execution,
         };
         self.assistant.generate_tests_from_examples(&doc, &mut ports);
+        Ok(())
     }
 
     fn cancel_job(&mut self) {
@@ -534,6 +564,9 @@ impl ClojureCraftApp {
                     self.library.send(Command::LoadRevisions(id));
                 }
                 self.docs.entry(id).or_insert_with(|| OpenDocument::new(*draft));
+                if self.quiet_open.remove(&id) {
+                    return;
+                }
                 self.view = View::Function(id);
                 if created {
                     self.focus = Some(Focus::Name);
@@ -545,6 +578,7 @@ impl ClojureCraftApp {
                 recoverable,
             } => {
                 self.loading.remove(&id);
+                self.quiet_open.remove(&id);
                 self.open_errors.insert(id, (error, recoverable));
             }
             LibraryEvent::Trashed { id, name } => {
@@ -1194,6 +1228,28 @@ impl ClojureCraftApp {
             }
         } else if close {
             self.dialog = None;
+        }
+    }
+}
+
+/// Starts serving MCP clients on the data directory's socket. Failure (for example a second
+/// window on the same library) is logged; the application works without it.
+fn start_mcp(
+    ctx: &egui::Context,
+) -> (
+    Option<clojurecraft_mcp::Server>,
+    Option<std::sync::mpsc::Receiver<clojurecraft_mcp::Request>>,
+) {
+    let Some(dirs) = clojurecraft_runtime::DataDirs::discover() else {
+        return (None, None);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    match clojurecraft_mcp::Server::start(&dirs.mcp_socket(), tx, move || ctx.request_repaint()) {
+        Ok(server) => (Some(server), Some(rx)),
+        Err(e) => {
+            tracing::warn!(error = %e, "not serving MCP clients");
+            (None, None)
         }
     }
 }

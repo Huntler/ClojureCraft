@@ -15,6 +15,9 @@ use serde::Deserialize;
 pub const PROBE: &str = "clojurecraft.harness/probe!";
 /// The probe used as a step of `->` (`(probe-first id)`).
 pub const PROBE_FIRST: &str = "clojurecraft.harness/probe-first";
+/// The probe that records locals before an expression (`(probe-locals! id [a b] expr)`); only
+/// the latest values are kept.
+pub const PROBE_LOCALS: &str = "clojurecraft.harness/probe-locals!";
 
 /// Values kept per probe and call; later evaluations are only counted.
 pub const VALUES_KEPT: usize = 3;
@@ -59,6 +62,17 @@ pub struct ProbeCapture {
     /// The first [`VALUES_KEPT`] values, in evaluation order.
     #[serde(default)]
     pub values: Vec<ProbeValue>,
+    /// For a probe of locals ([`PROBE_LOCALS`]): their values the last time it was reached.
+    #[serde(default)]
+    pub locals: Vec<LocalValue>,
+}
+
+/// A local's value recorded by [`PROBE_LOCALS`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct LocalValue {
+    pub name: String,
+    #[serde(flatten)]
+    pub value: ProbeValue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]

@@ -8,6 +8,7 @@ use clojurecraft_inference::{GenerateRequest, Placement, Role, Section};
 
 use crate::answers::{self, InterpretationAnswer};
 use crate::deps;
+use crate::grammar;
 use crate::naming;
 use crate::spec;
 
@@ -228,8 +229,10 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
          except static methods of Math, Long, Integer, Double, Character, and Boolean.\n\
          - Prefer clear, idiomatic clojure.core functions. Return eager collections (vectors, maps, \
          sets) unless the examples show a sequence.\n\
-         Answer with JSON only: \"code\" holds the complete source; \"assumptions\" lists decisions you \
-         made where the specification is silent.",
+         Answer with JSON only: \"code\" holds the complete source; \"steps\" gives, for each numbered \
+         transformation step, the step number and the code from \"code\" that carries it out (one \
+         expression or one stage of a pipeline, copied exactly; leave it empty when there are no steps); \
+         \"assumptions\" lists decisions you made where the specification is silent.",
         version = input.clojure_version,
     )
 }
@@ -244,12 +247,17 @@ pub fn generation_request(input: GenerationInput<'_>) -> GenerateRequest {
         answers::generation_schema(),
     );
     r.seed = Some(input.seed);
+    r.grammar = Some(grammar::GENERATION.to_owned());
     r
 }
 
 /// Sampling temperature of repairs: higher than a first generation, because a model that sees
 /// its own failing code tends to return it nearly unchanged.
 pub const REPAIR_TEMPERATURE: f32 = 0.5;
+
+/// Sampling temperature of further candidates for the same generation request: high enough that
+/// a different seed gives a different approach, not the first candidate again.
+pub const SAMPLE_TEMPERATURE: f32 = 0.6;
 
 /// Prompt label of the code a repair starts from.
 pub const PREVIOUS_CODE_LABEL: &str = "Previous code";
@@ -264,7 +272,8 @@ pub fn repair_request(
     failures: &str,
     attempt: u32,
     attempts: u32,
-    repeated: Option<u32>,
+    // The attempt being repaired and an earlier one that failed in exactly the same way.
+    repeated: Option<(u32, u32)>,
 ) -> GenerateRequest {
     let mut sections = spec::specification_sections(input.doc);
     sections.push(Section::required(
@@ -281,12 +290,11 @@ pub fn repair_request(
         ),
     ));
     sections.extend(input.documentation.clone());
-    let repeated = repeated.map_or_else(String::new, |n| {
+    let repeated = repeated.map_or_else(String::new, |(this, n)| {
         format!(
-            " Attempt {} failed in exactly the same way as attempt {n}, so small adjustments are not \
+            " Attempt {this} failed in exactly the same way as attempt {n}, so small adjustments are not \
              enough: re-read the examples and expected outputs, and implement the transformation with a \
-             different approach.",
-            attempt - 1
+             different approach."
         )
     });
     let text = format!(
@@ -296,12 +304,15 @@ pub fn repair_request(
          already works and change only what the failures require; if the approach cannot work, \
          rewrite it. Compare the expected and actual values carefully: vectors, lists, and sequences \
          with the same elements in order are equal, but an integer never equals a floating-point \
-         number (1 is not 1.0).\n\n{}",
+         number (1 is not 1.0). A failing check may list the values after each transformation step \
+         and the values of locals, recorded while that call ran: find the first step whose value is \
+         not what the step should produce for that input, and fix the code of that step.\n\n{}",
         generation_task(&input)
     );
     let mut r = request(Role::Generation, text, sections, answers::generation_schema());
     r.seed = Some(input.seed);
     r.temperature = Some(REPAIR_TEMPERATURE);
+    r.grammar = Some(grammar::GENERATION.to_owned());
     r
 }
 
@@ -445,10 +456,11 @@ mod tests {
             "Example 1 — failed\n  Expected: {}\n  Actual: []",
             3,
             4,
-            Some(1),
+            Some((2, 1)),
         );
         assert_eq!((r.role, r.seed), (Role::Generation, Some(9)));
         assert_eq!(r.temperature, Some(REPAIR_TEMPERATURE));
+        assert_eq!(r.grammar.as_deref(), Some(crate::grammar::GENERATION));
         let t = all_text(&r);
         for needle in [
             "attempt 3 of 4",

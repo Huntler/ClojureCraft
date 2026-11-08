@@ -386,6 +386,7 @@ mod tests {
             temperature: 0.0,
             top_p: None,
             response_schema: None,
+            grammar: None,
             tools: vec![],
             seed: None,
         }

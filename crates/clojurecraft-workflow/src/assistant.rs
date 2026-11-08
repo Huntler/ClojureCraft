@@ -9,9 +9,14 @@
 //! - an interpretation is stored next to the user's text, and its questions stay open until the
 //!   user answers them;
 //! - a contract proposal is stored as proposed, and never replaces an accepted contract;
-//! - generated code is validated (see [`crate::validation`]); a failing candidate is sent back
-//!   with its diagnostics for repair, at most [`MAX_ATTEMPTS`] attempts in total, and the first
-//!   passing candidate ends the loop;
+//! - generated code is validated (see [`crate::validation`]). A new generation first writes up to
+//!   [`SAMPLES`] independent candidates (new seed, higher temperature), because failures are
+//!   mostly sampling noise and checking a candidate is cheap; then the best failing candidate is
+//!   sent back with its diagnostics for repair, at most [`MAX_REPAIRS`] times. The first passing
+//!   candidate ends the loop;
+//! - before checking, closing delimiters that do not match are inferred from the indentation
+//!   (see [`crate::delimiters`]) and harmless extras are removed (see [`crate::cleanup`]); both
+//!   are noted on the attempt;
 //! - passing code replaces the current implementation only when that is absent or exactly what
 //!   the model generated earlier, when it uses no namespace the user has not allowed, and when
 //!   the specification did not change while the job ran; otherwise it is held for review;
@@ -34,10 +39,11 @@ use std::hash::{BuildHasher, RandomState};
 use std::time::Instant;
 
 use crate::answers::{self, InterpretationAnswer};
-use crate::edge_cases;
+use crate::intermediate::StepLines;
 use crate::requests::{self, DOCUMENTATION_DROP_ORDER};
 use crate::validation::{self, Plan, ReportContext};
 use crate::{Candidate, GenerationInput, Names, Provenance, deps, readiness};
+use crate::{cleanup, delimiters, edge_cases};
 use clojurecraft_clojure::{EvalOutcome, EvalRequest};
 use clojurecraft_domain::{
     DocumentationRef, ExecutionEnvironment, Explanation, Fingerprint, FunctionDocument, FunctionId,
@@ -56,8 +62,14 @@ pub const MAX_EXCERPTS: usize = 10;
 /// the answer's token limit; the service still caps the total at half the context.
 pub const REASONING_ALLOWANCE: u32 = 6144;
 
-/// One initial generation plus three repairs.
-pub const MAX_ATTEMPTS: u32 = 4;
+/// Candidates written for a new generation before any repair.
+pub const SAMPLES: u32 = 3;
+
+/// Repairs after the candidates (or after the first repair of a fix).
+pub const MAX_REPAIRS: u32 = 3;
+
+/// Attempts of a generation at most: the candidates plus the repairs.
+pub const MAX_ATTEMPTS: u32 = SAMPLES + MAX_REPAIRS;
 
 /// Characters of failure diagnostics sent with a repair request.
 const MAX_FAILURE_CHARS: usize = 6000;
@@ -273,11 +285,45 @@ struct GenState {
     start: Option<(String, ValidationReport)>,
     /// The namespace and function of the code being fixed.
     start_names: Option<Names>,
+    /// What was changed in the current candidate before it was checked.
+    prepared: Vec<String>,
 }
 
 impl GenState {
     fn seed_now(&self) -> u64 {
         self.seed.wrapping_add(u64::from(self.attempt - 1))
+    }
+
+    /// Attempts this generation may make: a fix starts with a repair, so it has no candidates.
+    fn max_attempts(&self) -> u32 {
+        if self.start.is_some() {
+            1 + MAX_REPAIRS
+        } else {
+            MAX_ATTEMPTS
+        }
+    }
+
+    /// Whether `attempt` writes a fresh candidate rather than repairing one.
+    fn is_sample(&self, attempt: u32) -> bool {
+        self.start.is_none() && attempt <= SAMPLES
+    }
+
+    /// The sampling temperature `attempt` ran with.
+    fn temperature(&self, attempt: u32) -> f32 {
+        match (self.is_sample(attempt), attempt) {
+            (true, 1) => Role::Generation.profile().temperature,
+            (true, _) => requests::SAMPLE_TEMPERATURE,
+            (false, _) => requests::REPAIR_TEMPERATURE,
+        }
+    }
+
+    /// Repairs made up to and including `attempt`.
+    fn repairs(&self, attempt: u32) -> u32 {
+        if self.start.is_some() {
+            attempt
+        } else {
+            attempt.saturating_sub(SAMPLES)
+        }
     }
 
     fn input(&self) -> GenerationInput<'_> {
@@ -315,7 +361,7 @@ pub struct Job {
 impl Job {
     /// The attempt in progress and the maximum, for a generation.
     pub fn attempt(&self) -> Option<(u32, u32)> {
-        self.generation.as_ref().map(|g| (g.attempt, MAX_ATTEMPTS))
+        self.generation.as_ref().map(|g| (g.attempt, g.max_attempts()))
     }
 
     /// Attempts finished so far in this generation.
@@ -493,6 +539,9 @@ impl Assistant {
                 .max_output_tokens
                 .unwrap_or(request.role.profile().max_output_tokens);
             request.max_output_tokens = Some(base + REASONING_ALLOWANCE);
+            // llama.cpp applies a plain grammar from the first token, which keeps a reasoning
+            // model from thinking at all; the schema's grammar only starts after the reasoning.
+            request.grammar = None;
         }
         match ports.generate(request) {
             Ok(id) => job.request = Some(id),
@@ -626,6 +675,7 @@ impl Assistant {
                 plan: None,
                 start,
                 start_names,
+                prepared: Vec::new(),
             });
             if !documentation {
                 job.notes
@@ -695,7 +745,7 @@ impl Assistant {
                 let plan = validation::plan(&g.spec, code, names);
                 let failures = validation::failure_summary(&plan, report, MAX_FAILURE_CHARS);
                 (
-                    requests::repair_request(g.input(), code, &failures, 1, MAX_ATTEMPTS, None),
+                    requests::repair_request(g.input(), code, &failures, 1, g.max_attempts(), None),
                     Phase::Repairing,
                 )
             }
@@ -1021,13 +1071,16 @@ impl Assistant {
                 let Some(gen_state) = &mut job.generation else {
                     return Vec::new();
                 };
-                let generated = match answers::parse_generation(value) {
+                let mut generated = match answers::parse_generation(value) {
                     Ok(c) => c,
                     Err(e) => {
                         return self
                             .attempt_without_code(format!("The model's answer was not usable: {e}"), ports);
                     }
                 };
+                let (code, prepared) = prepare(&generated.code);
+                generated.code = code;
+                gen_state.prepared = prepared;
                 let Some(names) = gen_state.names.clone() else {
                     return Vec::new();
                 };
@@ -1049,8 +1102,10 @@ impl Assistant {
                             .into(),
                     );
                 }
+                let quoted = std::mem::take(&mut generated.steps);
                 let candidate = Candidate::check(generated, &names, &gen_state.allowed);
-                let plan = validation::plan(&gen_state.spec, &candidate.code, &names);
+                let lines = step_lines(&gen_state.spec, &candidate.code, &quoted);
+                let plan = validation::plan_with_steps(&gen_state.spec, &candidate.code, &names, lines);
                 let request = plan.request.clone();
                 gen_state.candidate = Some(candidate);
                 gen_state.plan = Some(plan);
@@ -1144,18 +1199,19 @@ impl Assistant {
             },
         );
         let passed = report.passed();
+        let note = std::mem::take(&mut g.prepared);
         g.attempts.push(Attempt {
             number: g.attempt,
             code: Some(candidate.code.clone()),
             report: Some(report.clone()),
-            note: None,
+            note: (!note.is_empty()).then(|| note.join(" ")),
         });
-        let mut updates = vec![Update::Validated(function, Box::new(report.clone()))];
+        let mut updates = vec![Update::Validated(function, Box::new(report))];
         if passed {
             let request = requests::explanation_request(&g.spec, &candidate.code);
             self.send(request, Phase::Explaining, ports);
         } else {
-            updates.extend(self.next_attempt(Some(&report), ports));
+            updates.extend(self.next_attempt(ports));
         }
         updates
     }
@@ -1168,11 +1224,13 @@ impl Assistant {
             if let Some(g) = &mut job.generation
                 && let Some(c) = &g.candidate
             {
+                let mut note = std::mem::take(&mut g.prepared);
+                note.push(format!("Not run: {why}"));
                 g.attempts.push(Attempt {
                     number: g.attempt,
                     code: Some(c.code.clone()),
                     report: None,
-                    note: Some(format!("Not run: {why}")),
+                    note: Some(note.join(" ")),
                 });
                 let request = requests::explanation_request(&g.spec, &c.code);
                 self.send(request, Phase::Explaining, ports);
@@ -1186,6 +1244,7 @@ impl Assistant {
         if let Some(g) = self.job.as_mut().and_then(|j| j.generation.as_mut()) {
             g.candidate = None;
             g.plan = None;
+            g.prepared.clear();
             g.attempts.push(Attempt {
                 number: g.attempt,
                 code: None,
@@ -1193,51 +1252,57 @@ impl Assistant {
                 note: Some(note),
             });
         }
-        self.next_attempt(None, ports)
+        self.next_attempt(ports)
     }
 
-    /// Starts the next attempt, or ends the loop after the last one.
-    fn next_attempt(&mut self, report: Option<&ValidationReport>, ports: &mut dyn Ports) -> Vec<Update> {
+    /// Starts the next attempt, or ends the loop after the last one: another candidate while
+    /// candidates remain, then a repair of the best candidate so far.
+    fn next_attempt(&mut self, ports: &mut dyn Ports) -> Vec<Update> {
         let Some(job) = &mut self.job else {
             return Vec::new();
         };
         let Some(g) = &mut job.generation else {
             return Vec::new();
         };
-        if g.attempt >= MAX_ATTEMPTS {
+        if g.attempt >= g.max_attempts() {
             let attempts = g.attempts.clone();
             let notes = std::mem::take(&mut job.notes);
             self.end_unresolved(attempts, notes);
             return Vec::new();
         }
         g.attempt += 1;
-        // Repair the most recent code; without any, write the code afresh.
-        let previous = g.attempts.iter().rev().find_map(|a| {
-            a.code
-                .as_ref()
-                .map(|c| (c.clone(), a.report.clone().or_else(|| report.cloned())))
-        });
-        let request = match previous {
-            Some((code, Some(r))) => {
-                let names = g.names.as_ref().expect("names are set before code is written");
-                let summary = |code: &str, r: &ValidationReport| {
-                    let plan = validation::plan(&g.spec, code, names);
-                    validation::failure_summary(&plan, r, MAX_FAILURE_CHARS)
-                };
-                let failures = summary(&code, &r);
-                // The newest attempt failing exactly like an earlier one (same code, or the same
-                // failures) means the model is stuck on one approach.
-                let repeated = g.attempts.split_last().and_then(|(last, earlier)| {
-                    earlier.iter().rev().find_map(|e| match (&e.code, &e.report) {
-                        (Some(c), _) if last.code.as_deref() == Some(c.as_str()) => Some(e.number),
-                        (Some(c), Some(er)) if summary(c, er) == failures => Some(e.number),
-                        _ => None,
-                    })
-                });
-                requests::repair_request(g.input(), &code, &failures, g.attempt, MAX_ATTEMPTS, repeated)
-            }
-            _ => requests::generation_request(g.input()),
+        if g.is_sample(g.attempt) {
+            let mut request = requests::generation_request(g.input());
+            request.temperature = Some(requests::SAMPLE_TEMPERATURE);
+            self.send(request, Phase::Generating, ports);
+            return Vec::new();
+        }
+        let Some(best) = best_attempt(&g.attempts) else {
+            // No candidate had code to repair: write the code afresh.
+            let mut request = requests::generation_request(g.input());
+            request.temperature = Some(requests::REPAIR_TEMPERATURE);
+            self.send(request, Phase::Repairing, ports);
+            return Vec::new();
         };
+        let (Some(code), Some(report)) = (best.code.clone(), best.report.clone()) else {
+            return Vec::new();
+        };
+        let names = g.names.as_ref().expect("names are set before code is written");
+        let summary = |code: &str, r: &ValidationReport| {
+            let plan = validation::plan(&g.spec, code, names);
+            validation::failure_summary(&plan, r, MAX_FAILURE_CHARS)
+        };
+        let failures = summary(&code, &report);
+        // Another attempt failing exactly like the one being repaired (same code, or the same
+        // failures) means the model is stuck on one approach.
+        let repeated = g.attempts.iter().rev().find_map(|e| match (&e.code, &e.report) {
+            _ if e.number == best.number => None,
+            (Some(c), _) if *c == code => Some((best.number, e.number)),
+            (Some(c), Some(er)) if summary(c, er) == failures => Some((best.number, e.number)),
+            _ => None,
+        });
+        let request =
+            requests::repair_request(g.input(), &code, &failures, g.attempt, g.max_attempts(), repeated);
         self.send(request, Phase::Repairing, ports);
         Vec::new()
     }
@@ -1248,11 +1313,7 @@ impl Assistant {
             model: g.model.model.clone(),
             runtime: g.model.runtime.clone(),
             settings: GenerationSettings {
-                temperature: if g.attempt > 1 {
-                    requests::REPAIR_TEMPERATURE
-                } else {
-                    profile.temperature
-                },
+                temperature: g.temperature(g.attempt),
                 top_p: profile.top_p,
                 seed: Some(g.seed_now()),
                 context_length: g.model.context_length,
@@ -1293,6 +1354,7 @@ impl Assistant {
                     code,
                     assumptions: Vec::new(),
                     unescaped: false,
+                    steps: Vec::new(),
                 },
                 &names,
                 &g.allowed,
@@ -1302,9 +1364,7 @@ impl Assistant {
             }
             let mut provenance = Self::provenance(g, job.spec_basis.clone());
             provenance.settings.seed = Some(g.seed.wrapping_add(u64::from(attempt.number - 1)));
-            if attempt.number == 1 {
-                provenance.settings.temperature = Role::Generation.profile().temperature;
-            }
+            provenance.settings.temperature = g.temperature(attempt.number);
             provenance.attempts = attempt.number;
             Some(Box::new(Pending {
                 needs_approval: candidate.structure.needs_approval.clone(),
@@ -1350,11 +1410,16 @@ impl Assistant {
         let provenance = Self::provenance(&g, job.spec_basis.clone());
         let mut notes = std::mem::take(&mut job.notes);
         notes.extend(candidate.structure.warnings.iter().map(|w| format!("Note: {w}.")));
-        if g.attempt > 1 {
+        let repairs = g.repairs(g.attempt);
+        if repairs > 0 {
             notes.push(format!(
-                "The code passed after {} repair{}.",
-                g.attempt - 1,
-                if g.attempt == 2 { "" } else { "s" }
+                "The code passed after {repairs} repair{}.",
+                if repairs == 1 { "" } else { "s" }
+            ));
+        } else if g.attempt > 1 {
+            notes.push(format!(
+                "Candidate {} passed; the earlier ones failed their checks.",
+                g.attempt
             ));
         }
         // Results computed against an earlier specification must not replace current work.
@@ -1499,6 +1564,91 @@ impl Assistant {
             self.reports.remove(&function);
         }
     }
+}
+
+/// Generated code made ready for checking: closing delimiters inferred from the indentation when
+/// the code cannot be read, and harmless extras removed. Returns the code and what was changed.
+fn prepare(code: &str) -> (String, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut code = code.to_owned();
+    if let Some(fixed) = delimiters::repair(&code) {
+        code = fixed;
+        notes.push(
+            "The closing delimiters did not match, so they were inferred from the indentation.".to_owned(),
+        );
+    }
+    let tidied = cleanup::tidy(&code);
+    notes.extend(tidied.notes);
+    (tidied.code, notes)
+}
+
+/// Where the code of each step is, from the model's quotes of it; `None` without steps.
+fn step_lines(spec: &FunctionDocument, code: &str, quoted: &[(u32, String)]) -> Option<StepLines> {
+    let steps = requests::numbered_steps(spec);
+    if steps.is_empty() {
+        return None;
+    }
+    Some(
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let number = u32::try_from(i + 1).unwrap_or(u32::MAX);
+                let lines = quoted
+                    .iter()
+                    .find(|(n, _)| *n == number)
+                    .ok_or_else(|| "The model attributed no code to this step.".to_owned())
+                    .and_then(|(_, quote)| {
+                        std::iter::once(quote.clone())
+                            .chain(pipeline_stage_variants(quote))
+                            .find_map(|q| crate::locate::locate(code, &q))
+                            .ok_or_else(|| "The code quoted for this step was not found.".to_owned())
+                    });
+                (step.id, lines)
+            })
+            .collect(),
+    )
+}
+
+/// A quoted pipeline stage as it appears inside `->>` or `->`: models often quote
+/// `(group-by :customer orders)` for the stage `(group-by :customer)`, so the call is also tried
+/// without its last argument and without its first.
+fn pipeline_stage_variants(quote: &str) -> Vec<String> {
+    let Ok(forms) = crate::structure::read_all(quote) else {
+        return Vec::new();
+    };
+    let [form] = forms.as_slice() else {
+        return Vec::new();
+    };
+    let Some(items) = form.list().filter(|i| i.len() >= 3) else {
+        return Vec::new();
+    };
+    let text = |skip: usize| {
+        let parts: Vec<&str> = items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip)
+            .map(|(_, f)| &quote[f.span()])
+            .collect();
+        format!("({})", parts.join(" "))
+    };
+    vec![text(items.len() - 1), text(1)]
+}
+
+/// The failed attempt most worth repairing: code that loads before code that does not, then the
+/// most passing checks, then the most recent.
+fn best_attempt(attempts: &[Attempt]) -> Option<&Attempt> {
+    attempts
+        .iter()
+        .filter(|a| a.code.is_some() && a.report.is_some())
+        .max_by_key(|a| {
+            let report = a.report.as_ref().expect("filtered above");
+            let loads = report.checks.iter().any(|c| {
+                c.subject == clojurecraft_domain::CheckSubject::Load
+                    && c.status == clojurecraft_domain::CheckStatus::Passed
+            });
+            (loads, validation::tally(report).passed, a.number)
+        })
 }
 
 /// The namespace and function the current implementation defines: as recorded when it was
@@ -1880,6 +2030,56 @@ mod tests {
         assert!(stored[0].freshness(&doc.basis()).is_current());
     }
 
+    /// Answers the running request with `code` and lets its validation fail, `n` times.
+    fn fail_with(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs, code: &str, n: u32) {
+        for _ in 0..n {
+            reply(a, p, d, json!({"code": code, "assumptions": []}));
+            validated(a, p, d, false);
+        }
+    }
+
+    #[test]
+    fn failing_candidates_are_followed_by_fresh_ones_before_any_repair() {
+        let (mut a, mut p, mut d, id) = setup();
+        generate_code(&mut a, &mut p, &mut d, id, WRONG);
+        let updates = validated(&mut a, &mut p, &mut d, false);
+        assert!(!reports(&updates)[0].passed());
+
+        // The second candidate is the same generation request with a new seed and more variety.
+        let job = a.job().unwrap();
+        assert_eq!(
+            (job.phase, job.attempt()),
+            (Phase::Generating, Some((2, MAX_ATTEMPTS)))
+        );
+        let (first, second) = (&p.sent[0].1, &p.sent[1].1);
+        assert_ne!(first.seed, second.seed, "each candidate samples anew");
+        assert_eq!(first.temperature, None);
+        assert_eq!(second.temperature, Some(requests::SAMPLE_TEMPERATURE));
+        assert!(!p.last_text().contains("Your previous implementation"));
+        assert!(first.grammar.is_some() && second.grammar.is_some());
+
+        reply(&mut a, &mut p, &mut d, json!({"code": CODE, "assumptions": []}));
+        validated(&mut a, &mut p, &mut d, true);
+        reply(&mut a, &mut p, &mut d, explanation());
+        let Some(Report::Generated { attempts, notes }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            notes.iter().any(|n| n.contains("Candidate 2 passed")),
+            "{notes:?}"
+        );
+        let g = d.0[&id]
+            .implementation
+            .as_ref()
+            .unwrap()
+            .generation
+            .clone()
+            .unwrap();
+        assert_eq!(g.attempts, 2);
+        assert_eq!(g.settings.temperature, requests::SAMPLE_TEMPERATURE);
+    }
+
     #[test]
     fn a_failing_candidate_is_repaired_with_its_diagnostics_until_one_passes() {
         let (mut a, mut p, mut d, id) = setup();
@@ -1887,14 +2087,16 @@ mod tests {
         generate_code(&mut a, &mut p, &mut d, id, WRONG);
         let updates = validated(&mut a, &mut p, &mut d, false);
         assert!(!reports(&updates)[0].passed());
+        fail_with(&mut a, &mut p, &mut d, WRONG, SAMPLES - 1);
 
         // The repair request carries the specification, the code, and expected and actual values.
         assert_eq!(p.last().1, Role::Generation);
         assert_eq!(a.job().unwrap().phase, Phase::Repairing);
-        assert_eq!(a.job().unwrap().attempt(), Some((2, MAX_ATTEMPTS)));
+        let first_repair = SAMPLES + 1;
+        assert_eq!(a.job().unwrap().attempt(), Some((first_repair, MAX_ATTEMPTS)));
         let text = p.last_text();
         for needle in [
-            "attempt 2 of 4",
+            &format!("attempt {first_repair} of {MAX_ATTEMPTS}"),
             "count))",
             "Example 1 — failed",
             "Expected: {1 2}",
@@ -1905,18 +2107,21 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
         }
-        let seeds: Vec<_> = p.sent.iter().map(|(_, r)| r.seed).collect();
-        assert_ne!(seeds[0], seeds[1], "each attempt samples anew");
+        assert_eq!(
+            p.sent.last().unwrap().1.temperature,
+            Some(requests::REPAIR_TEMPERATURE)
+        );
 
         reply(&mut a, &mut p, &mut d, json!({"code": CODE, "assumptions": []}));
         let updates = validated(&mut a, &mut p, &mut d, true);
-        assert_eq!(reports(&updates)[0].attempt, Some(2));
+        assert_eq!(reports(&updates)[0].attempt, Some(first_repair));
         reply(&mut a, &mut p, &mut d, explanation());
         let Some(Report::Generated { attempts, notes }) = a.report(id) else {
             panic!("{:?}", a.report(id))
         };
-        assert_eq!(attempts.len(), 2);
-        assert!(!attempts[0].passed() && attempts[1].passed());
+        assert_eq!(attempts.len(), first_repair as usize);
+        assert!(attempts.last().unwrap().passed());
+        assert!(attempts[..attempts.len() - 1].iter().all(|a| !a.passed()));
         assert!(
             notes.iter().any(|n| n.contains("passed after 1 repair")),
             "{notes:?}"
@@ -1931,21 +2136,49 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .attempts,
-            2
+            first_repair
         );
         // The repair changed only the code.
         assert_eq!(doc.examples, before.examples);
         assert_eq!(doc.tests, before.tests);
         assert_eq!(doc.spec_fingerprint(), before.spec_fingerprint());
-        // Both runs share the generation run.
+        // All runs share the generation run.
         assert_eq!(
             attempts[0].report.as_ref().unwrap().run,
-            attempts[1].report.as_ref().unwrap().run
+            attempts.last().unwrap().report.as_ref().unwrap().run
         );
     }
 
     #[test]
-    fn a_fourth_failed_attempt_ends_with_visible_diagnostics() {
+    fn the_candidate_that_got_furthest_is_repaired() {
+        let (mut a, mut p, mut d, id) = setup();
+        // Unreadable, then loading but wrong, then structurally invalid.
+        generate_code(
+            &mut a,
+            &mut p,
+            &mut d,
+            id,
+            "(ns order-totals.core)\n(defn order-totals [x] (str \"x))",
+        );
+        reply(&mut a, &mut p, &mut d, json!({"code": WRONG, "assumptions": []}));
+        validated(&mut a, &mut p, &mut d, false);
+        reply(
+            &mut a,
+            &mut p,
+            &mut d,
+            json!({"code": "(ns order-totals.core)\n(defn order-totals [x] (slurp x))", "assumptions": []}),
+        );
+        assert_eq!(a.job().unwrap().phase, Phase::Repairing);
+        let text = p.last_text();
+        assert!(
+            text.contains("count))"),
+            "the loading candidate is repaired:\n{text}"
+        );
+        assert!(!text.contains("slurp"));
+    }
+
+    #[test]
+    fn the_last_failed_attempt_ends_with_visible_diagnostics() {
         let (mut a, mut p, mut d, id) = setup();
         generate_code(&mut a, &mut p, &mut d, id, WRONG);
         let mut stored = Vec::new();
@@ -1961,17 +2194,29 @@ mod tests {
             }
         }
         assert!(a.job().is_none());
-        assert_eq!(p.sent.len(), 4, "one generation and three repairs");
-        let third: String = p.sent[2].1.sections.iter().map(|s| s.text.as_str()).collect();
-        assert!(
-            third.contains("Attempt 2 failed in exactly the same way as attempt 1"),
-            "a stuck model is told so"
+        assert_eq!(
+            p.sent.len() as u32,
+            SAMPLES + MAX_REPAIRS,
+            "the candidates and the repairs"
         );
-        let second: String = p.sent[1].1.sections.iter().map(|s| s.text.as_str()).collect();
-        assert!(!second.contains("exactly the same way"));
-        assert_eq!(p.sent[1].1.temperature, Some(requests::REPAIR_TEMPERATURE));
-        assert_eq!(p.sent[0].1.temperature, None);
-        assert_eq!(stored.len(), 4, "every candidate's report is stored");
+        let first_repair: String = p.sent[SAMPLES as usize]
+            .1
+            .sections
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            first_repair.contains(&format!(
+                "Attempt {SAMPLES} failed in exactly the same way as attempt {}",
+                SAMPLES - 1
+            )),
+            "a stuck model is told so:\n{first_repair}"
+        );
+        assert_eq!(
+            stored.len() as u32,
+            MAX_ATTEMPTS,
+            "every candidate's report is stored"
+        );
         let Some(Report::Unresolved {
             attempts,
             best,
@@ -1980,7 +2225,7 @@ mod tests {
         else {
             panic!("{:?}", a.report(id))
         };
-        assert_eq!(attempts.len(), 4);
+        assert_eq!(attempts.len() as u32, MAX_ATTEMPTS);
         assert!(
             attempts
                 .iter()
@@ -2006,13 +2251,8 @@ mod tests {
     #[test]
     fn structurally_invalid_code_is_a_failed_attempt_and_is_repaired() {
         let (mut a, mut p, mut d, id) = setup();
-        let updates = generate_code(
-            &mut a,
-            &mut p,
-            &mut d,
-            id,
-            "(ns order-totals.core)\n(defn order-totals [x] (slurp x))",
-        );
+        let slurp = "(ns order-totals.core)\n(defn order-totals [x] (slurp x))";
+        let updates = generate_code(&mut a, &mut p, &mut d, id, slurp);
         assert!(p.validations.is_empty(), "nothing runs");
         let r = reports(&updates)[0];
         let structure = r
@@ -2022,9 +2262,49 @@ mod tests {
             .unwrap();
         assert_eq!(structure.status, CheckStatus::Forbidden);
         assert!(structure.diagnostics[0].contains("slurp is not allowed"));
+        for _ in 1..SAMPLES {
+            reply(&mut a, &mut p, &mut d, json!({"code": slurp, "assumptions": []}));
+        }
         assert_eq!(a.job().unwrap().phase, Phase::Repairing);
         assert!(p.last_text().contains("slurp is not allowed"));
         assert!(d.0[&id].implementation.is_none());
+    }
+
+    #[test]
+    fn steps_quoted_with_the_threaded_value_are_found_in_the_pipeline() {
+        let code =
+            "(ns a)\n(defn f [orders]\n  (->> orders\n       (group-by :customer)\n       (into [])))\n";
+        let mut spec = doc();
+        spec.steps = vec![Step::new("group"), Step::new("collect")];
+        let quoted = [
+            (1, "(group-by :customer orders)".to_owned()),
+            (2, "(into [] x)".to_owned()),
+        ];
+        let lines = step_lines(&spec, code, &quoted).unwrap();
+        assert_eq!(lines[0].1.as_ref().unwrap().start, 4);
+        assert_eq!(lines[1].1.as_ref().unwrap().start, 5);
+        assert!(
+            step_lines(&spec, code, &[(1, "(map inc xs)".to_owned())]).unwrap()[0]
+                .1
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unbalanced_delimiters_and_comment_forms_are_fixed_before_checking() {
+        let (mut a, mut p, mut d, id) = setup();
+        let sloppy = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (->> orders\n       (group-by :customer)\n       (update-vals (fn [os] (reduce + (map :amount os)))))))\n\n(comment\n  (order-totals []))\n";
+        generate_code(&mut a, &mut p, &mut d, id, sloppy);
+        let req = p.validations.last().expect("the fixed code runs");
+        assert_eq!(req.code, format!("{CODE}\n"));
+        validated(&mut a, &mut p, &mut d, true);
+        reply(&mut a, &mut p, &mut d, explanation());
+        let Some(Report::Generated { attempts, .. }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        let note = attempts[0].note.as_deref().unwrap_or_default();
+        assert!(note.contains("inferred from the indentation"), "{note}");
+        assert!(note.contains("(comment …)"), "{note}");
     }
 
     #[test]
@@ -2405,6 +2685,8 @@ mod tests {
         a.generate(&d.0[&id], model(), false, &mut p);
         let gen_budget = Role::Generation.profile().max_output_tokens + REASONING_ALLOWANCE;
         assert_eq!(p.sent.last().unwrap().1.max_output_tokens, Some(gen_budget));
+        // A plain grammar would stop the model from reasoning, so only the schema is sent.
+        assert_eq!(p.sent.last().unwrap().1.grammar, None);
     }
 
     #[test]

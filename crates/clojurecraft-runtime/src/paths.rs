@@ -52,6 +52,27 @@ impl DataDirs {
         self.root.join("settings.json")
     }
 
+    /// Unix socket on which the running application serves MCP clients (through
+    /// `clojurecraft mcp`): `mcp.sock` in the data root, or, when that path is too long for a
+    /// socket address, a name derived from the data root in the per-user runtime directory
+    /// (`$XDG_RUNTIME_DIR`, else the temporary directory, which is per-user on macOS).
+    pub fn mcp_socket(&self) -> PathBuf {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        /// Socket addresses hold 104 (macOS) or 108 (Linux) bytes including the terminator.
+        const MAX_SOCKET_PATH: usize = 100;
+        let path = self.root.join("mcp.sock");
+        if path.as_os_str().len() <= MAX_SOCKET_PATH {
+            return path;
+        }
+        // Same binary for the application and the bridge, so the hash agrees between them.
+        let mut h = DefaultHasher::new();
+        self.root.hash(&mut h);
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(std::env::temp_dir, PathBuf::from);
+        dir.join(format!("clojurecraft-mcp-{:016x}.sock", h.finish()))
+    }
+
     /// File holding window geometry, panel sizes, text size, and the last open function.
     pub fn ui_state(&self) -> PathBuf {
         self.root.join("ui-state.ron")

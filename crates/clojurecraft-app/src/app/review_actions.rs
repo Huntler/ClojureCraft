@@ -230,29 +230,22 @@ impl ClojureCraftApp {
 
     /// Repairs the current code with all accepted cases; the result waits for review.
     fn fix_failing(&mut self, id: FunctionId) {
+        if let Err(e) = self.try_fix_failing(id) {
+            self.toast(e, None);
+        }
+    }
+
+    pub(super) fn try_fix_failing(&mut self, id: FunctionId) -> Result<(), String> {
         if let Some(why) = self.assist_blocked(id) {
-            self.toast(why, None);
-            return;
+            return Err(why);
         }
         self.finish_editing(id);
         let reports = self.validations.get(&id).cloned().unwrap_or_default();
         let Some(doc) = self.docs.get(&id).map(|o| o.doc.clone()) else {
-            return;
+            return Err("The function is not open.".into());
         };
-        let report = match edge_cases::failing_report(&doc, &reports) {
-            Ok(r) => r.clone(),
-            Err(why) => {
-                self.toast(why.to_owned(), None);
-                return;
-            }
-        };
-        let model = match self.model_context() {
-            Ok(m) => m,
-            Err(e) => {
-                self.toast(e, None);
-                return;
-            }
-        };
+        let report = edge_cases::failing_report(&doc, &reports)?.clone();
+        let model = self.model_context()?;
         let documentation = self.knowledge.active().is_some();
         let mut ports = AppPorts {
             inference: &mut self.inference,
@@ -261,6 +254,7 @@ impl ClojureCraftApp {
         };
         self.assistant
             .fix_failing(&doc, model, documentation, &report, &mut ports);
+        Ok(())
     }
 
     fn case_op(&mut self, id: FunctionId, case: clojurecraft_domain::TestCaseId, op: CaseOp) {

@@ -16,6 +16,8 @@
 //!   tests, contract) and its report;
 //! - [`edge_cases`]: proposing edge-case tests from the specification, reviewing them, and
 //!   fixing code that fails accepted cases;
+//! - [`export`]: a Clojure project (sources, `clojure.test` files, `deps.edn`) made from saved
+//!   functions;
 //! - [`diff`]: line differences for reviewing replacement code;
 //! - [`references`]: example inputs taken from another function's executed output (planning
 //!   the upstream run, cycle and contract checks, recording the snapshot);
@@ -27,10 +29,16 @@
 pub mod answers;
 pub mod assistant;
 pub mod candidate;
+pub mod cleanup;
+pub mod delimiters;
 pub mod deps;
 pub mod diff;
 pub mod edge_cases;
+pub mod export;
+pub mod grammar;
+mod insert;
 pub mod intermediate;
+pub mod locals;
 pub mod locate;
 pub mod naming;
 pub mod references;

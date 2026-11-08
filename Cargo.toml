@@ -23,6 +23,7 @@ clojurecraft-edn = { path = "crates/clojurecraft-edn" }
 clojurecraft-store = { path = "crates/clojurecraft-store" }
 clojurecraft-knowledge = { path = "crates/clojurecraft-knowledge" }
 clojurecraft-workflow = { path = "crates/clojurecraft-workflow" }
+clojurecraft-mcp = { path = "crates/clojurecraft-mcp" }
 
 anyhow = "1"
 directories = "6"

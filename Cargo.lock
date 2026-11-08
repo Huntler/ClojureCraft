@@ -672,12 +672,14 @@ dependencies = [
  "clojurecraft-hardware",
  "clojurecraft-inference",
  "clojurecraft-knowledge",
+ "clojurecraft-mcp",
  "clojurecraft-runtime",
  "clojurecraft-sandbox",
  "clojurecraft-store",
  "clojurecraft-workflow",
  "eframe",
  "egui",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -781,6 +783,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "clojurecraft-mcp"
+version = "0.1.0"
+dependencies = [
+ "clojurecraft-domain",
+ "clojurecraft-workflow",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 

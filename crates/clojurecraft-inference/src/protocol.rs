@@ -117,6 +117,10 @@ pub struct ChatRequest {
     pub top_p: Option<f32>,
     /// Constrains the answer to JSON matching this schema (llama.cpp grammar sampling).
     pub response_schema: Option<Schema>,
+    /// A GBNF grammar that constrains the answer more tightly than `response_schema` can; sent
+    /// instead of the schema (llama.cpp refuses both at once). The answer is still validated
+    /// against `response_schema`.
+    pub grammar: Option<String>,
     pub tools: Vec<ToolSpec>,
     pub seed: Option<u64>,
 }
@@ -137,7 +141,9 @@ impl ChatRequest {
         if let Some(p) = self.top_p {
             body["top_p"] = json!(p);
         }
-        if let Some(schema) = &self.response_schema {
+        if let Some(grammar) = &self.grammar {
+            body["grammar"] = json!(grammar);
+        } else if let Some(schema) = &self.response_schema {
             body["response_format"] = json!({
                 "type": "json_schema",
                 "json_schema": {"name": "answer", "strict": true, "schema": schema.to_json()},
@@ -619,6 +625,7 @@ mod tests {
             temperature: 0.1,
             top_p: None,
             response_schema: Some(Schema::string()),
+            grammar: None,
             tools: vec![ToolSpec {
                 name: "t".into(),
                 description: "d".into(),
@@ -634,6 +641,15 @@ mod tests {
         assert!(b["messages"][0].get("tool_calls").is_none());
         let t = req.template_body();
         assert!(t.get("max_tokens").is_none() && t.get("tools").is_some());
+
+        // A grammar replaces the schema in the request; llama.cpp accepts only one of them.
+        let g = ChatRequest {
+            grammar: Some("root ::= \"x\"".into()),
+            ..req
+        }
+        .body(false);
+        assert_eq!(g["grammar"], "root ::= \"x\"");
+        assert!(g.get("response_format").is_none());
     }
 
     #[test]

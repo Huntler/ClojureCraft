@@ -21,6 +21,7 @@ use clojurecraft_domain::{ExampleId, Fingerprint, FunctionDocument, LineRange, S
 use clojurecraft_edn::{Delim, TokenKind, line_col};
 
 use crate::deps;
+use crate::insert::{self, Insertion};
 use crate::references::names_for;
 use crate::spec;
 use crate::structure::{self, Expectations, Form};
@@ -396,14 +397,44 @@ fn explanation(doc: &FunctionDocument) -> Result<&[StepMapping], String> {
     }
 }
 
-/// Chooses an observable expression for each step and builds the instrumented source.
-pub fn instrument(doc: &FunctionDocument) -> Result<Instrumentation, String> {
+/// Where each step's code is: its lines, or why they are not known.
+pub type StepLines = Vec<(StepId, Result<LineRange, String>)>;
+
+/// The step-to-code mapping of the implementation's explanation, for its own source.
+fn explained_lines(doc: &FunctionDocument) -> Result<StepLines, String> {
     let mappings = explanation(doc)?;
-    let source = doc
-        .implementation
-        .as_ref()
-        .map(|i| i.source.as_str())
-        .unwrap_or_default();
+    Ok(doc
+        .steps
+        .iter()
+        .map(|step| {
+            let lines = match mappings.iter().find(|m| m.step == step.id) {
+                None => Err("The explanation attributes no code to this step.".to_owned()),
+                Some(m) if m.step_text.trim() != step.text.trim() => Err(
+                    "The step was reworded after the code was explained, so its code is not known."
+                        .to_owned(),
+                ),
+                Some(StepMapping { lines: None, .. }) => Err(
+                    "The code the explanation attributes to this step was not found in the implementation."
+                        .to_owned(),
+                ),
+                Some(StepMapping {
+                    lines: Some(lines), ..
+                }) => Ok(*lines),
+            };
+            (step.id, lines)
+        })
+        .collect())
+}
+
+/// The targets, step plans, and insertions of [`step_probes`].
+pub(crate) type StepProbeParts = (Vec<Target>, Vec<(StepId, StepPlan)>, Vec<Insertion>);
+
+/// Probes for the steps' values in `source`, numbered from 0: an observable expression is
+/// chosen inside each step's lines.
+pub(crate) fn step_probes(
+    source: &str,
+    steps: &[(StepId, Result<LineRange, String>)],
+) -> Result<StepProbeParts, String> {
     let forms = structure::read_all(source).map_err(|(message, at)| {
         format!(
             "The code cannot be read (line {}): {message}",
@@ -424,27 +455,19 @@ pub fn instrument(doc: &FunctionDocument) -> Result<Instrumentation, String> {
         .collect();
 
     // Step → chosen site, in step order.
-    let mut chosen: Vec<(StepId, Result<usize, String>)> = Vec::new();
-    for step in &doc.steps {
-        let choice = match mappings.iter().find(|m| m.step == step.id) {
-            None => Err("The explanation attributes no code to this step.".to_owned()),
-            Some(m) if m.step_text.trim() != step.text.trim() => Err(
-                "The step was reworded after the code was explained, so its code is not known.".to_owned(),
-            ),
-            Some(StepMapping { lines: None, .. }) => Err(
-                "The code the explanation attributes to this step was not found in the implementation."
-                    .to_owned(),
-            ),
-            Some(StepMapping {
-                lines: Some(lines), ..
-            }) => choose(&sites, *lines).ok_or_else(|| {
-                "Its lines hold no expression whose value can be observed on its own (only names, \
-                 parameters, or part of a larger form)."
-                    .to_owned()
-            }),
-        };
-        chosen.push((step.id, choice));
-    }
+    let chosen: Vec<(StepId, Result<usize, String>)> = steps
+        .iter()
+        .map(|(step, lines)| {
+            let choice = lines.clone().and_then(|lines| {
+                choose(&sites, lines).ok_or_else(|| {
+                    "Its lines hold no expression whose value can be observed on its own (only names, \
+                     parameters, or part of a larger form)."
+                        .to_owned()
+                })
+            });
+            (*step, choice)
+        })
+        .collect();
 
     // One probe per distinct site.
     let mut probe_sites: Vec<usize> = Vec::new();
@@ -466,7 +489,7 @@ pub fn instrument(doc: &FunctionDocument) -> Result<Instrumentation, String> {
             }
         })
         .collect();
-    let steps = chosen
+    let plans = chosen
         .iter()
         .map(|(step, c)| {
             let plan = match c {
@@ -483,28 +506,49 @@ pub fn instrument(doc: &FunctionDocument) -> Result<Instrumentation, String> {
             (*step, plan)
         })
         .collect();
+    let insertions = probe_sites
+        .iter()
+        .enumerate()
+        .map(|(probe, &i)| {
+            let span = sites[i].0.span.clone();
+            match sites[i].0.kind {
+                SiteKind::Expression => Insertion::Wrap {
+                    span,
+                    open: format!("({PROBE} {probe} "),
+                    close: ")".to_owned(),
+                },
+                SiteKind::ThreadStep { first } => Insertion::After {
+                    at: span.end,
+                    text: format!(" ({} {probe})", if first { PROBE_FIRST } else { PROBE }),
+                },
+            }
+        })
+        .collect();
+    Ok((targets, plans, insertions))
+}
 
-    // Insert probes from the end of the source backwards, so earlier offsets stay valid.
-    let mut insertions: Vec<(usize, String)> = Vec::new();
-    for (probe, &i) in probe_sites.iter().enumerate() {
-        let span = &sites[i].0.span;
-        match sites[i].0.kind {
-            SiteKind::Expression => {
-                insertions.push((span.start, format!("({PROBE} {probe} ")));
-                insertions.push((span.end, ")".to_owned()));
-            }
-            SiteKind::ThreadStep { first } => {
-                let probe_fn = if first { PROBE_FIRST } else { PROBE };
-                insertions.push((span.end, format!(" ({probe_fn} {probe})")));
-            }
-        }
-    }
-    insertions.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-    let mut code = source.to_owned();
-    for (at, text) in insertions {
-        code.insert_str(at, &text);
-    }
-    Ok(Instrumentation { code, targets, steps })
+/// Chooses an observable expression for each step and builds the instrumented source.
+pub fn instrument(doc: &FunctionDocument) -> Result<Instrumentation, String> {
+    let steps = explained_lines(doc)?;
+    let source = doc
+        .implementation
+        .as_ref()
+        .map(|i| i.source.as_str())
+        .unwrap_or_default();
+    let (targets, steps, insertions) = step_probes(source, &steps)?;
+    Ok(Instrumentation {
+        code: insert::apply(source, &insertions),
+        targets,
+        steps,
+    })
+}
+
+/// The step-to-code lines of the explained implementation, when `source` is exactly its code.
+pub fn explained_step_lines(doc: &FunctionDocument, source: &str) -> Option<StepLines> {
+    let current = doc.implementation.as_ref()?;
+    (current.source == source)
+        .then(|| explained_lines(doc).ok())
+        .flatten()
 }
 
 /// A planned inspection run.
@@ -707,6 +751,78 @@ pub fn inspect(plan: &InspectionPlan, outcome: Result<&EvalOutcome, &str>) -> In
         });
     }
     inspection
+}
+
+/// Step probes in a validation run: what each step's value is, and the step texts by number.
+#[derive(Clone, Debug)]
+pub struct StepProbes {
+    pub targets: Vec<Target>,
+    pub plans: Vec<(StepId, StepPlan)>,
+    /// Each step's number (from 1) and text.
+    pub texts: Vec<(StepId, usize, String)>,
+}
+
+/// Characters of one step value in a diagnostic, and of the whole description.
+const STEP_VALUE_CHARS: usize = 300;
+const STEP_VALUES_CHARS: usize = 1800;
+
+/// The values of the steps in one failing call, labelled with the user's step texts; `None`
+/// when no step's value is known.
+pub fn describe_steps(p: &StepProbes, run: &clojurecraft_clojure::ProbeCall) -> Option<String> {
+    if !run.consistent {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut used = 0;
+    let mut shown: Vec<(usize, usize)> = Vec::new(); // (probe, step number)
+    for (step, number, text) in &p.texts {
+        let Some(StepPlan::Probed { probe, .. }) = p.plans.iter().find(|(s, _)| s == step).map(|(_, p)| p)
+        else {
+            continue;
+        };
+        let head = format!("  step {number} \"{}\"", one_line(text, 80));
+        let line = if let Some((_, earlier)) = shown.iter().find(|(pr, _)| pr == probe) {
+            format!("{head}: the same code as step {earlier}")
+        } else {
+            let target = &p.targets[*probe];
+            match run.capture(*probe) {
+                None => format!("{head}: {} was never evaluated", target.describe()),
+                Some(c) => {
+                    let value = c.values.first().map_or_else(String::new, |v| match v.kind {
+                        ValueKind::Value => {
+                            let t = one_line(&v.text, STEP_VALUE_CHARS);
+                            if v.complete { t } else { format!("{t} (shortened)") }
+                        }
+                        ValueKind::Function => "a function".to_owned(),
+                        ValueKind::Error => format!(
+                            "(could not be printed: {})",
+                            v.message.as_deref().unwrap_or("unknown error")
+                        ),
+                    });
+                    let times = if c.evaluations > 1 {
+                        format!(", evaluated {} times, first", c.evaluations)
+                    } else {
+                        String::new()
+                    };
+                    format!("{head}: {}{times} = {value}", target.describe())
+                }
+            }
+        };
+        shown.push((*probe, *number));
+        if used + line.len() > STEP_VALUES_CHARS {
+            parts.push("  (later steps are not shown)".to_owned());
+            break;
+        }
+        used += line.len();
+        parts.push(line);
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "Values after each transformation step in this call (compare them with what the step \
+             should produce):\n{}",
+            parts.join("\n")
+        )
+    })
 }
 
 /// Whether a recorded value is data that can be shown.
@@ -962,11 +1078,13 @@ mod tests {
                     id: 0,
                     evaluations: 1,
                     values: vec![value("({:amount 3, :paid true})", true)],
+                    locals: vec![],
                 },
                 ProbeCapture {
                     id: 1,
                     evaluations: 1,
                     values: vec![value("(3 …", false)],
+                    locals: vec![],
                 },
             ],
         };

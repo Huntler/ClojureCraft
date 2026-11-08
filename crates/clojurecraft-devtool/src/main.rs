@@ -307,6 +307,7 @@ fn smoke_file(
         temperature: 0.2,
         top_p: None,
         response_schema: None,
+        grammar: None,
         tools: vec![],
         seed: None,
     };

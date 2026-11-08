@@ -37,6 +37,9 @@ const APP_ID: &str = "org.clojurecraft.ClojureCraft";
 pub const MIN_WINDOW: [f32; 2] = [1024.0, 640.0];
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return mcp_bridge();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -61,4 +64,33 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(app::ClojureCraftApp::new(cc)))),
     )
     .map_err(|e| anyhow::anyhow!("could not open the application window: {e}"))
+}
+
+/// `clojurecraft mcp`: the stdio server an MCP client starts. It relays to the running
+/// application, starting it first when needed (unless `CLOJURECRAFT_MCP_NO_LAUNCH` is set).
+/// stdout carries only protocol messages, so logs go to stderr.
+fn mcp_bridge() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .init();
+    let dirs = clojurecraft_runtime::DataDirs::discover()
+        .ok_or_else(|| anyhow::anyhow!("no data directory is available for this user"))?;
+    let launch = || -> std::io::Result<()> {
+        tracing::info!("starting ClojureCraft for an MCP client");
+        std::process::Command::new(std::env::current_exe()?)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
+    };
+    let may_launch = std::env::var_os("CLOJURECRAFT_MCP_NO_LAUNCH").is_none();
+    clojurecraft_mcp::bridge::run(
+        &dirs.mcp_socket(),
+        may_launch.then_some(&launch as &dyn Fn() -> std::io::Result<()>),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }

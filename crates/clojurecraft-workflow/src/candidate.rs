@@ -42,6 +42,7 @@ impl Candidate {
             code: std::mem::take(&mut self.code),
             assumptions: std::mem::take(&mut self.assumptions),
             unescaped: false,
+            steps: Vec::new(),
         };
         *self = Self::check(generated, names, allowed);
     }
@@ -149,6 +150,7 @@ mod tests {
                 code: "(ns f.core)\n(defn f [x] (eval x))\n".into(),
                 assumptions: vec![],
                 unescaped: false,
+                steps: Vec::new(),
             },
             &names(),
             &allowed,
@@ -161,6 +163,7 @@ mod tests {
                     .into(),
                 assumptions: vec!["keys are strings".into()],
                 unescaped: false,
+                steps: Vec::new(),
             },
             &names(),
             &allowed,
@@ -189,6 +192,7 @@ mod tests {
                 code: "(ns f.core)\n(defn f [x] x)\n".into(),
                 assumptions: vec![],
                 unescaped: false,
+                steps: Vec::new(),
             },
             &names(),
             &BTreeSet::new(),

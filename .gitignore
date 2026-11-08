@@ -5,4 +5,6 @@
 *.part
 
 # Claude Code local state (worktrees, settings).
-/.claude/
+/.claude/*
+# Shared with everyone working in the repository.
+!/.claude/skills/

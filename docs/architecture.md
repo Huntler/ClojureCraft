@@ -19,6 +19,7 @@ hardware. "Verified" means exercised on a machine; "unverified" means designed a
 | `clojurecraft-clojure` | Sandboxed JVM evaluation of candidate functions: static checks, lint, loading, calls with per-call limits, structural comparison with expected EDN, output-contract checks, exact output printing, instrumented runs recording intermediate values (harness); trusted scripts in the same sandbox |
 | `clojurecraft-knowledge` | Versioned Clojure documentation: pinned sources, API extraction, chunking, SQLite/FTS5 index, embeddings, merged retrieval, atomic collection updates, prompt formatting |
 | `clojurecraft-workflow` | Specification readiness and prompt sections, model requests and answer schemas (interpretation, questions, retrieval planning, contract proposals, generation, explanation), structural checks of generated code, allowed namespaces, validation plans and reports, edge-case proposals and review, line diffs (`similar`), referenced example inputs (planning, cycle and contract checks, snapshots), intermediate step values, and the assistant that sequences these requests with validation and repair (no I/O; inference, retrieval, and execution are reached through a trait) |
+| `clojurecraft-mcp` | Model Context Protocol server for outside agents: tool catalogue and typed calls, applying an agent's specification and test-case review, compact JSON views of progress and results, the application's Unix socket, and the `clojurecraft mcp` stdio bridge |
 | `clojurecraft-devtool` | Developer commands that exercise installation, inference, and sandboxing on a real machine |
 
 Later boundaries (export, benchmarking, updates)
@@ -37,7 +38,7 @@ with `downloads/` (archives and resumable `.part` files), `runtimes/<component>/
 `model.json` record), `harness/`, `knowledge/` (`collections/<version>/` with `index.sqlite3` and `collection.json`,
 `downloads/` for verified source pages, `models/` for the embedding model), `library/library.sqlite3`
 (saved functions, history, results),
-`settings.json` (inference settings), and `ui-state.ron` (window geometry, column widths, text
+`settings.json` (inference settings), `mcp.sock` (the MCP socket while the application runs), and `ui-state.ron` (window geometry, column widths, text
 size, last open function). Access tokens are never stored here.
 
 ## Decisions
@@ -572,24 +573,71 @@ collection, with a budget of 1,000,000 elements and 512 levels of nesting. More 
 large ("it may be an infinite lazy sequence"); an exception thrown while realizing belongs to the
 call that produced the sequence. The value is printed (bounded) only after realization.
 
+**Values of failing calls.** Every call that fails (throws, returns a wrong value, or breaks the
+contract) is run once more with an instrumented copy of the code; passing calls are not. The copy
+records two things, and the call's diagnostics (and so repair prompts and the MCP status) show
+them:
+
+- *Values after each transformation step.* A generation answer gives, next to the code, the code
+  that carries out each numbered step (`steps`: step number and a quote). The quote is located in
+  the code (whitespace-insensitive; a pipeline stage quoted with its threaded value written out,
+  such as `(group-by :customer orders)` for `(group-by :customer)`, is also found), an observable
+  expression is chosen in those lines as for the Result tab's intermediate values, and its first
+  value is shown with the user's step text: `step 2 "split items by ", "": value of …
+  (line 23) = ["2026-03-02" "Bench Press" "3x8 @ 60kg"]`. For checks of the current code, the
+  stored explanation's step mapping is used when the code is exactly the explained code.
+- *Locals* (`clojurecraft-workflow/src/locals.rs`): every function arity (`defn`, `defn-`, `fn`)
+  and every `let`, `loop`, `when-let`, and `if-let` body records the values of the locals it binds
+  when entered, keeping the latest. For an exception, the harness reports the line of every stack
+  frame in the candidate's code, and the scopes around each of those lines, up to the enclosing
+  function, show their locals. For a wrong value there is no stack, so every scope the call
+  entered is listed in source order with how often it was entered.
+
+Probes are inserted within lines, so line numbers do not move; several probes at one place nest
+(`clojurecraft-workflow/src/insert.rs`). The harness uses the copy only when removing the probes
+gives back the checked forms, and values are shown only when the instrumented run ended like the
+checked one (same result, or the same exception class). A failure summary for a repair carries the
+values of the first two failing calls, so that every failing check still fits.
+
 **Output contract.** From the accepted contract: the output's value type, and for each key rule
 (applied to the output map, or to each map in an output collection) presence of required keys,
 the value type of present non-nil values, and nil where nil is disallowed. Types `other` and
 `any` are not checked; ordering requirements other than "does not matter", nil defaults, and the
 input shape are not checked mechanically. Violations from all results form one `Contract` check.
 
-**Repair loop** (`Assistant`). One generation plus at most three repairs. Every attempt's code is
-validated against a snapshot of the specification taken when the job started; its report
-(attempt number, generation run, checked source) is stored. The first passing attempt ends the
-loop and is explained, then applied or held for review under the rules above. A failing attempt
-leads to a repair request (Generation role, a new seed, temperature 0.5 instead of 0.2, because
-the model otherwise tends to return its failing code nearly unchanged) containing the whole
-specification as required sections, the previous code, the failures (each failing check with its
-diagnostics, input, expected and actual values, named as in the specification, at most 6,000
-characters), and the same documentation excerpts. When the newest attempt has the same code or
-exactly the same failures as an earlier one, the request says so and asks for a different
-approach. A malformed or cut-off answer is a failed attempt without code; the next attempt
-repairs the most recent code, or generates afresh if there is none. After the fourth failure the
+**Repair loop** (`Assistant`). A new generation writes up to three independent candidates, then
+makes at most three repairs (six attempts); a fix of failing cases starts with a repair and makes
+at most four. Failures of small models are mostly sampling noise, and checking a candidate takes
+under a second, so further candidates (the same generation request with a new seed and
+temperature 0.6) are tried before any repair. Every attempt's code is validated against a
+snapshot of the specification taken when the job started; its report (attempt number, generation
+run, checked source) is stored. The first passing attempt ends the loop and is explained, then
+applied or held for review under the rules above.
+
+*Before checking*, generated code is made ready without costing an attempt: when it cannot be
+read, its closing delimiters are inferred from the indentation (parinfer's indent mode: the
+closers at the end of each line are recomputed from the next line's indentation, mismatched
+closers in the middle of a line are removed; used only when the result reads), and top-level
+`(comment …)` forms and requires of `clojure.core` are removed (a `core/` alias is written out as
+`clojure.core/`), and Java-style static calls of the allowed classes (`Double.parseDouble`) are
+written as Clojure calls (`Double/parseDouble`). Both are noted on the attempt. Generation and repair requests also send a GBNF
+grammar instead of the JSON schema (see `clojurecraft-workflow/src/grammar.rs`): the answer's
+JSON shape plus Clojure at the JSON-escaped level with balanced `()[]{}`, terminated strings, and
+line comments, so delimiters cannot be miscounted in the first place. The answer is still
+validated against the schema. Once the model is known to reason before answering, only the
+schema is sent: llama.cpp applies a plain grammar from the first token, which stops a reasoning
+model from thinking at all (verified with Mellum 2.1 Thinking: no reasoning, where the schema
+allowed 7,500 characters of it), while the schema's grammar starts after the reasoning.
+
+*Repairs* start from the best failed attempt so far (code that loads first, then most passing
+checks, then the most recent). A repair request (Generation role, a new seed, temperature 0.5
+instead of 0.2, because the model otherwise tends to return its failing code nearly unchanged)
+contains the whole specification as required sections, the code, the failures (each failing
+check with its diagnostics, input, expected and actual values, named as in the specification, at
+most 6,000 characters) followed by the linter's warnings (a value bound but never used usually
+means a step's result was dropped), and the same documentation excerpts. When another attempt
+has the same code or exactly the same failures as the one being repaired, the request says so
+and asks for a different approach. A malformed or cut-off answer is a failed attempt without code. After the last failure the
 job ends with every attempt's diagnostics visible; nothing is applied, and the user may choose
 the best candidate (most passing checks among those that loaded), recorded as not passing. Other
 inference failures (timeouts, crashes) end the job and keep the attempts made so far. Examples,
@@ -787,6 +835,90 @@ text editors do not trap Tab. Shortcuts (Cmd on macOS, Ctrl elsewhere): New func
 (F), Duplicate (D), Save now (S), Rename (F2), move the focused step (Alt/Option+Up/Down), add a step
 after it (Cmd/Ctrl+Enter), text size (Cmd/Ctrl +, −, 0), Esc to close dialogs or clear the search.
 Labels use words rather than symbols such as ⌘ because the bundled fonts lack them.
+
+### MCP server for outside agents
+
+An outside agent (Claude Code, another MCP client) can use ClojureCraft as a tool: it specifies a
+function, reviews test cases, starts generation, and reads back checked code, while writing,
+running, and repairing the code happens locally. The agent spends tokens on the specification
+and the final code, not on iterating.
+
+**Where it runs.** Inside the running application, not in a separate headless process, so the
+agent and the person share one library, one loaded model, and one job queue, and the person sees
+the agent's functions and can intervene. The application listens on a Unix socket, `mcp.sock` in
+the data directory (mode `0600`; when that path is too long for a socket address, a name derived
+from the data directory in `$XDG_RUNTIME_DIR` or the per-user temporary directory). The MCP
+client starts `clojurecraft mcp`, which relays its stdio to the socket line by line and starts the
+application first when nothing is listening (not with `CLOJURECRAFT_MCP_NO_LAUNCH` set). A second
+window on the same library does not serve; a socket left behind by a crash is replaced.
+
+**Protocol.** JSON-RPC 2.0 over newline-delimited JSON (MCP revisions 2025-06-18, 2025-03-26,
+2024-11-05): `initialize` (with usage instructions for the agent), `ping`, `tools/list`, and
+`tools/call`. Bad arguments are tool results with `isError` so the agent can correct them;
+unknown methods and tools are JSON-RPC errors.
+
+**Tools.** `list_functions`; `create_function` and `update_function` (name, description, steps
+and examples replaced as a whole, EDN as text, an accepted contract or `null`; all-or-nothing with
+field-level errors such as `examples[1].input: …`, answered with the id and the specification's
+readiness only); `create_functions` (several specifications, all or nothing, errors prefixed
+`functions[i]`); `get_function` (specification and test cases with ids); `generate_test_cases`
+(from the examples, or from the whole specification); `review_test_cases` (accept, reject,
+reopen, remove, or edit cases and add the agent's own, accepted by default; all-or-nothing;
+accepting records a `TestsAccepted` revision); `run_tests`; `generate` (fresh, or `fix` from the
+failing checks; one function or `function_ids`); `status` (one function, or a line per function
+with `function_ids`); `result`; `accept_code` (code held for review); `submit_code`;
+`export_project`; `cancel` (also empties the queue).
+
+**Queue.** `generate` for a function while the model works on another queues the generation
+instead of refusing it (a missing model is still reported at once). Queued generations start in
+order, one per free model, from the frame loop; one that cannot start records its reason
+(`queue_error` in `status`) and the next starts. A queued function counts as working, so
+`status` with `wait_seconds` waits through the queue. Generations started from the window are
+not queued; they simply hold the queue until they finish.
+
+**Agent-written code.** `submit_code` is the agent's fallback when generation keeps failing: the
+code replaces the function's code as hand-written code (a `CodeEdited` revision “Code written by
+an agent”, so the previous code stays in the history), a check of the previous code still
+running is cancelled, and the same checks as `run_tests` start. It is refused while a model job
+works on the function.
+
+**Compact replies.** `status` and `result` list the first failing check of each kind (parse,
+structure, lint, load, contract, and per status the calls) and count the rest; inputs are cut to
+200 characters, values to 160, and one diagnostic to 300. When a wrong value's expected or actual
+text is longer than that, both are replaced by the harness's description of the first difference
+(`at [0 :total]: expected 5 but got 4`). `verbose: true` gives up to eight failures with
+600-character values and two diagnostics each.
+
+**Export.** `export_project` writes chosen functions into an absolute directory as a Clojure
+project: each function's code under `src/` (namespace and function read from the code), one
+`clojure.test` namespace per function under `test/` with an assertion per example and accepted
+test case, `deps.edn` (the runtime's Clojure version, a `:test` alias with Cognitect's test runner),
+and `test/clojurecraft/check.clj`, which compares results like the harness does (float tolerance,
+number kinds, unordered output when the accepted contract says so). EDN values are quoted
+literals. Output contracts are not exported. Rendering is pure (`clojurecraft_workflow::export`);
+writing checks every file first and changes nothing when a file exists with other content, unless
+`overwrite` is set. The reply lists created, updated, and unchanged files, a `require` form per
+function, whether each passes its current checks, and test commands for the Clojure CLI and for
+the installed Java runtime and jars (no CLI needed).
+
+**Waiting.** Model jobs and checks run in the background; their tools return at once. `status`
+reports the job and phase, the attempt, the last job's outcome, the latest checks of the current
+code (counts, freshness, and at most eight failures with input, expected and actual values and two
+bounded diagnostics), test-case counts, and a `next` hint. With `wait_seconds` (at most 300) the
+server polls the application every 500 ms and answers when nothing is working on the function,
+so the agent makes one call instead of polling.
+
+**Carrying out calls.** Each call is sent to the frame loop over a channel and handled after the
+services' events through the same operations as the interface's buttons (the job starters return
+their refusal as text instead of a notification), so the agent's work is autosaved, recorded in
+the history, and shown. A call about a function that is not open waits until the library opens it,
+without switching the view; a created function is shown. The connection waits at most 60 s for
+the frame loop, which must keep running: a minimized window that the platform stops redrawing
+delays calls until it is shown.
+
+- Verified: the stdio bridge, application start-up from the bridge, and every tool on Linux/X11
+  with a scratch data directory, including a generation with Qwen2.5-Coder 7B.
+- Unverified: macOS; Wayland with a minimized window.
 
 ### Hardware detection and budgets
 

@@ -16,7 +16,9 @@ use clojurecraft_inference::{
     Finish, GenerateRequest, Generation, PromptPlan, RequestId, Role, ServiceEvent, Usage,
 };
 use clojurecraft_runtime::{DataDirs, Manifest, components, platform_key};
-use clojurecraft_workflow::assistant::{Assistant, Execution, Gather, ModelContext, Ports, Report, Update};
+use clojurecraft_workflow::assistant::{
+    Assistant, Execution, Gather, MAX_ATTEMPTS, ModelContext, Ports, Report, SAMPLES, Update,
+};
 use serde_json::{Value, json};
 
 fn runtime() -> Option<ClojureRuntime> {
@@ -219,7 +221,9 @@ fn a_wrong_candidate_is_repaired_from_real_diagnostics() {
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
-    h.answer(json!({"code": WRONG, "assumptions": []}));
+    for _ in 0..SAMPLES {
+        h.answer(json!({"code": WRONG, "assumptions": []}));
+    }
 
     let first = &h.stored[0];
     assert!(!first.passed());
@@ -235,22 +239,33 @@ fn a_wrong_candidate_is_repaired_from_real_diagnostics() {
     );
     // The repair request holds the real values the harness reported.
     let prompt = h.last_prompt();
-    assert!(prompt.contains("attempt 2 of 4"), "{prompt}");
+    let repair = SAMPLES + 1;
+    assert!(
+        prompt.contains(&format!("attempt {repair} of {MAX_ATTEMPTS}")),
+        "{prompt}"
+    );
     assert!(prompt.contains("Actual: {\"a\" 2, \"b\" 1}"), "{prompt}");
     assert!(prompt.contains("at [\"a\"]: expected 5 but got 2"), "{prompt}");
 
     h.answer(json!({"code": RIGHT, "assumptions": []}));
-    assert!(h.stored[1].passed(), "{:?}", h.stored[1].checks);
+    let last = h.stored.last().unwrap();
+    assert!(last.passed(), "{:?}", last.checks);
     assert_eq!(h.p.sent.last().unwrap().role, Role::Explanation);
     h.answer(explanation());
 
     let Some(Report::Generated { attempts, .. }) = h.a.report(h.id) else {
         panic!("{:?}", h.a.report(h.id))
     };
-    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts.len(), repair as usize);
     let i = h.docs[&h.id].implementation.as_ref().unwrap();
     assert_eq!(i.source, RIGHT);
-    assert!(h.stored[1].freshness(&h.docs[&h.id].basis()).is_current());
+    assert!(
+        h.stored
+            .last()
+            .unwrap()
+            .freshness(&h.docs[&h.id].basis())
+            .is_current()
+    );
 }
 
 #[test]
@@ -259,7 +274,10 @@ fn lint_and_load_failures_reach_the_repair_prompt() {
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
-    h.answer(json!({"code": "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (sum-by :amount orders))\n", "assumptions": []}));
+    let code = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (sum-by :amount orders))\n";
+    for _ in 0..SAMPLES {
+        h.answer(json!({"code": code, "assumptions": []}));
+    }
     let r = &h.stored[0];
     let status = |s: CheckSubject| r.checks.iter().find(|c| c.subject == s).map(|c| c.status);
     assert_eq!(status(CheckSubject::Lint), Some(CheckStatus::Failed));
@@ -272,17 +290,105 @@ fn lint_and_load_failures_reach_the_repair_prompt() {
 }
 
 #[test]
-fn every_attempt_failing_ends_unresolved_with_four_stored_reports() {
+fn every_attempt_failing_ends_unresolved_with_every_report_stored() {
     let Some(rt) = runtime() else { return };
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
-    for _ in 0..4 {
+    for _ in 0..MAX_ATTEMPTS {
         h.answer(json!({"code": WRONG, "assumptions": []}));
     }
-    assert_eq!(h.p.sent.len(), 4);
-    assert_eq!(h.stored.len(), 4);
+    assert_eq!(h.p.sent.len() as u32, MAX_ATTEMPTS);
+    assert_eq!(h.stored.len() as u32, MAX_ATTEMPTS);
     assert!(h.a.job().is_none());
     assert!(matches!(h.a.report(h.id), Some(Report::Unresolved { .. })));
     assert!(h.docs[&h.id].implementation.is_none());
+}
+
+#[test]
+fn an_exception_shows_the_locals_of_the_running_code() {
+    let Some(rt) = runtime() else { return };
+    let mut h = Harness::new(rt);
+    let d = h.docs[&h.id].clone();
+    // `:amt` is missing, so `+` meets nil inside `amount-of`.
+    let broken = "(ns order-totals.core)\n\n(defn- amount-of [order]\n  (+ 0 (:amt order)))\n\n(defn order-totals [orders]\n  (update-vals (group-by :customer orders)\n               (fn [os] (reduce + (map amount-of os)))))\n";
+    h.a.generate(&d, model(), false, &mut h.p);
+    h.answer(json!({"code": broken, "assumptions": []}));
+
+    let example = h.stored[0]
+        .checks
+        .iter()
+        .find(|c| matches!(c.subject, CheckSubject::Example(_)))
+        .unwrap();
+    assert_eq!(example.status, CheckStatus::Error);
+    let diagnostics = example.diagnostics.join("\n");
+    for needle in [
+        "Values of the locals in the running code when it threw",
+        "in (defn- amount-of [order]) at line 3: order = {:customer \"a\", :amount 2}",
+        "in (fn [os]) at line 8: os = [{:customer \"a\", :amount 2} {:customer \"a\", :amount 3}]",
+    ] {
+        assert!(
+            diagnostics.contains(needle),
+            "missing {needle:?} in\n{diagnostics}"
+        );
+    }
+    // The empty example did not throw, so it was not run again.
+    assert!(h.p.executions[0].outcome.as_ref().unwrap().report.probes.len() == 1);
+
+    // Repairs see the values.
+    for _ in 1..SAMPLES {
+        h.answer(json!({"code": broken, "assumptions": []}));
+    }
+    assert!(
+        h.last_prompt().contains("order = {:customer \"a\", :amount 2}"),
+        "{}",
+        h.last_prompt()
+    );
+}
+
+#[test]
+fn a_wrong_value_shows_each_steps_value_and_the_locals_entered() {
+    let Some(rt) = runtime() else { return };
+    let mut h = Harness::new(rt);
+    let d = h.docs[&h.id].clone();
+    let wrong = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (let [groups (group-by :customer orders)]\n    (update-vals groups count)))\n";
+    let answer = json!({
+        "code": wrong,
+        "steps": [{"step": 1, "code": "(group-by :customer orders)"},
+                  {"step": 2, "code": "(update-vals groups count)"}],
+        "assumptions": []
+    });
+    h.a.generate(&d, model(), false, &mut h.p);
+    h.answer(answer.clone());
+    let example = h.stored[0]
+        .checks
+        .iter()
+        .find(|c| matches!(c.subject, CheckSubject::Example(_)))
+        .unwrap();
+    assert_eq!(example.status, CheckStatus::Failed);
+    let diagnostics = example.diagnostics.join("\n");
+    for needle in [
+        "Values after each transformation step in this call",
+        "step 1 \"group orders by :customer\": value of `(group-by :customer orders)` (line 4) = {\"a\" [{:customer \"a\", :amount 2} {:customer \"a\", :amount 3}], \"b\" [{:customer \"b\", :amount 1}]}",
+        "step 2 \"sum :amount per group\": value of `(update-vals groups count)` (line 5) = {\"a\" 2, \"b\" 1}",
+        "Values of the locals in each scope the call entered, in source order:",
+        "in (defn order-totals [orders]) at line 3 (entered once): orders = [",
+        "in let at line 4 (entered once): groups = {\"a\"",
+    ] {
+        assert!(
+            diagnostics.contains(needle),
+            "missing {needle:?} in\n{diagnostics}"
+        );
+    }
+    // The passing example was not run again.
+    assert_eq!(h.p.executions[0].outcome.as_ref().unwrap().report.probes.len(), 1);
+    // A repair carries the values.
+    for _ in 1..SAMPLES {
+        h.answer(answer.clone());
+    }
+    assert!(
+        h.last_prompt().contains("step 2 \"sum :amount per group\""),
+        "{}",
+        h.last_prompt()
+    );
 }

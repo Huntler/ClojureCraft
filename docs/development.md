@@ -101,5 +101,30 @@ The application runs the API extraction through the sandbox helper next to its o
 build the whole workspace (`cargo build --workspace`) before `cargo run` when installing the
 documentation from the app.
 
+## Using ClojureCraft from an agent (MCP)
+
+`clojurecraft mcp` is a stdio MCP server that relays to the running application (starting it if
+needed). The repository's `.mcp.json` registers it for Claude Code as a project server (built
+and started with `cargo run`); Claude Code asks once whether to enable it when started in the
+repository. To register it elsewhere or for another client:
+
+```sh
+cargo build --workspace
+claude mcp add clojurecraft -- "$PWD/target/debug/clojurecraft" mcp
+```
+
+The skill `.claude/skills/clojurecraft/SKILL.md` tells Claude when and how to use these tools;
+Claude Code loads it in this repository, and it can be used elsewhere by copying the
+`clojurecraft` directory to `~/.claude/skills/`. The agent then calls `create_function`, optionally `generate_test_cases` and
+`review_test_cases`, `generate`, `status` with `wait_seconds`, and `result`. Set
+`CLOJURECRAFT_DATA_DIR` in the client's environment for a scratch library, and
+`CLOJURECRAFT_MCP_NO_LAUNCH=1` to fail instead of starting the application. The protocol can be
+exercised by hand:
+
+```sh
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_functions"}}' \
+    | ./target/debug/clojurecraft mcp
+```
+
 Inference checks (`smoke-model`) are local and manual: they need real weights and, for GPU
 backends, a GPU. They are never part of automated CI.

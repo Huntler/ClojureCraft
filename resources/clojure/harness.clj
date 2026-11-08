@@ -8,7 +8,8 @@
 ;;    :equality {:float-tolerance 1e-9 :unordered false}
 ;;    :call-ms 5000 :max-elements 1000000
 ;;    :output-chars 4000000                              ; optional: print results unbounded up to this length
-;;    :probe-code "<source with probes>"}               ; optional: record intermediate values
+;;    :probe-code "<source with probes>"                ; optional: record intermediate values
+;;    :probe-failing-only true}                          ; optional: instrumented runs only of failing calls
 ;; and writes one JSON object per line to stdout as it goes:
 ;;   read, check, lint, load       the stages before any call
 ;;   start {index}                 a call begins (so a process that dies mid-call is attributable)
@@ -587,6 +588,14 @@
         class-of (fn [^StackTraceElement e] (.getClassName e))
         own? (fn [e] (.startsWith ^String (class-of e) prefix))
         user (first (filter own? frames))
+        ;; Every frame in the candidate's code, innermost first: the calls that were running.
+        own-lines (->> frames
+                       (filter own?)
+                       (map #(.getLineNumber ^StackTraceElement %))
+                       (filter pos?)
+                       dedupe
+                       (take 8)
+                       vec)
         before (take-while (complement own?) frames)
         core (first (filter #(.startsWith ^String (class-of %) "clojure.core$") before))
         ;; The runtime method the candidate's code called directly, not its internal helpers.
@@ -594,6 +603,8 @@
     (cond-> {}
       (and user (pos? (.getLineNumber ^StackTraceElement user)))
       (assoc :line (.getLineNumber ^StackTraceElement user))
+      (seq own-lines)
+      (assoc :lines own-lines)
       core
       (assoc :in (str "clojure.core/"
                       (clojure.lang.Compiler/demunge
@@ -694,10 +705,12 @@
 (defn- call-outcome
   "What a call produced, kept so that an instrumented run can be compared with it."
   [r]
-  (case (:status r)
-    "ok" (if (contains? r ::value) {:value (::value r)} {:other "ok"})
-    "error" {:error (select-keys (:error r) [:class :message])}
-    {:other (:status r)}))
+  (assoc (case (:status r)
+           "ok" (if (contains? r ::value) {:value (::value r)} {:other "ok"})
+           "error" {:error (select-keys (:error r) [:class :message])}
+           {:other (:status r)})
+         ;; Whether the call failed its check: an error, a wrong value, or a contract violation.
+         :failed (or (not= "ok" (:status r)) (false? (:match r)) (boolean (seq (:contract r))))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Intermediate values. An instrumented copy of the code (the checked code with probe calls
@@ -760,6 +773,20 @@
   [v id]
   (probe! id v))
 
+(defn record-locals!
+  "Records the current values of the locals `names` as probe `id`; only the latest values are
+   kept, so after an exception they are those of the scope that was running."
+  [id names values]
+  (when-let [state @probe-state]
+    (let [{:keys [n] :or {n 0}} (get state id)]
+      (reset! probe-state (assoc state id {:n (inc n) :locals (mapv vector names values)})))))
+
+(defmacro probe-locals!
+  "Records the locals `names` as probe `id` whenever evaluation reaches `expr`, then evaluates
+   `expr` (in tail position, so `recur` inside it still works)."
+  [id names expr]
+  `(do (record-locals! ~id ~(mapv str names) ~names) ~expr))
+
 (def ^:private probe-heads '#{clojurecraft.harness/probe! clojurecraft.harness/probe-first})
 
 (defn- threaded-probe? [x]
@@ -770,6 +797,7 @@
    (fn [x]
      (cond
        (and (seq? x) (= 'clojurecraft.harness/probe! (first x)) (= 3 (count x))) (nth x 2)
+       (and (seq? x) (= 'clojurecraft.harness/probe-locals! (first x)) (= 4 (count x))) (nth x 3)
        (and (seq? x) (some threaded-probe? x)) (apply list (remove threaded-probe? x))
        :else x))
    form))
@@ -796,7 +824,7 @@
                                         (:class (error-map :call (:error run)))))
     :else false))
 
-(defn- run-probes [{:keys [forms probe-code fname calls outcomes opts]}]
+(defn- run-probes [{:keys [forms probe-code fname calls outcomes opts failing-only]}]
   (let [{:keys [call-ms max-elements]} opts
         setup (try
                 (let [probe-forms (read-all probe-code)]
@@ -815,7 +843,8 @@
       (emit {:event "probe-setup" :ok false :message e})
       (do
         (emit {:event "probe-setup" :ok true})
-        (doseq [[i call original] (map vector (range) calls outcomes)]
+        (doseq [[i call original] (map vector (range) calls outcomes)
+                :when (or (not failing-only) (:failed original))]
           (reset! probe-state {})
           (let [run (in-thread
                      (fn []
@@ -830,8 +859,10 @@
                    :status (cond (= run ::timeout) "timeout" (:error run) "error" :else "ok")
                    :message (when-let [t (and (map? run) (:error run))] (str (.getMessage ^Throwable t)))
                    :consistent (and (not= run ::timeout) (same-outcome? original run))
-                   :probes (vec (for [[id {:keys [n values]}] (sort-by key captured)]
-                                  {:id id :count n :values values}))})
+                   :probes (vec (for [[id {:keys [n values locals]}] (sort-by key captured)]
+                                  (cond-> {:id id :count n :values (or values [])}
+                                    locals (assoc :locals (mapv (fn [[nm v]] (assoc (preview v) :name nm))
+                                                                locals)))))})
             (when (= run ::timeout)
               (emit {:event "halted"})
               (.halt (Runtime/getRuntime) 0))))))))
@@ -887,7 +918,8 @@
                                      (recur (inc i) (next calls) (conj outcomes (call-outcome r))))))))]
               (when-let [probe-code (:probe-code request)]
                 (run-probes {:forms forms :probe-code probe-code :fname fname :calls calls
-                             :outcomes outcomes :opts opts})))))))
+                             :outcomes outcomes :opts opts
+                             :failing-only (:probe-failing-only request)})))))))
     (emit {:event "done"})))
 
 (let [request (edn/read-string (slurp *in*))]

@@ -25,9 +25,18 @@ use clojurecraft_domain::{
 };
 
 use crate::deps;
+use crate::insert;
+use crate::intermediate::{self, StepLines, StepProbes};
+use crate::locals::{self, Locals};
 use crate::requests::Names;
 use crate::spec;
 use crate::structure::{self, CodeStructure, Expectations, ProblemKind};
+
+/// Failing calls whose recorded values a failure summary includes.
+const MAX_CALLS_WITH_VALUES: usize = 2;
+/// How diagnostics with recorded values begin (see [`crate::locals`] and
+/// [`crate::intermediate::describe_steps`]).
+const VALUES_PREFIX: &str = "Values ";
 
 /// Longest diagnostic line kept in a report.
 const MAX_DIAGNOSTIC_CHARS: usize = 2000;
@@ -59,6 +68,10 @@ pub struct Plan {
     /// The request for the harness; `None` when the source cannot be run (parse or structure
     /// problems).
     pub request: Option<EvalRequest>,
+    /// The scopes whose locals the instrumented copy records (see [`crate::locals`]).
+    pub locals: Option<Locals>,
+    /// The steps whose values the instrumented copy records (see [`crate::intermediate`]).
+    pub steps: Option<StepProbes>,
 }
 
 impl Plan {
@@ -165,8 +178,29 @@ pub fn equality(doc: &FunctionDocument) -> Equality {
 }
 
 /// Plans checking `source` against `doc`'s specification. `names` are the namespace and
-/// function the code is expected to define; a different name is only a warning.
+/// function the code is expected to define; a different name is only a warning. When `source`
+/// is the explained implementation, failing calls show the values of its steps.
 pub fn plan(doc: &FunctionDocument, source: &str, names: &Names) -> Plan {
+    plan_with_steps(
+        doc,
+        source,
+        names,
+        intermediate::explained_step_lines(doc, source),
+    )
+}
+
+/// [`plan`] with the lines of the code that carries out each step, for example as the model
+/// stated them with generated code.
+///
+/// Every failing call is run again with an instrumented copy of the code that records the value
+/// of each step's code and the locals of every function and binding form, so its diagnostics
+/// show where the data flow went wrong.
+pub fn plan_with_steps(
+    doc: &FunctionDocument,
+    source: &str,
+    names: &Names,
+    step_lines: Option<StepLines>,
+) -> Plan {
     let allowed = deps::allowed(doc);
     let structure = structure::check(
         source,
@@ -179,6 +213,8 @@ pub fn plan(doc: &FunctionDocument, source: &str, names: &Names) -> Plan {
     let calls = planned_calls(doc);
     let output_rules = output_rules(doc);
     let equality = equality(doc);
+    let mut locals = None;
+    let mut steps = None;
     let request = match (&structure.function, structure.problems.is_empty()) {
         (Some(function), true) => {
             let mut r = EvalRequest::new(
@@ -196,6 +232,32 @@ pub fn plan(doc: &FunctionDocument, source: &str, names: &Names) -> Plan {
             r.equality = equality;
             r.call_timeout = CALL_TIMEOUT;
             r.max_elements = MAX_ELEMENTS;
+            let mut insertions = Vec::new();
+            if let Some(lines) = step_lines.filter(|l| l.iter().any(|(_, r)| r.is_ok()))
+                && let Ok((targets, plans, ins)) = intermediate::step_probes(source, &lines)
+                && !ins.is_empty()
+            {
+                let texts = crate::requests::numbered_steps(doc)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.id, i + 1, s.text.trim().to_owned()))
+                    .collect();
+                steps = Some(StepProbes {
+                    targets,
+                    plans,
+                    texts,
+                });
+                insertions.extend(ins);
+            }
+            let first_id = steps.as_ref().map_or(0, |s| s.targets.len());
+            if let Some((l, ins)) = locals::instrument(source, first_id) {
+                locals = Some(l);
+                insertions.extend(ins);
+            }
+            if !insertions.is_empty() {
+                r.probe_code = Some(insert::apply(source, &insertions));
+                r.probe_failing_only = true;
+            }
             Some(r)
         }
         _ => None,
@@ -207,6 +269,8 @@ pub fn plan(doc: &FunctionDocument, source: &str, names: &Names) -> Plan {
         output_rules,
         equality,
         request,
+        locals,
+        steps,
     }
 }
 
@@ -302,7 +366,7 @@ fn process_failure(status: &EvalStatus, stderr: &str) -> (CheckStatus, String) {
     }
 }
 
-fn call_check(call: &PlannedCall, r: &CallResult) -> Check {
+fn call_check(call: &PlannedCall, r: &CallResult, values: Vec<String>) -> Check {
     let mut c = check(call.subject, CheckStatus::Passed, Vec::new());
     c.expected = Some(Edn::new(bounded(&call.expected, MAX_VALUE_CHARS)));
     c.actual = r.actual.as_deref().map(Edn::new);
@@ -354,7 +418,26 @@ fn call_check(call: &PlannedCall, r: &CallResult) -> Check {
             MAX_DIAGNOSTIC_CHARS,
         ));
     }
+    if c.status != CheckStatus::Passed {
+        c.diagnostics
+            .extend(values.iter().map(|v| bounded(v, MAX_DIAGNOSTIC_CHARS)));
+    }
     c
+}
+
+/// What the instrumented run of a failing call recorded: the values after each step, then the
+/// locals around an exception or, for a wrong value, of every scope the call entered.
+fn values(plan: &Plan, result: &CallResult, run: &clojurecraft_clojure::ProbeCall) -> Vec<String> {
+    let steps = plan
+        .steps
+        .as_ref()
+        .and_then(|s| intermediate::describe_steps(s, run));
+    let locals = plan.locals.as_ref().and_then(|l| match &result.error {
+        Some(e) if result.status == CallStatus::Error => locals::describe(l, e, run),
+        _ if result.status == CallStatus::Ok => locals::describe_returned(l, run),
+        _ => None,
+    });
+    steps.into_iter().chain(locals).collect()
 }
 
 /// Builds the report for `plan` from the harness outcome, or from the reason it could not run.
@@ -572,7 +655,13 @@ fn checks(plan: &Plan, outcome: Result<&EvalOutcome, &str>) -> Vec<Check> {
                     contract_checked = true;
                     contract.extend(result.contract.iter().map(|p| format!("{}: {p}", call.label)));
                 }
-                out.push(call_check(call, result));
+                let values = r
+                    .probes
+                    .iter()
+                    .find(|p| p.index == i)
+                    .map(|p| values(plan, result, p))
+                    .unwrap_or_default();
+                out.push(call_check(call, result, values));
             }
             None if r.halted => skip(
                 &mut out,
@@ -614,7 +703,11 @@ fn checks(plan: &Plan, outcome: Result<&EvalOutcome, &str>) -> Vec<Check> {
 pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut omitted = 0;
-    let mut used = 0;
+    // Linter warnings do not fail the code, but next to failing checks they often point at the
+    // cause: a value that is computed and then dropped, or a binding shadowed by mistake.
+    let warnings = lint_warnings(report);
+    let mut used = warnings.as_ref().map_or(0, String::len);
+    let mut with_values = 0;
     for c in &report.checks {
         if matches!(c.status, CheckStatus::Passed | CheckStatus::Skipped) {
             // Lint warnings on passing code are useful context, but only errors fail.
@@ -629,13 +722,24 @@ pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize)
             CheckStatus::Passed | CheckStatus::Skipped => "",
         };
         let mut text = format!("{} — {status}", plan.label(&c.subject));
+        // Recorded values are long; the first failing calls show where the data flow breaks.
+        let show_values = with_values < MAX_CALLS_WITH_VALUES;
+        let mut had_values = false;
         let errors: Vec<&String> = c
             .diagnostics
             .iter()
             .filter(|d| !d.starts_with("warning:") && !d.contains(": warning:"))
+            .filter(|d| {
+                let values = d.starts_with(VALUES_PREFIX);
+                had_values |= values;
+                show_values || !values
+            })
             .collect();
+        if had_values {
+            with_values += 1;
+        }
         for d in errors {
-            text.push_str(&format!("\n  {}", bounded(d, 600)));
+            text.push_str(&format!("\n  {}", bounded(d, 1600)));
         }
         if let (Some(e), CheckSubject::Example(_) | CheckSubject::Test(_)) = (&c.expected, c.subject) {
             if let Some(call) = plan.calls.iter().find(|p| p.subject == c.subject) {
@@ -656,7 +760,31 @@ pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize)
     if omitted > 0 {
         parts.push(format!("({omitted} more failing checks are not shown.)"));
     }
+    if !parts.is_empty() {
+        parts.extend(warnings);
+    }
     parts.join("\n\n")
+}
+
+/// The linter's warnings in a report, as a section of a failure summary.
+fn lint_warnings(report: &ValidationReport) -> Option<String> {
+    let lint = report.checks.iter().find(|c| c.subject == CheckSubject::Lint)?;
+    let warnings: Vec<String> = lint
+        .diagnostics
+        .iter()
+        .filter(|d| d.starts_with("warning:") || d.contains(": warning:"))
+        .take(8)
+        .map(|d| format!("\n  {}", bounded(d, 200)))
+        .collect();
+    if warnings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Linter warnings — check whether one of these causes a failure above: a value that is \
+         computed but never used usually means the result of a step is dropped instead of being \
+         passed on.{}",
+        warnings.concat()
+    ))
 }
 
 /// Counts of a report's checks, for a short status line.
@@ -878,10 +1006,13 @@ mod tests {
             summary.contains("Input: [1 2]\n  Expected: 3\n  Actual: 4"),
             "{summary}"
         );
-        assert!(
-            !summary.contains("warning"),
-            "warnings are not failures: {summary}"
+        // Warnings are no failing check, but are listed once as possible causes.
+        assert_eq!(
+            summary.matches("x is bound but never used").count(),
+            1,
+            "{summary}"
         );
+        assert!(summary.contains("Linter warnings"), "{summary}");
     }
 
     #[test]
@@ -1015,7 +1146,34 @@ mod tests {
         );
         let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &stdout)));
         let s = failure_summary(&p, &r, 250);
-        assert!(s.len() < 400, "{s}");
+        assert!(s.len() < 600, "{s}");
         assert!(s.contains("more failing checks are not shown"), "{s}");
+    }
+
+    #[test]
+    fn summaries_of_failing_code_carry_the_linter_warnings() {
+        let d = doc();
+        let p = plan(&d, GOOD, &names());
+        let failing = format!(
+            "{STAGES}{}\n{}\n{}\n{{\"event\":\"done\"}}\n",
+            result(0, false),
+            result(1, true),
+            result(2, true)
+        );
+        let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &failing)));
+        let s = failure_summary(&p, &r, 6000);
+        assert!(s.contains("expected 3 but got 4"), "{s}");
+        assert!(s.contains("Linter warnings"), "{s}");
+        assert!(s.contains("line 2: warning: x is bound but never used"), "{s}");
+
+        // Warnings alone are no failure.
+        let passing = format!(
+            "{STAGES}{}\n{}\n{}\n{{\"event\":\"done\"}}\n",
+            result(0, true),
+            result(1, true),
+            result(2, true)
+        );
+        let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &passing)));
+        assert_eq!(failure_summary(&p, &r, 6000), "");
     }
 }

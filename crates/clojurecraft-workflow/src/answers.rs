@@ -396,10 +396,25 @@ pub fn parse_contract(
 
 // ---- generation -------------------------------------------------------------------------------
 
+/// Step references a generation answer may give at most, and the length of each quote.
+pub const MAX_STEP_REFERENCES: usize = 20;
+pub const MAX_STEP_QUOTE: usize = 400;
+
 pub fn generation_schema() -> Schema {
     Schema::object(vec![
         Field::required("code", Schema::string())
             .describe("the complete Clojure source: the ns declaration followed by the definitions"),
+        Field::required(
+            "steps",
+            Schema::array(
+                Schema::object(vec![
+                    Field::required("step", Schema::integer(Some(1), Some(99))),
+                    Field::required("code", prose(MAX_STEP_QUOTE))
+                        .describe("the code from \"code\" that carries out the step, copied exactly"),
+                ]),
+                Some(MAX_STEP_REFERENCES),
+            ),
+        ),
         Field::required("assumptions", strings(8)),
     ])
 }
@@ -408,6 +423,8 @@ pub fn generation_schema() -> Schema {
 pub struct GeneratedCode {
     pub code: String,
     pub assumptions: Vec<String>,
+    /// For each transformation step (numbered from 1), the code the model says carries it out.
+    pub steps: Vec<(u32, String)>,
     /// The code arrived escaped twice (line breaks as `\n` text) and was unescaped.
     pub unescaped: bool,
 }
@@ -427,6 +444,14 @@ fn undo_double_escaping(code: &str) -> Option<String> {
 struct RawGeneration {
     code: String,
     assumptions: Vec<String>,
+    #[serde(default)]
+    steps: Vec<RawStepReference>,
+}
+
+#[derive(Deserialize)]
+struct RawStepReference {
+    step: u32,
+    code: String,
 }
 
 /// Removes a Markdown code fence the model may have put around the code.
@@ -456,6 +481,12 @@ pub fn parse_generation(v: &Value) -> Result<GeneratedCode, String> {
     Ok(GeneratedCode {
         code,
         assumptions: items(&raw.assumptions, MAX_ITEM),
+        steps: raw
+            .steps
+            .iter()
+            .filter(|s| !s.code.trim().is_empty())
+            .map(|s| (s.step, strip_fence(&s.code).to_owned()))
+            .collect(),
         unescaped: unescaped.is_some(),
     })
 }
@@ -581,7 +612,10 @@ mod tests {
                        "output": {"description": "", "value_type": "map", "keys": []},
                        "ordering": "unspecified", "sorted_by": "", "notes": ""}),
             ),
-            (generation_schema(), json!({"code": "(ns a)", "assumptions": []})),
+            (
+                generation_schema(),
+                json!({"code": "(ns a)", "steps": [{"step": 1, "code": "(ns a)"}], "assumptions": []}),
+            ),
             (
                 explanation_schema(2),
                 json!({"summary": "s", "steps": [{"step": 2, "code": "c", "explanation": "e"}], "symbols": []}),
@@ -650,6 +684,12 @@ mod tests {
         assert!(parse_generation(&json!({"code": "  ", "assumptions": []})).is_err());
         let huge = json!({"code": "x".repeat(MAX_CODE_CHARS + 1), "assumptions": []});
         assert!(parse_generation(&huge).unwrap_err().contains("longer than"));
+        let with_steps = json!({"code": "(ns a)", "assumptions": [],
+                                "steps": [{"step": 1, "code": "(inc x)"}, {"step": 2, "code": " "}]});
+        assert_eq!(
+            parse_generation(&with_steps).unwrap().steps,
+            [(1, "(inc x)".to_owned())]
+        );
     }
 
     #[test]

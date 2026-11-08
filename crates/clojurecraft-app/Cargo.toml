@@ -24,8 +24,10 @@ clojurecraft-store.workspace = true
 clojurecraft-domain.workspace = true
 clojurecraft-edn.workspace = true
 clojurecraft-workflow.workspace = true
+clojurecraft-mcp.workspace = true
 eframe.workspace = true
 egui.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
