@@ -439,6 +439,22 @@ fn lint_reports_errors_and_warnings_with_lines_before_loading() {
 }
 
 #[test]
+fn a_value_thrown_away_by_a_misplaced_parenthesis_is_a_lint_error() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.dropped)\n(defn f [s]\n  (let [[a b] (seq s)]\n    (if (and a b)\n      {:a a :b b})\n    nil))";
+    let req = EvalRequest::new(code, "f", vec![call("\"xy\"", Some("{:a \\x :b \\y}"))]);
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let lint = out.report.lint.clone().unwrap_or_default();
+    assert!(
+        lint.iter().any(|f| f.level == LintLevel::Error
+            && f.line == Some(4)
+            && f.message
+                .starts_with("the value of (if (and a b) {:a a, :b b}) is thrown away")),
+        "{lint:?}"
+    );
+}
+
+#[test]
 fn idiomatic_code_lints_clean() {
     let Some(rt) = runtime() else { return };
     let code = r#"(ns t.clean (:require [clojure.string :as str] [clojure.set :as set]))

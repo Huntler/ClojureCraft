@@ -42,11 +42,15 @@ All EDN values (`input`, `expected`, keys, defaults) are **strings**: `"[{:id 1 
    - a clear `name` (it becomes the function name in kebab-case, in namespace `<name>.core`);
    - a `description` that states the input shape, the output shape, and the rules;
    - `steps` for the transformation, in order;
-   - **at least 2–3 `examples`** covering the normal case and one tricky case;
+   - **at least 2–3 small `examples`, one per case** (one line, one record each: the normal
+     case, an optional part missing, an edge value). One big example that mixes every case hides
+     which case fails, and one crash fails it all;
    - a `contract` when output types or keys matter, for example
      `{"input": {"type": "vector"}, "output": {"type": "map"}, "ordering": "unordered"}`.
 
-   If `readiness.blocking` is not empty, fix it with `update_function`.
+   If `readiness.blocking` is not empty, fix it with `update_function`. It also lists expected
+   outputs that contradict the contract (for example a key marked `required` that an example
+   leaves out); no code can pass those, so fix the contract or the example.
 2. **Edge cases (recommended).** Call `generate_test_cases`, then `status` with
    `wait_seconds: 120`, then `get_function`. Review each proposed case **critically**: the
    local model sometimes writes nonsense expectations (for example `"defined"`). Accept cases
@@ -76,6 +80,12 @@ All EDN values (`input`, `expected`, keys, defaults) are **strings**: `"[{:id 1 
   (`generate_test_cases`) are refused while the model is busy: wait with `status`, then retry.
 - Do not patch generated code by hand. Change the specification or the tests and regenerate,
   so the checks stay the source of truth.
+- **Keep each function small.** The local model usually writes one grouping, sorting, or
+  aggregation, or the parsing of **one** token format (`"3@10"` → `{:sets 3 :reps 10}`) on the
+  first job. It fails on parsers that split a line into several differently formatted fields. Generate one
+  function per field format and compose them (and the line splitting) in your own glue code.
+- In `status`, an attempt that failed exactly like an earlier one shows `same_failure_as`
+  instead of repeating the failure.
 - **Budget rule:** after 2 failed `generate` jobs on one function, simplify or split its
   specification. After 3, write the code yourself and send it with `submit_code` (keep the
   `namespace` and `function` from `result`), then fix it from the `status` failures. Do not keep

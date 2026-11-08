@@ -421,6 +421,27 @@ fn attempt(doc: &FunctionDocument, a: &Attempt, detail: Detail) -> Value {
     v
 }
 
+/// Attempts in order; a failure identical to the previous attempt's is named, not repeated.
+fn attempt_list(doc: &FunctionDocument, attempts: &[Attempt], detail: Detail) -> Vec<Value> {
+    let mut previous: Option<(Value, Value)> = None;
+    attempts
+        .iter()
+        .map(|a| {
+            let mut v = attempt(doc, a, detail);
+            let failure = v.as_object_mut().and_then(|o| o.remove("first_failure"));
+            match (failure, &previous) {
+                (Some(f), Some((seen, first))) if f == *seen => v["same_failure_as"] = first.clone(),
+                (Some(f), _) => {
+                    previous = Some((f.clone(), v["attempt"].clone()));
+                    v["first_failure"] = f;
+                }
+                (None, _) => previous = None,
+            }
+            v
+        })
+        .collect()
+}
+
 /// How the last job ended.
 pub fn last_job(doc: &FunctionDocument, r: &Report, detail: Detail) -> Value {
     let notes = |n: &[String]| n.iter().map(|s| shorten(s, DIAGNOSTIC_CHARS)).collect::<Vec<_>>();
@@ -476,7 +497,7 @@ pub fn last_job(doc: &FunctionDocument, r: &Report, detail: Detail) -> Value {
             notes: n,
         } => json!({
             "outcome": "all_attempts_failed",
-            "attempts": attempts.iter().map(|a| attempt(doc, a, detail)).collect::<Vec<_>>(),
+            "attempts": attempt_list(doc, attempts, detail),
             "best_candidate_available": best.is_some(),
             "notes": notes(n),
         }),
@@ -773,6 +794,34 @@ mod tests {
         assert_eq!(r["passes_all_checks"], true);
         assert_eq!(r["namespace"], "sum-numbers.core");
         assert_eq!(r["function"], "sum-numbers");
+    }
+
+    #[test]
+    fn repeated_attempt_failures_are_named_instead_of_repeated() {
+        let d = doc();
+        let failing = report_for(&d, d.basis(), false);
+        let att = |number| Attempt {
+            number,
+            code: Some("(ns sum-numbers.core)".into()),
+            report: Some(failing.clone()),
+            note: None,
+        };
+        let empty = Attempt {
+            number: 4,
+            code: None,
+            report: None,
+            note: Some("cut off".into()),
+        };
+        let list = attempt_list(&d, &[att(1), att(2), att(3), empty, att(5)], Detail::Compact);
+        assert!(list[0]["first_failure"].is_object());
+        assert_eq!(list[1]["same_failure_as"], 1);
+        assert_eq!(list[2]["same_failure_as"], 1);
+        assert!(list[1].get("first_failure").is_none());
+        assert!(list[3].get("same_failure_as").is_none());
+        assert!(
+            list[4]["first_failure"].is_object(),
+            "a failure after a different attempt is shown again"
+        );
     }
 
     #[test]

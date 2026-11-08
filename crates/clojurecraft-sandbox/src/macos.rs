@@ -50,8 +50,11 @@ pub fn apply_rlimits(policy: &Policy) -> Result<(), SetupError> {
     Ok(())
 }
 
+/// Quotes `p` for the profile. Seatbelt matches resolved paths, so symlinks such as
+/// `/var -> /private/var` are resolved first.
 fn quote(p: &Path) -> String {
-    let s = p.to_string_lossy();
+    let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let s = resolved.to_string_lossy();
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -60,7 +63,8 @@ pub fn profile(policy: &Policy) -> String {
     let mut p = String::from(
         "(version 1)\n(deny default)\n(allow process-exec*)\n(deny process-fork)\n(deny network*)\n\
          (allow file-read-metadata)\n(allow sysctl-read)\n(allow signal (target self))\n\
-         (allow file-read* file-write-data (literal \"/dev/null\"))\n",
+         (allow file-read* file-write-data (literal \"/dev/null\"))\n\
+         (allow file-read* (literal \"/\"))\n",
     );
     for dir in &policy.exec {
         let _ = writeln!(

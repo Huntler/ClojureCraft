@@ -36,6 +36,7 @@ pub mod diff;
 pub mod edge_cases;
 pub mod export;
 pub mod grammar;
+pub mod idioms;
 mod insert;
 pub mod intermediate;
 pub mod locals;

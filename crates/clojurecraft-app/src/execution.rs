@@ -202,6 +202,14 @@ impl ExecutionState {
         }
     }
 
+    /// Whether the Java runtime and Clojure are installed.
+    pub fn installed(&self) -> bool {
+        self.env.as_ref().is_ok_and(|(dirs, manifest)| {
+            components::java(manifest, dirs, &platform_key()).is_some()
+                && components::clojure_jars(manifest, dirs).is_some()
+        })
+    }
+
     /// Downloads and verifies the pinned Java runtime and Clojure.
     pub fn install(&mut self) {
         if matches!(self.install, InstallState::Running { .. }) {

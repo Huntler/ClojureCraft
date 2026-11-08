@@ -114,6 +114,10 @@ pub fn server_args(cfg: &ServerConfig, host: &str, port: Option<u16>) -> Vec<Str
             // Thinking models: reasoning arrives separately from the answer.
             "--reasoning-format",
             "deepseek",
+            // Draft tokens from n-grams already seen (the prompt, earlier answers): repairs and
+            // further candidates repeat most of the code, which roughly doubles decoding speed.
+            "--spec-type",
+            "ngram-mod",
             "--no-webui",
             "--no-slots",
             "--sse-ping-interval",
@@ -479,6 +483,7 @@ mod tests {
             "--no-context-shift",
             "--no-webui",
             "--parallel 1",
+            "--spec-type ngram-mod",
         ] {
             assert!(a.contains(expected), "{expected} missing from {a}");
         }
@@ -523,6 +528,7 @@ mod tests {
             assert!(a.contains(expected), "{expected} missing from {a}");
         }
         assert!(!a.contains("--jinja"), "{a}");
+        assert!(!a.contains("--spec-type"), "{a}");
     }
 
     #[test]

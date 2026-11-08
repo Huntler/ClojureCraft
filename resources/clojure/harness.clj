@@ -218,6 +218,20 @@
 
 (defn- new-binding [sym line] {:sym sym :line line :used (volatile! false)})
 
+(defn- check-discarded
+  "Forms written in the source before the last form of a body: in pure code their value is lost."
+  [ctx body line]
+  (doseq [f (butlast body)]
+    (when (and (seq? f) (:line (meta f))
+               (not (contains? '#{throw assert when when-not comment} (first f))))
+      (finding! ctx :error (line-of f line)
+                (str "the value of " (binding [*print-length* 3 *print-level* 3] (pr-str f))
+                     " is thrown away: a let, fn, or do body returns only its last form."
+                     " Check the parentheses, so that this form's value is used or returned."
+                     " Clojure data is immutable: (assoc m k v) returns a new map and leaves m unchanged,"
+                     " so apply optional changes in one expression, such as"
+                     " (cond-> m has-a? (assoc :a a) has-b? (assoc :b b))")))))
+
 (defn- warn-unused [ctx bindings]
   (doseq [{:keys [sym line used]} bindings]
     (when (and (not @used) (not (ignorable-name? sym)))
@@ -236,6 +250,7 @@
 (defn- analyze-fn-method [[params & body] env ctx line]
   (let [bs (mapv #(new-binding % line) (remove #{'&} params))
         env (into env (map (juxt :sym identity) bs))]
+    (check-discarded ctx body line)
     (analyze-all body env (assoc ctx :in-fn true) line)
     (warn-unused ctx bs)))
 
@@ -302,12 +317,14 @@
               (finding! ctx :error line "def inside a function defines a global var on every call; use let"))
             (analyze-all (drop 2 form) env ctx line))
     (let* loop*) (let [[env bs] (analyze-bindings (second form) env ctx line)]
+                   (check-discarded ctx (drop 2 form) line)
                    (analyze-all (drop 2 form) env ctx line)
                    (warn-unused ctx bs))
     letfn* (let [pairs (partition 2 (second form))
                  bs (mapv (fn [[sym _]] (new-binding sym line)) pairs)
                  env (into env (map (juxt :sym identity) bs))]
              (doseq [[_ f] pairs] (analyze f env ctx line))
+             (check-discarded ctx (drop 2 form) line)
              (analyze-all (drop 2 form) env ctx line)
              (warn-unused ctx bs))
     fn* (analyze-fn form env ctx line)
@@ -320,6 +337,8 @@
           (analyze-all (rest member) env ctx line)
           (analyze-all args env ctx line)))
     new (analyze-all (drop 2 form) env ctx line)
+    do (do (check-discarded ctx (rest form) line)
+           (analyze-all (rest form) env ctx line))
     (analyze-all (rest form) env ctx line)))
 
 (defn- analyze-call [form env ctx line]

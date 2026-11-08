@@ -78,6 +78,92 @@ pub fn usable_examples(doc: &FunctionDocument) -> Vec<(String, &Example, &str)> 
         .collect()
 }
 
+/// Whether `node` has type `t`; `None` when the type cannot be checked mechanically.
+fn type_matches(t: &ValueType, node: &clojurecraft_edn::Node) -> Option<bool> {
+    use clojurecraft_edn::NodeKind as K;
+    let k = &node.kind;
+    Some(match t {
+        ValueType::Nil => matches!(k, K::Nil),
+        ValueType::Boolean => matches!(k, K::Boolean(_)),
+        ValueType::Integer => matches!(k, K::Integer),
+        ValueType::Number => matches!(k, K::Integer | K::Float | K::Ratio),
+        ValueType::String => matches!(k, K::String(_)),
+        ValueType::Keyword => matches!(k, K::Keyword),
+        ValueType::Symbol => matches!(k, K::Symbol),
+        ValueType::Map => matches!(k, K::Map(_)),
+        ValueType::Vector => matches!(k, K::Vector(_)),
+        ValueType::List => matches!(k, K::List(_)),
+        ValueType::Set => matches!(k, K::Set(_)),
+        ValueType::Sequential => matches!(k, K::List(_) | K::Vector(_)),
+        ValueType::Any | ValueType::Other(_) => return None,
+    })
+}
+
+fn map_problems(
+    src: &str,
+    entries: &[(clojurecraft_edn::Node, clojurecraft_edn::Node)],
+    keys: &[KeySpec],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in keys {
+        let key = k.key.as_str().trim();
+        let Some((_, v)) = entries.iter().find(|(kn, _)| kn.text(src).trim() == key) else {
+            if k.required {
+                out.push(format!("required key {key} is missing"));
+            }
+            continue;
+        };
+        if matches!(v.kind, clojurecraft_edn::NodeKind::Nil) {
+            if k.nil == NilBehavior::Disallowed {
+                out.push(format!("key {key} is nil, but nil is not allowed"));
+            }
+        } else if type_matches(&k.value_type, v) == Some(false) {
+            out.push(format!(
+                "key {key} is {}, not {}",
+                v.type_name(),
+                type_text(&k.value_type)
+            ));
+        }
+    }
+    out
+}
+
+/// Where an expected output contradicts the accepted output contract, so no code could pass both.
+pub fn expected_contract_problems(c: &Shape, expected: &str) -> Vec<String> {
+    use clojurecraft_edn::NodeKind as K;
+    let parsed = parse_value(expected);
+    let Some(value) = parsed.values.first().filter(|_| !parsed.has_errors()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if type_matches(&c.value_type, value) == Some(false) {
+        out.push(format!(
+            "it is {}, but the contract's output type is {}",
+            value.type_name(),
+            type_text(&c.value_type)
+        ));
+    }
+    if !c.keys.is_empty() {
+        match &value.kind {
+            K::Map(entries) => out.extend(map_problems(expected, entries, &c.keys)),
+            K::List(items) | K::Vector(items) | K::Set(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if let K::Map(entries) = &item.kind {
+                        out.extend(
+                            map_problems(expected, entries, &c.keys)
+                                .into_iter()
+                                .map(|p| format!("element {i}: {p}")),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.truncate(5);
+    out
+}
+
 pub fn readiness(doc: &FunctionDocument) -> Readiness {
     let mut r = Readiness::default();
     let mut usable = 0;
@@ -149,6 +235,27 @@ pub fn readiness(doc: &FunctionDocument) -> Readiness {
                     r.blocking.push(format!(
                         "Contract {side}: the default for {} is not valid EDN: {err}.",
                         k.key.as_str()
+                    ));
+                }
+            }
+        }
+        if r.blocking.is_empty() {
+            let mut expected: Vec<(String, &str)> = usable_examples(doc)
+                .into_iter()
+                .map(|(label, e, _)| (label, e.expected.as_str()))
+                .collect();
+            for (n, t) in doc.tests.iter().filter(|t| t.is_active()).enumerate() {
+                if let Expectation::Value { expected: v } = &t.expectation {
+                    expected.push((test_label(n, t), v.as_str()));
+                }
+            }
+            for (label, value) in expected {
+                let problems = expected_contract_problems(&c.output, value);
+                if !problems.is_empty() {
+                    r.blocking.push(format!(
+                        "{label}: the expected output contradicts the accepted contract ({}). Change \
+                         the contract or the expected output.",
+                        problems.join("; ")
                     ));
                 }
             }
@@ -341,6 +448,63 @@ mod tests {
             Edn::new("{1 2}"),
         )];
         doc
+    }
+
+    fn key(k: &str, required: bool, t: ValueType, nil: NilBehavior) -> KeySpec {
+        KeySpec {
+            key: Edn::new(k),
+            required,
+            value_type: t,
+            nil,
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_expected_output_missing_a_required_contract_key_blocks_generation() {
+        let mut d = FunctionDocument::new("parse workout");
+        d.description = "Parse text input line by line into structured maps".into();
+        d.examples = vec![Example::direct(
+            "",
+            Edn::new(r#""2026-12-01 Pull-up 3@10 5kg\n2026-12-03 Jogging""#),
+            Edn::new(
+                r#"[{:date "2026-12-01" :workout "pull-up" :sets 3} {:date "2026-12-03" :workout "jogging"}]"#,
+            ),
+        )];
+        let mut c = crate::deps::new_contract(ContractStatus::Accepted);
+        c.output.keys = vec![
+            key(":date", true, ValueType::String, NilBehavior::Disallowed),
+            key(":sets", true, ValueType::Number, NilBehavior::TreatAsMissing),
+        ];
+        d.contract = Some(c);
+        let r = readiness(&d);
+        assert_eq!(r.blocking.len(), 1, "{r:?}");
+        assert!(r.blocking[0].starts_with("Example 1:"), "{r:?}");
+        assert!(
+            r.blocking[0].contains("element 1: required key :sets is missing"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn expected_outputs_are_checked_against_contract_types_and_nil_rules() {
+        let mut shape = Shape {
+            value_type: ValueType::Vector,
+            ..Shape::default()
+        };
+        shape.keys = vec![
+            key(":n", false, ValueType::Integer, NilBehavior::Disallowed),
+            key(":s", false, ValueType::Any, NilBehavior::Unspecified),
+        ];
+        assert!(expected_contract_problems(&shape, "[{:n 1 :s 2} {}]").is_empty());
+        assert_eq!(
+            expected_contract_problems(&shape, "({:n 1.5} {:n nil})"),
+            vec![
+                "it is list, but the contract's output type is vector".to_owned(),
+                "element 0: key :n is decimal, not integer".to_owned(),
+                "element 1: key :n is nil, but nil is not allowed".to_owned(),
+            ]
+        );
     }
 
     fn texts(doc: &FunctionDocument) -> String {

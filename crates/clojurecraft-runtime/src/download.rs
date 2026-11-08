@@ -42,6 +42,9 @@ pub enum DownloadError {
     Cancelled,
     #[error("network error: {0}")]
     Http(String),
+    /// A failure that may pass on its own (server errors, rate limits, timeouts, dropped connections).
+    #[error("network error: {0}")]
+    Temporary(String),
     #[error("the server refused access; the repository may be gated or private")]
     Unauthorized,
     #[error("not enough disk space: {needed} bytes needed, {available} available")]
@@ -127,13 +130,26 @@ pub fn download_verified_auth(
         fs::create_dir_all(parent).map_err(io_err(parent))?;
     }
     let part = part_path(dest);
-    let mut have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    if have > artifact.size {
-        fs::remove_file(&part).map_err(io_err(&part))?;
-        have = 0;
-    }
-    if have < artifact.size {
-        fetch_into(artifact, &part, have, bearer, cancel, &mut progress)?;
+    let mut attempt = 0;
+    loop {
+        let mut have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if have > artifact.size {
+            fs::remove_file(&part).map_err(io_err(&part))?;
+            have = 0;
+        }
+        if have >= artifact.size {
+            break;
+        }
+        match fetch_into(artifact, &part, have, bearer, cancel, &mut progress) {
+            Err(DownloadError::Temporary(_)) if attempt < RETRY_DELAYS.len() => {
+                wait(RETRY_DELAYS[attempt], cancel)?;
+                attempt += 1;
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
     }
     let len = fs::metadata(&part).map_err(io_err(&part))?.len();
     if len != artifact.size {
@@ -155,6 +171,27 @@ pub fn download_verified_auth(
     Ok(())
 }
 
+/// Pauses before each retry of a temporary failure; the part file is resumed afterwards.
+const RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+fn wait(delay: Duration, cancel: &Cancel) -> Result<(), DownloadError> {
+    let step = Duration::from_millis(100);
+    let mut waited = Duration::ZERO;
+    while waited < delay {
+        if cancel.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        std::thread::sleep(step);
+        waited += step;
+    }
+    Ok(())
+}
+
 fn fetch_into(
     artifact: &Artifact,
     part: &Path,
@@ -172,8 +209,11 @@ fn fetch_into(
     }
     let resp = req.call().map_err(|e| match e {
         ureq::Error::StatusCode(401 | 403) => DownloadError::Unauthorized,
+        ureq::Error::StatusCode(code @ (429 | 500..)) => {
+            DownloadError::Temporary(format!("server answered HTTP {code}"))
+        }
         ureq::Error::StatusCode(code) => DownloadError::Http(format!("server answered HTTP {code}")),
-        other => DownloadError::Http(other.to_string()),
+        other => DownloadError::Temporary(other.to_string()),
     })?;
     let resumed = have > 0 && resp.status().as_u16() == 206;
     let mut file = if resumed {
@@ -192,7 +232,7 @@ fn fetch_into(
         }
         let n = reader
             .read(&mut buf)
-            .map_err(|e| DownloadError::Http(e.to_string()))?;
+            .map_err(|e| DownloadError::Temporary(e.to_string()))?;
         if n == 0 {
             break;
         }
@@ -267,6 +307,34 @@ mod tests {
         format!("http://{addr}/file")
     }
 
+    /// Answers the first request with HTTP 503, later ones with `body`.
+    fn serve_after_outage(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let (status, slice) = if i == 0 {
+                    ("503 Service Unavailable", &b""[..])
+                } else {
+                    ("200 OK", &body[..])
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(slice);
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
     fn artifact(url: String, body: &[u8]) -> Artifact {
         Artifact {
             url,
@@ -296,16 +364,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let dest = dir.path().join("f.bin");
         let a = artifact(serve(body.clone(), true, Some(100_000)), &body);
-        let first = download_verified(&a, &dest, &Cancel::default(), |_| {});
-        assert!(first.is_err(), "truncated transfer must not verify");
-        assert!(!dest.exists());
-        assert_eq!(fs::metadata(part_path(&dest)).expect("part").len(), 100_000);
-        let mut saw_resume_start = None;
-        download_verified(&a, &dest, &Cancel::default(), |p| {
-            saw_resume_start.get_or_insert(p.received);
-        })
-        .expect("resume");
-        assert!(saw_resume_start.expect("progress") > 100_000);
+        let mut seen = Vec::new();
+        download_verified(&a, &dest, &Cancel::default(), |p| seen.push(p.received)).expect("resume");
+        assert!(seen.contains(&100_000));
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "retry restarted instead of resuming"
+        );
+        assert_eq!(fs::read(&dest).expect("read"), body);
+    }
+
+    #[test]
+    fn temporary_server_error_is_retried() {
+        let body = payload();
+        let dir = tempfile::tempdir().expect("tmp");
+        let dest = dir.path().join("f.bin");
+        let a = artifact(serve_after_outage(body.clone()), &body);
+        download_verified(&a, &dest, &Cancel::default(), |_| {}).expect("download");
         assert_eq!(fs::read(&dest).expect("read"), body);
     }
 

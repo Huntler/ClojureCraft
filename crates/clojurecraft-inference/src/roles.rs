@@ -89,7 +89,7 @@ impl Role {
                     Prefer clear, idiomatic core functions over clever code.",
                 temperature: 0.2,
                 top_p: TOP_P,
-                max_output_tokens: 2500,
+                max_output_tokens: 1800,
                 timeout: Duration::from_secs(600),
             },
             Self::Explanation => RoleProfile {

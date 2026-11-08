@@ -1,48 +1,73 @@
 //! A sampling grammar for generated code that makes unbalanced delimiters impossible.
 //!
-//! Generation answers are JSON (`{"code": …, "assumptions": […]}`), and the code is a JSON string,
-//! so every Clojure character appears JSON-escaped: a line break as `\n`, a quote as `\"`, a
-//! backslash as `\\`. The grammar describes Clojure at that escaped level: lists, vectors, and maps
-//! must close with the matching delimiter, string literals must end, and line comments run to a
-//! line break. Everything else (symbols, keywords, numbers, reader macros such as `#`, `'`, `@`,
-//! `^`) is an atom; `#{…}`, `#(…)`, and `#"…"` read as the atom `#` before a collection or a
-//! string. So the grammar does not check that code is valid Clojure, only that it can be read
-//! into balanced forms, which was the most common failure of small models.
+//! Generation answers are plain text, not JSON, because small models write noticeably worse code
+//! when every line break and quote has to be escaped inside a JSON string:
+//!
+//! ````text
+//! PLAN: how example 1's input becomes its output, then the functions to use
+//! ```clojure
+//! (ns …)
+//! (defn …)
+//! ```
+//! STEPS:
+//! STEP 1: (the code that carries out step 1)
+//! ASSUMPTIONS:
+//! - a decision the model made
+//! ````
+//!
+//! The `STEPS:` section exists only when the specification has steps, with at most one line per
+//! step. The grammar describes the code as Clojure reads it: lists, vectors, and maps must close
+//! with the matching delimiter and string literals must end. The code starts with `(ns …)`, and
+//! every later top-level form is a `defn`, `defn-`, `def`, or `declare` list, so a definition can
+//! never lose its opening parenthesis and no example calls are left at the top level. Comments are
+//! not allowed: small models tend to ramble in them until the answer is cut off.
+//! Everything else (symbols, keywords, numbers, reader macros such as `#`, `'`, `@`, `^`) is an
+//! atom; `#{…}`, `#(…)`, and `#"…"` read as the atom `#` before a collection or a string. So the
+//! grammar does not check that code is valid Clojure, only that it can be read into balanced
+//! forms, which was the most common failure of small models. Backticks are not allowed outside
+//! string literals, so the closing fence is unambiguous.
 //!
 //! Two atoms can never follow each other without whitespace in between, so llama.cpp's grammar
 //! sampler never has to track more than one way of splitting a run of characters into atoms.
 //!
-//! The answer is still validated against [`crate::answers::generation_schema`] afterwards; the
-//! JSON parts of this grammar use the same bounds (at most 20 step references quoting at most 400
-//! characters, at most 8 assumptions of at most 300 characters).
+//! The answer is turned into the generation answer's JSON shape by
+//! [`crate::answers::generation_from_text`] and validated as before.
 
-/// The GBNF grammar for answers to generation and repair requests.
-pub const GENERATION: &str = r#"root ::= "{" ws "\"code\"" ws ":" ws "\"" seq "\"" ws "," ws "\"steps\"" ws ":" ws steps ws "," ws "\"assumptions\"" ws ":" ws assumptions ws "}"
-ws ::= [ \t\n]{0,16}
-steps ::= "[" ws ( stepref ( ws "," ws stepref ){0,19} ws )? "]"
-stepref ::= "{" ws "\"step\"" ws ":" ws [1-9] [0-9]? ws "," ws "\"code\"" ws ":" ws "\"" jchar{0,400} "\"" ws "}"
-assumptions ::= "[" ws ( jstr ( ws "," ws jstr ){0,7} ws )? "]"
-jstr ::= "\"" jchar{0,300} "\""
-jchar ::= [^"\\\x7F\x00-\x1F] | jesc
-jesc ::= "\\" ["\\/bfnrt] | "\\u" hex hex hex hex
-hex ::= [0-9a-fA-F]
+/// Grammar rules shared by every generation answer; `root` is added by [`generation`].
+const RULES: &str = r#"plan ::= [^`\x00]{0,1000}
+lchar ::= [^`\n\x00]
+assumptions ::= ( "\n- " lchar{1,200} ){0,4}
 
+top ::= sp "(ns " seq ")" sp ( "(" ( "defn-" | "defn" | "def" | "declare" ) sp1 seq ")" sp )+
 seq ::= sp rest
 rest ::= ( coll seq | cstr seq | atom after )?
 after ::= ( sp1 rest | coll seq | cstr seq )?
 coll ::= "(" seq ")" | "[" seq "]" | "{" seq "}"
 sp ::= wsu*
 sp1 ::= wsu+
-wsu ::= " " | "," | "\\n" | "\\t" | "\\r" | comment
-comment ::= ";" cchar* "\\n"
-cchar ::= [^"\\\x7F\x00-\x1F] | "\\" ["\\/bft] | "\\u" hex hex hex hex
-cstr ::= "\\\"" schar* "\\\""
-schar ::= [^"\\\x7F\x00-\x1F] | "\\" [/bfnrt] | "\\u" hex hex hex hex | "\\\\" jchar
+wsu ::= [ ,\t\n\r]
+cstr ::= "\"" ( [^"\\\x00] | "\\" [^\x00] )* "\""
 atom ::= tok | chr
 tok ::= tchar+
-tchar ::= [^()\[\]{}"\\;, \x7F\x00-\x1F] | "\\/" | "\\u" hex hex hex hex
-chr ::= "\\\\" ( [a-zA-Z0-9]+ | [^a-zA-Z0-9"\\\x7F\x00-\x1F] | jesc )
+tchar ::= [^()\[\]{}"\\;,` \t\n\r\x00]
+chr ::= "\\" ( [a-zA-Z0-9]+ | [^a-zA-Z0-9 \t\n\r\x00] )
 "#;
+
+/// The generation grammar for a specification with `steps` transformation steps: at most one
+/// step line per step, and no step section without steps, so the model does not spend its answer
+/// budget quoting its code a second time.
+pub fn generation(steps: usize) -> String {
+    let step_section = match steps {
+        0 => String::new(),
+        n => format!(
+            " \"\\nSTEPS:\" ( \"\\nSTEP \" [1-9] [0-9]? \": \" lchar{{1,200}} ){{0,{}}}",
+            n.min(20)
+        ),
+    };
+    format!(
+        "root ::= \"PLAN: \" plan \"```clojure\\n\" top \"```\"{step_section} \"\\nASSUMPTIONS:\" assumptions\n{RULES}"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -52,7 +77,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::GENERATION;
+    use super::generation;
 
     #[derive(Clone, Debug)]
     enum Item {
@@ -192,9 +217,9 @@ mod tests {
         }
     }
 
-    fn rules() -> HashMap<String, Vec<Vec<Rep>>> {
+    fn rules(text: &str) -> HashMap<String, Vec<Vec<Rep>>> {
         let mut out = HashMap::new();
-        for line in GENERATION.lines().filter(|l| !l.trim().is_empty()) {
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let (name, body) = line.split_once("::=").unwrap();
             let chars: Vec<char> = body.chars().collect();
             let mut p = P { s: &chars, i: 0 };
@@ -264,26 +289,29 @@ mod tests {
         here
     }
 
-    fn accepts(code: &str) -> bool {
-        // Built by hand: `json!` would sort the keys.
-        let answer = format!(
-            r#"{{"code": {}, "steps": [{{"step": 1, "code": "(inc x)"}}], "assumptions": ["the input is a vector"]}}"#,
-            serde_json::to_string(code).unwrap()
-        );
+    fn matches(grammar: &str, answer: &str) -> bool {
+        let g = rules(grammar);
         let chars: Vec<char> = answer.chars().collect();
-        let g = rules();
         alts_ends(&g, &g["root"], &chars, 0).contains(&chars.len())
+    }
+
+    fn accepts(code: &str) -> bool {
+        let answer = format!(
+            "PLAN: sum the values\n```clojure\n{code}\n```\nSTEPS:\nSTEP 1: (inc x)\nASSUMPTIONS:\n- the input is a vector"
+        );
+        matches(&generation(2), &answer)
     }
 
     #[test]
     fn balanced_code_with_strings_chars_regexes_and_comments_is_accepted() {
         for code in [
             "(ns totals.core\n  (:require [clojure.string :as str]))\n\n(defn totals [xs] (reduce + 0 xs))\n",
-            "(ns a)\n;; a comment with (unbalanced [ delimiters \"and quotes\n(defn- helper [m] {:a 1, :b #{2 3}})\n(defn f [x] #(inc %))",
+            "(ns a)\n(defn- helper [m] {:a 1, :b #{2 3}})\n(defn f [x] #(inc %))",
             "(ns a)\n(defn f [s] (str/split s #\"\\s*,\\s*\"))",
             "(ns a)\n(defn f [s] (str \"say \\\"hi\\\" (\" \\( \\newline \\\" \\\\ \"\\n\"))",
             "(ns a)\n(defn f [x] (let [{:keys [a b]} x] ^long (+ a b)))\n(def ^:private n 'sym)\n(defn g [x] @x)",
             "(ns a)\n(defn f [x]\n\t(case x \"a\" 1 2))",
+            "(ns a)\n(defn f [s] (str \"a line\nand a ``` fence inside a string\"))",
         ] {
             assert!(accepts(code), "rejected: {code}");
         }
@@ -297,22 +325,40 @@ mod tests {
             "(ns a)\n(defn f [x) x)",
             "(ns a)\n(defn f [x] {:a 1)",
             "(ns a)\n(defn f [x] (str \"open x))",
-            "(ns a)\n(defn f [x] x) ; trailing comment without a line break",
+            "(ns a)\n\ndefn- g [x]\n  (inc x)\n(defn f [x] (g x))",
+            "(ns a)\n(defn f [x] `(inc ~x))",
+            "(ns a)\n;; a comment\n(defn f [x] x)",
+            "(ns a)\n(defn f [x] x)\n(f 1)",
+            "(defn f [x] x)",
+            "(ns a)",
         ] {
             assert!(!accepts(code), "accepted: {code}");
         }
     }
 
     #[test]
-    fn json_outside_the_code_is_fixed_in_shape() {
-        let g = rules();
-        let ok = r#"{"code": "(ns a)", "steps": [], "assumptions": []}"#;
-        let missing = r#"{"code": "(ns a)", "assumptions": []}"#;
-        let check = |s: &str| {
-            let c: Vec<char> = s.chars().collect();
-            alts_ends(&g, &g["root"], &c, 0).contains(&c.len())
-        };
-        assert!(check(ok));
-        assert!(!check(missing));
+    fn the_sections_around_the_code_are_fixed_in_shape() {
+        let ok = "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:";
+        assert!(matches(&generation(0), ok));
+        assert!(matches(
+            &generation(0),
+            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:\n- one\n- two"
+        ));
+        assert!(!matches(&generation(0), "PLAN: p\n```clojure\n(ns a)\n```"));
+        assert!(!matches(&generation(0), "PLAN: p\n```clojure\n```\nASSUMPTIONS:"));
+        assert!(!matches(
+            &generation(0),
+            "PLAN: uses `x`\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:"
+        ));
+        assert!(!matches(
+            &generation(0),
+            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: x\nASSUMPTIONS:"
+        ));
+        let one_step = "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: (inc x)\nASSUMPTIONS:";
+        assert!(matches(&generation(1), one_step));
+        assert!(!matches(
+            &generation(1),
+            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: a\nSTEP 2: b\nASSUMPTIONS:"
+        ));
     }
 }

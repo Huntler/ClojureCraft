@@ -160,7 +160,7 @@ impl InferenceState {
             .runtimes()
             .join(components::LLAMA_CPP)
             .join(&build.version)
-            .join(&manifest.llama_cpp.server_path);
+            .join(components::server_path(manifest, &build.version));
         let record = self.active_model().ok_or("No model is selected.")?.clone();
         if let Some(p) = self.problems(&record.key).first() {
             return Err(format!("The selected model needs attention: {p}."));

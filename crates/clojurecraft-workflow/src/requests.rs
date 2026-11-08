@@ -222,32 +222,44 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
          value of an example. It must return the expected output of every example and accepted test, \
          and follow the steps, the contract, and the user's answers.\n\
          - Define helpers with defn-. Top-level forms other than defn, defn-, def, and declare are \
-         not allowed.\n\
+         not allowed. Write no comments and no example calls.\n\
          - Use {allowed}.{others}\n\
          - The function must be pure: no I/O, printing, randomness, time, atoms, futures, agents, or \
          dynamic vars; no eval, read-string, resolve, or other dynamic evaluation; no Java interop \
          except static methods of Math, Long, Integer, Double, Character, and Boolean.\n\
          - Prefer clear, idiomatic clojure.core functions. Return eager collections (vectors, maps, \
          sets) unless the examples show a sequence.\n\
-         Answer with JSON only: \"code\" holds the complete source; \"steps\" gives, for each numbered \
-         transformation step, the step number and the code from \"code\" that carries it out (one \
-         expression or one stage of a pipeline, copied exactly; leave it empty when there are no steps); \
-         \"assumptions\" lists decisions you made where the specification is silent.",
+         Answer in exactly this format and nothing else:\n\
+         PLAN: <at most six short lines, no code and no backticks: trace example 1 by hand. Take one element of its \
+         input (one line of text, one map, or one item) and quote each part of it next to the output \
+         value it becomes, for example 'id=7' -> :id 7, noting conversions (text to number; integer \
+         or decimal). Say how the other examples differ (missing parts, empty input), then name the \
+         core functions you will use.>\n\
+         ```clojure\n\
+         <the complete source, following the plan>\n\
+         ```\n\
+         {steps}ASSUMPTIONS:\n\
+         - <a decision you made where the specification is silent; at most four, or none>",
         version = input.clojure_version,
+        steps = if numbered_steps(input.doc).is_empty() {
+            ""
+        } else {
+            "STEPS:\n\
+             STEP <n>: <for each numbered transformation step, the code from the source that carries \
+             it out, copied exactly: one expression or one stage of a pipeline, on one line>\n"
+        },
     )
 }
 
 pub fn generation_request(input: GenerationInput<'_>) -> GenerateRequest {
     let mut sections = spec::specification_sections(input.doc);
+    sections.extend(crate::idioms::section(input.doc));
     sections.extend(input.documentation.clone());
-    let mut r = request(
-        Role::Generation,
-        generation_task(&input),
-        sections,
-        answers::generation_schema(),
-    );
+    let mut sections_all = vec![task(generation_task(&input))];
+    sections_all.extend(sections);
+    let mut r = GenerateRequest::new(Role::Generation, sections_all);
     r.seed = Some(input.seed);
-    r.grammar = Some(grammar::GENERATION.to_owned());
+    r.grammar = Some(grammar::generation(numbered_steps(input.doc).len()));
     r
 }
 
@@ -289,6 +301,7 @@ pub fn repair_request(
              These checks failed (examples and tests are named as in the specification):\n{failures}"
         ),
     ));
+    sections.extend(crate::idioms::section(input.doc));
     sections.extend(input.documentation.clone());
     let repeated = repeated.map_or_else(String::new, |(this, n)| {
         format!(
@@ -309,10 +322,12 @@ pub fn repair_request(
          not what the step should produce for that input, and fix the code of that step.\n\n{}",
         generation_task(&input)
     );
-    let mut r = request(Role::Generation, text, sections, answers::generation_schema());
+    let mut all = vec![task(text)];
+    all.extend(sections);
+    let mut r = GenerateRequest::new(Role::Generation, all);
     r.seed = Some(input.seed);
     r.temperature = Some(REPAIR_TEMPERATURE);
-    r.grammar = Some(grammar::GENERATION.to_owned());
+    r.grammar = Some(grammar::generation(numbered_steps(input.doc).len()));
     r
 }
 
@@ -400,7 +415,14 @@ mod tests {
         });
         assert_eq!(r.role, Role::Generation);
         assert_eq!(r.seed, Some(7));
-        assert!(r.schema.is_some());
+        assert!(
+            r.schema.is_none(),
+            "answers are plain text constrained by the grammar"
+        );
+        assert_eq!(
+            r.grammar,
+            Some(crate::grammar::generation(numbered_steps(&d).len()))
+        );
         let t = all_text(&r);
         for needle in [
             "Clojure 1.12.6",
@@ -429,7 +451,7 @@ mod tests {
         assert!(
             r.sections
                 .iter()
-                .filter(|s| s.label != "Clojure documentation")
+                .filter(|s| s.label != "Clojure documentation" && s.label != crate::idioms::LABEL)
                 .all(|s| s.priority == clojurecraft_inference::Priority::Required)
         );
     }
@@ -460,7 +482,10 @@ mod tests {
         );
         assert_eq!((r.role, r.seed), (Role::Generation, Some(9)));
         assert_eq!(r.temperature, Some(REPAIR_TEMPERATURE));
-        assert_eq!(r.grammar.as_deref(), Some(crate::grammar::GENERATION));
+        assert_eq!(
+            r.grammar,
+            Some(crate::grammar::generation(numbered_steps(&d).len()))
+        );
         let t = all_text(&r);
         for needle in [
             "attempt 3 of 4",

@@ -60,25 +60,11 @@ pub struct LlamaBuild {
 pub fn llama_builds(manifest: &Manifest, dirs: &DataDirs) -> Vec<LlamaBuild> {
     let comp = component(dirs, LLAMA_CPP);
     let active = comp.active().map(|a| a.version);
-    let backends = [
-        Backend::Metal,
-        Backend::Cuda,
-        Backend::Rocm,
-        Backend::Vulkan,
-        Backend::Cpu,
-    ];
     let mut out: Vec<LlamaBuild> = comp
         .installed()
         .into_iter()
         .map(|version| {
-            let backend = backends
-                .into_iter()
-                .find(|b| version.ends_with(&format!("-{}", backend_slug(*b))));
-            let release = backend.map_or(version.clone(), |b| {
-                version
-                    .trim_end_matches(&format!("-{}", backend_slug(b)))
-                    .to_owned()
-            });
+            let (release, backend) = split_version(&version);
             LlamaBuild {
                 active: active.as_deref() == Some(version.as_str()),
                 pinned: release == manifest.llama_cpp.release,
@@ -90,6 +76,35 @@ pub fn llama_builds(manifest: &Manifest, dirs: &DataDirs) -> Vec<LlamaBuild> {
         .collect();
     out.sort_by(|a, b| b.release.cmp(&a.release).then(a.version.cmp(&b.version)));
     out
+}
+
+/// Splits a version id such as `b12138-metal` into its release and backend.
+fn split_version(version: &str) -> (String, Option<Backend>) {
+    let backend = [
+        Backend::Metal,
+        Backend::Cuda,
+        Backend::Rocm,
+        Backend::Vulkan,
+        Backend::Cpu,
+    ]
+    .into_iter()
+    .find(|b| version.ends_with(&format!("-{}", backend_slug(*b))));
+    let release = backend.map_or(version.to_owned(), |b| {
+        version
+            .trim_end_matches(&format!("-{}", backend_slug(b)))
+            .to_owned()
+    });
+    (release, backend)
+}
+
+/// The server binary of an installed build, relative to its directory. Archives name their top
+/// directory after the release, so builds other than the pinned one use their own release there.
+pub fn server_path(manifest: &Manifest, version: &str) -> String {
+    let (release, _) = split_version(version);
+    manifest
+        .llama_cpp
+        .server_path
+        .replace(&manifest.llama_cpp.release, &release)
 }
 
 pub fn activate_llama(dirs: &DataDirs, version: &str) -> Result<Installed, ComponentError> {
@@ -230,7 +245,7 @@ pub fn parse_device_list(output: &str) -> Vec<String> {
 /// The active llama.cpp server binary, if installed.
 pub fn llama_server(manifest: &Manifest, dirs: &DataDirs) -> Option<(Installed, PathBuf)> {
     let active = component(dirs, LLAMA_CPP).active()?;
-    let server = active.dir.join(&manifest.llama_cpp.server_path);
+    let server = active.dir.join(server_path(manifest, &active.version));
     server.is_file().then_some((active, server))
 }
 
@@ -324,7 +339,7 @@ pub fn check_llama(manifest: &Manifest, dirs: &DataDirs, version: &str) -> Resul
         .runtimes()
         .join(LLAMA_CPP)
         .join(version)
-        .join(&manifest.llama_cpp.server_path);
+        .join(server_path(manifest, version));
     smoke(&server, &["--version"])?;
     Ok(parse_device_list(&smoke(&server, &["--list-devices"])?))
 }
@@ -341,7 +356,17 @@ pub fn llama_server_for(manifest: &Manifest, dirs: &DataDirs, backend: Backend) 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_device_list;
+    use super::{parse_device_list, server_path};
+    use crate::manifest::Manifest;
+
+    #[test]
+    fn server_path_follows_the_build_release() {
+        let m = Manifest::bundled().expect("manifest");
+        let pinned = m.llama_cpp.server_path.clone();
+        assert_eq!(server_path(&m, &format!("{}-metal", m.llama_cpp.release)), pinned);
+        assert_eq!(server_path(&m, "b12202-metal"), "llama-b12202/llama-server");
+        assert_eq!(server_path(&m, "b12202-rocm-hip"), "llama-b12202/llama-server");
+    }
 
     #[test]
     fn device_list_parsing() {

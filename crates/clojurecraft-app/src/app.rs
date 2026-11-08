@@ -146,7 +146,10 @@ impl ClojureCraftApp {
         let references = ReferencesState::new(jobs.sender(), cc.egui_ctx.clone(), secrets.clone());
         let inference = InferenceState::new(jobs.sender(), cc.egui_ctx.clone(), secrets);
         let knowledge = KnowledgeState::new(jobs.sender(), cc.egui_ctx.clone());
-        let execution = ExecutionState::new(jobs.sender(), cc.egui_ctx.clone());
+        let mut execution = ExecutionState::new(jobs.sender(), cc.egui_ctx.clone());
+        if !execution.installed() {
+            execution.install();
+        }
         let first_run = inference.settings.setup == SetupState::NotStarted;
         let (mcp_server, mcp_requests) = start_mcp(&cc.egui_ctx);
         let reopen = cc

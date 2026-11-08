@@ -366,7 +366,16 @@ fn process_failure(status: &EvalStatus, stderr: &str) -> (CheckStatus, String) {
     }
 }
 
-fn call_check(call: &PlannedCall, r: &CallResult, values: Vec<String>) -> Check {
+/// The trimmed text of 1-based `line` in `source`, when it is short enough to quote.
+fn source_line(source: &str, line: Option<u32>) -> Option<String> {
+    let text = source
+        .lines()
+        .nth(usize::try_from(line?).ok()?.checked_sub(1)?)?
+        .trim();
+    (!text.is_empty() && text.chars().count() <= 200).then(|| text.to_owned())
+}
+
+fn call_check(call: &PlannedCall, r: &CallResult, values: Vec<String>, source: &str) -> Check {
     let mut c = check(call.subject, CheckStatus::Passed, Vec::new());
     c.expected = Some(Edn::new(bounded(&call.expected, MAX_VALUE_CHARS)));
     c.actual = r.actual.as_deref().map(Edn::new);
@@ -391,8 +400,10 @@ fn call_check(call: &PlannedCall, r: &CallResult, values: Vec<String>) -> Check 
             } else {
                 CheckStatus::Error
             };
+            let quoted = source_line(source, e.line)
+                .map_or_else(String::new, |l| format!("\nThe line that threw: {l}"));
             c.diagnostics.push(bounded(
-                &format!("The function threw {}", error_text(&e)),
+                &format!("The function threw {}{quoted}", error_text(&e)),
                 MAX_DIAGNOSTIC_CHARS,
             ));
         }
@@ -661,7 +672,7 @@ fn checks(plan: &Plan, outcome: Result<&EvalOutcome, &str>) -> Vec<Check> {
                     .find(|p| p.index == i)
                     .map(|p| values(plan, result, p))
                     .unwrap_or_default();
-                out.push(call_check(call, result, values));
+                out.push(call_check(call, result, values, &plan.source));
             }
             None if r.halted => skip(
                 &mut out,
@@ -1087,6 +1098,22 @@ mod tests {
         assert_eq!(r.checks[3].status, CheckStatus::Error);
         assert!(r.checks[3].diagnostics[0].starts_with("line 2: RuntimeException: Unable"));
         assert!(r.checks[4..].iter().all(|c| c.status == CheckStatus::Skipped));
+    }
+
+    #[test]
+    fn a_thrown_error_quotes_the_source_line_that_threw() {
+        let d = doc();
+        let p = plan(&d, GOOD, &names());
+        let stdout = format!(
+            "{STAGES}{}\n",
+            r#"{"event":"result","index":0,"status":"error","error":{"phase":"call","class":"java.lang.IllegalArgumentException","message":"Don't know how to create ISeq from: java.lang.Long","line":2}}"#
+        );
+        let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &stdout)));
+        assert_eq!(
+            r.checks[4].diagnostics[0],
+            "The function threw line 2: IllegalArgumentException: Don't know how to create ISeq from: \
+             java.lang.Long\nThe line that threw: (defn totals [xs] (reduce + xs))"
+        );
     }
 
     #[test]

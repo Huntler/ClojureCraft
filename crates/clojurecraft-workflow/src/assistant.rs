@@ -944,7 +944,30 @@ impl Assistant {
         let Some(job) = &mut self.job else {
             return Vec::new();
         };
-        let Some(value) = &g.value else {
+        // Generation answers are plain text, read into the same shape as a structured answer.
+        let from_text;
+        let value = match (&g.value, job.phase) {
+            (Some(v), _) => Some(v),
+            (None, Phase::Generating | Phase::Repairing) => {
+                let read = if g.finish == clojurecraft_inference::Finish::Length {
+                    Err("the answer was cut off at its length limit".to_owned())
+                } else {
+                    answers::generation_from_text(&g.text)
+                };
+                match read {
+                    Ok(v) => {
+                        from_text = v;
+                        Some(&from_text)
+                    }
+                    Err(e) => {
+                        return self
+                            .attempt_without_code(format!("The model's answer was not usable: {e}"), ports);
+                    }
+                }
+            }
+            (None, _) => None,
+        };
+        let Some(value) = value else {
             match job.phase {
                 Phase::Generating | Phase::Repairing => {
                     return self.attempt_without_code("The model gave no structured answer.".into(), ports);
@@ -1078,12 +1101,12 @@ impl Assistant {
                             .attempt_without_code(format!("The model's answer was not usable: {e}"), ports);
                     }
                 };
-                let (code, prepared) = prepare(&generated.code);
-                generated.code = code;
-                gen_state.prepared = prepared;
                 let Some(names) = gen_state.names.clone() else {
                     return Vec::new();
                 };
+                let (code, prepared) = prepare(&generated.code, &names.function);
+                generated.code = code;
+                gen_state.prepared = prepared;
                 gen_state.omitted = g.plan.omitted.iter().map(|(label, _)| label.clone()).collect();
                 if gen_state
                     .omitted
@@ -1568,7 +1591,7 @@ impl Assistant {
 
 /// Generated code made ready for checking: closing delimiters inferred from the indentation when
 /// the code cannot be read, and harmless extras removed. Returns the code and what was changed.
-fn prepare(code: &str) -> (String, Vec<String>) {
+fn prepare(code: &str, function: &str) -> (String, Vec<String>) {
     let mut notes = Vec::new();
     let mut code = code.to_owned();
     if let Some(fixed) = delimiters::repair(&code) {
@@ -1579,7 +1602,9 @@ fn prepare(code: &str) -> (String, Vec<String>) {
     }
     let tidied = cleanup::tidy(&code);
     notes.extend(tidied.notes);
-    (tidied.code, notes)
+    let fixed = cleanup::conventions(&tidied.code, function);
+    notes.extend(fixed.notes);
+    (fixed.code, notes)
 }
 
 /// Where the code of each step is, from the model's quotes of it; `None` without steps.

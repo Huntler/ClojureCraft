@@ -399,9 +399,13 @@ pub fn parse_contract(
 /// Step references a generation answer may give at most, and the length of each quote.
 pub const MAX_STEP_REFERENCES: usize = 20;
 pub const MAX_STEP_QUOTE: usize = 400;
+/// Length of the plan written before the code; the generation grammar uses the same bound.
+pub const MAX_PLAN: usize = 1000;
 
 pub fn generation_schema() -> Schema {
     Schema::object(vec![
+        Field::optional("plan", prose(MAX_PLAN))
+            .describe("how each example's input becomes its expected output, before writing code"),
         Field::required("code", Schema::string())
             .describe("the complete Clojure source: the ns declaration followed by the definitions"),
         Field::required(
@@ -462,6 +466,42 @@ fn strip_fence(code: &str) -> &str {
     };
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric());
     rest.strip_suffix("```").unwrap_or(rest).trim()
+}
+
+/// A plain-text generation answer (see [`crate::grammar`]) in the JSON shape that
+/// [`parse_generation`] reads: `plan`, `code`, `steps`, and `assumptions`.
+pub fn generation_from_text(text: &str) -> Result<Value, String> {
+    const FENCE: &str = "```clojure";
+    let open = text
+        .find(FENCE)
+        .ok_or("the answer has no ```clojure code block")?;
+    let body = &text[open + FENCE.len()..];
+    let close = body.rfind("```").ok_or("the code block is not closed")?;
+    let plan = text[..open].trim().trim_start_matches("PLAN:").trim();
+    let mut steps = Vec::new();
+    let mut assumptions = Vec::new();
+    let mut in_assumptions = false;
+    for line in body[close + 3..].lines().map(str::trim) {
+        if line == "ASSUMPTIONS:" {
+            in_assumptions = true;
+        } else if in_assumptions {
+            if let Some(a) = line.strip_prefix("- ") {
+                assumptions.push(a.trim());
+            }
+        } else if let Some((n, quote)) = line
+            .strip_prefix("STEP ")
+            .and_then(|l| l.split_once(": "))
+            .and_then(|(n, q)| Some((n.parse::<u32>().ok()?, q.trim())))
+        {
+            steps.push(serde_json::json!({"step": n, "code": quote}));
+        }
+    }
+    Ok(serde_json::json!({
+        "plan": plan,
+        "code": body[..close].trim(),
+        "steps": steps,
+        "assumptions": assumptions,
+    }))
 }
 
 pub fn parse_generation(v: &Value) -> Result<GeneratedCode, String> {
@@ -726,5 +766,20 @@ mod tests {
         assert_eq!(e.steps[0].lines.map(|l| (l.start, l.end)), Some((4, 4)));
         assert_eq!(e.steps[1].lines.map(|l| l.start), Some(5));
         assert_eq!(e.symbols.len(), 1);
+    }
+
+    #[test]
+    fn text_answers_read_like_json_answers() {
+        let text = "PLAN: split lines, then parse\n```clojure\n(ns a)\n(defn f [s] (str \"x\"))\n```\n\
+                    STEPS:\nSTEP 1: (str \"x\")\nSTEP 2: (inc: x)\nASSUMPTIONS:\n- input is a string\n- \n";
+        let g = parse_generation(&generation_from_text(text).unwrap()).unwrap();
+        assert_eq!(g.code, "(ns a)\n(defn f [s] (str \"x\"))\n");
+        assert_eq!(
+            g.steps,
+            vec![(1, "(str \"x\")".to_owned()), (2, "(inc: x)".to_owned())]
+        );
+        assert_eq!(g.assumptions, vec!["input is a string".to_owned()]);
+        assert!(generation_from_text("PLAN: p\n```clojure\n(ns a)").is_err());
+        assert!(generation_from_text("(ns a)").is_err());
     }
 }

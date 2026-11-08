@@ -91,6 +91,44 @@ specifications (single runs; quality varies between seeds):
   ran out of their answer budget while reasoning (cut off at 8,192 tokens with a 16,384-token
   context) and counted as failed attempts, at about 2–4 minutes each.
 
+## Harness changes and measurements (2026-11-08)
+
+Apple M3 Pro (36 GB), llama.cpp b12138 Metal, Qwen2.5-Coder 7B Q8_0, context 8192,
+`clojurecraft-devtool generate`. Changes, each measured on the sample specifications and the
+workout-log parser from the MCP example:
+
+- **Speed.** Raw decoding is 17 tok/s (memory-bandwidth bound); the JSON grammar costs nothing.
+  `--spec-type ngram-mod` (draft tokens from n-grams already seen, no draft model) gives 33 tok/s
+  on repairs and up to 115 tok/s when an answer repeats an earlier one, with identical output.
+  Step references are capped at one per step (the model listed 18 for 6 steps), assumptions at
+  four, and the output limit is 1800 tokens (runaway answers that redefined `let`, `mapv`, … until
+  the 2500-token limit cost up to 8 minutes). A six-attempt job went from 4–14 min to 2.5–3 min.
+- **Plain-text answers.** Code is no longer a JSON string: the answer is `PLAN:`, a
+  ```` ```clojure ```` block, `STEPS:` lines, and `ASSUMPTIONS:`, still grammar-constrained. The
+  grammar requires `(ns …)` first and only `defn`/`defn-`/`def`/`declare` after it, and allows no
+  comments (the model rambled in `;;` comments until cut off).
+- **Plan first.** The answer starts with a short trace of example 1 before the code.
+- **Checks.** Expected outputs that contradict the accepted contract block generation before
+  any attempt. A new lint error reports a form whose value a `let`/`fn`/`do` body throws away (a
+  misplaced parenthesis, or `(assoc m …)` written as if it changed `m`). Thrown errors quote the
+  source line. Cleanup adds a missing `clojure.string`/`clojure.set` require, makes extra public
+  functions private, and replaces invented `clojure.string` names (`contains?` → `includes?`).
+- **Idioms.** A short, keyword-chosen list of one-line idioms (descending sort with tie-breaker,
+  `cond->` for optional keys, `parse-long`/`parse-double`, …) is sent with the specification.
+
+| Specification | Before | After |
+| --- | --- | --- |
+| `order-totals` | first attempt passed in 3 of 13 runs | attempt 1 (1 of 1 run) |
+| `top-scorers` | attempt 1 (single run) | failed 6/6 until the idioms were added, then attempt 1 (2 of 2 runs) |
+| `normalize-keys` | attempt 1 | attempt 1 |
+| `nested-tags` | attempt 1 | attempt 2–3 (2 runs) |
+| workout-log parser (whole log, or one line with four optional fields) | 0 of 6 | 0 of 6 in every variant (10 runs), now in about 3 min instead of 4–14 |
+
+Single-token parsers split out of it (`"3@10"` → `{:sets 3 :reps 10}`, `"7.5kg"` → `7.5`)
+passed on the first attempt in 3 of 4 runs. The 7B model cannot write the line parser: it keeps treating `"3@10"` as one number or as two
+tokens. Splitting such parsers into one function per field format is the workaround (see the
+skill); a larger model (Qwen3-Coder 30B-A3B, ~3B active parameters) is the next thing to measure.
+
 ## Models from other Hugging Face repositories
 
 1. The repository id (`owner/name`) and optional branch, tag, or commit are validated, and the
