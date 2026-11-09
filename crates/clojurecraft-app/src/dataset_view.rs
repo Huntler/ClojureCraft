@@ -1,5 +1,6 @@
-//! The fine-tuning dataset page: saved functions whose generated code passes its checks, chosen
-//! for export as JSON Lines (model input messages and validated code per function).
+//! The fine-tuning dataset page: saved functions whose code (generated, or hand-written and
+//! described) passes its checks, chosen for export as JSON Lines (model input messages and
+//! validated code per function).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -95,7 +96,7 @@ pub fn page(ui: &mut Ui, page: &mut DatasetPage) -> DatasetAction {
     ui.add_space(8.0);
     if qualifying.is_empty() {
         ui.label(
-            RichText::new("No function has unedited generated code that passes its checks.")
+            RichText::new("No function has passing code: unedited generated code, or hand-written code with a description.")
                 .color(theme::MUTED),
         );
     } else {
@@ -134,13 +135,13 @@ pub fn page(ui: &mut Ui, page: &mut DatasetPage) -> DatasetAction {
                         PromptSource::Recorded => "prompt as sent",
                         PromptSource::Rebuilt => "prompt rebuilt without documentation",
                     };
-                    let attempts = if e.attempts == 1 {
-                        "1 attempt".to_owned()
-                    } else {
-                        format!("{} attempts", e.attempts)
+                    let attempts = match e.attempts {
+                        0 => String::new(),
+                        1 => "1 attempt · ".to_owned(),
+                        n => format!("{n} attempts · "),
                     };
                     ui.label(
-                        RichText::new(format!("{} · {attempts} · {prompt}", e.model))
+                        RichText::new(format!("{} · {attempts}{prompt}", e.model))
                             .small()
                             .color(theme::MUTED),
                     );

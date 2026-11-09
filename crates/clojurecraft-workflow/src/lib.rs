@@ -16,6 +16,8 @@
 //!   tests, contract) and its report;
 //! - [`edge_cases`]: proposing edge-case tests from the specification, reviewing them, and
 //!   fixing code that fails accepted cases;
+//! - [`describe`]: the specification of existing code, written by the model, with example
+//!   outputs recorded by running the code;
 //! - [`dataset`]: a fine-tuning dataset of generation prompts and validated code;
 //! - [`export`]: a Clojure project (sources, `clojure.test` files, `deps.edn`) made from saved
 //!   functions;
@@ -36,6 +38,7 @@ pub mod cleanup;
 pub mod dataset;
 pub mod delimiters;
 pub mod deps;
+pub mod describe;
 pub mod diff;
 pub mod edge_cases;
 pub mod edits;

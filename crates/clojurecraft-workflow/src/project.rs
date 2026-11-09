@@ -461,66 +461,118 @@ pub fn compose(binding: &ProjectBinding, fragment: &str) -> Result<Composed, Str
     })
 }
 
-/// The rest of the namespace, as the model may use it: each other definition's signature and
-/// docstring.
-pub fn context(binding: &ProjectBinding) -> String {
-    let Ok(layout) = layout(&binding.file) else {
-        return String::new();
+/// A top-level definition as the model is told about it.
+struct Summary {
+    head: String,
+    name: String,
+    /// The docstring as written, quotes included.
+    doc: Option<String>,
+    /// For functions: each parameter vector as written.
+    arglists: Vec<String>,
+    /// For `def`: the value as written, shortened.
+    value: Option<String>,
+}
+
+/// Longest `def` value shown in full.
+const MAX_VALUE_CHARS: usize = 200;
+
+fn summarize(file: &str, form: &Form) -> Option<Summary> {
+    let items = form.list()?;
+    let head = items.first().and_then(Form::symbol)?;
+    let name = items.get(1).and_then(Form::symbol)?;
+    if !head.starts_with("def") {
+        return None;
+    }
+    let text = |f: &Form| file[full_span(f)].to_owned();
+    let is_string = |f: &Form| {
+        matches!(
+            f.bare(),
+            Form::Atom {
+                kind: TokenKind::String { .. },
+                ..
+            }
+        )
     };
-    let Ok(forms) = read_all(&binding.file) else {
-        return String::new();
-    };
-    let owned = owned_names(binding);
-    let mut out = Vec::new();
-    for form in forms.iter().skip(usize::from(layout.ns_span.is_some())) {
-        let items = form.list().unwrap_or_default();
-        let head = items.first().and_then(Form::symbol).unwrap_or_default();
-        let Some(name) = items.get(1).and_then(Form::symbol) else {
-            continue;
-        };
-        if owned.contains(name) || !head.starts_with("def") {
-            continue;
-        }
-        let text = |f: &Form| binding.file[full_span(f)].to_owned();
-        let mut line = format!("({head} {name}");
-        let mut rest = &items[2..];
-        let mut doc = None;
-        if let Some(first) = rest.first()
-            && matches!(
-                first.bare(),
-                Form::Atom {
-                    kind: TokenKind::String { .. },
+    let mut rest = &items[2..];
+    let mut doc = None;
+    // A def's only argument is its value, even when it is a string.
+    let has_doc = rest.first().is_some_and(is_string) && (head != "def" || rest.len() > 1);
+    if has_doc {
+        doc = Some(text(&rest[0]));
+        rest = &rest[1..];
+    }
+    let mut arglists = Vec::new();
+    let mut value = None;
+    if matches!(head, "defn" | "defn-") {
+        if rest.first().is_some_and(|f| {
+            matches!(
+                f.bare(),
+                Form::Seq {
+                    delim: Delim::Brace,
                     ..
                 }
             )
-        {
-            doc = Some(text(first));
+        }) {
             rest = &rest[1..];
         }
-        if matches!(head, "defn" | "defn-") {
-            if rest.first().is_some_and(|f| {
-                matches!(
-                    f.bare(),
-                    Form::Seq {
-                        delim: Delim::Brace,
-                        ..
-                    }
-                )
-            }) {
-                rest = &rest[1..];
-            }
-            let arglists: Vec<String> = match rest.first().and_then(Form::vector) {
-                Some(_) => vec![text(&rest[0])],
-                None => rest
-                    .iter()
-                    .filter_map(|a| a.list()?.first().filter(|p| p.vector().is_some()).map(text))
-                    .collect(),
-            };
+        arglists = match rest.first().and_then(Form::vector) {
+            Some(_) => vec![text(&rest[0])],
+            None => rest
+                .iter()
+                .filter_map(|a| a.list()?.first().filter(|p| p.vector().is_some()).map(text))
+                .collect(),
+        };
+    } else if head == "def"
+        && let Some(v) = rest.first()
+    {
+        let v = text(v);
+        value = Some(match v.char_indices().nth(MAX_VALUE_CHARS) {
+            Some((i, _)) => format!("{} …", &v[..i]),
+            None => v,
+        });
+    }
+    Some(Summary {
+        head: head.to_owned(),
+        name: name.to_owned(),
+        doc,
+        arglists,
+        value,
+    })
+}
+
+fn top_level(binding: &ProjectBinding) -> Vec<Summary> {
+    let Ok(layout) = layout(&binding.file) else {
+        return Vec::new();
+    };
+    let Ok(forms) = read_all(&binding.file) else {
+        return Vec::new();
+    };
+    forms
+        .iter()
+        .skip(usize::from(layout.ns_span.is_some()))
+        .filter_map(|f| summarize(&binding.file, f))
+        .collect()
+}
+
+/// The rest of the namespace, as the model may use it: each other definition's signature (or a
+/// def's value) and docstring.
+pub fn context(binding: &ProjectBinding) -> String {
+    let owned = owned_names(binding);
+    let mut out = Vec::new();
+    for d in top_level(binding)
+        .into_iter()
+        .filter(|d| !owned.contains(d.name.as_str()))
+    {
+        let mut line = format!("({} {}", d.head, d.name);
+        if !d.arglists.is_empty() {
             line.push(' ');
-            line.push_str(&arglists.join(" "));
+            line.push_str(&d.arglists.join(" "));
+        } else if let Some(v) = &d.value {
+            line.push(' ');
+            line.push_str(v);
         }
         line.push(')');
-        if let Some(doc) = doc {
+        if let Some(doc) = d.doc {
             line.push_str(&format!(
                 "\n  ;; {}",
                 doc.trim_matches('"').replace('\n', "\n  ;; ")
@@ -529,6 +581,23 @@ pub fn context(binding: &ProjectBinding) -> String {
         out.push(line);
     }
     out.join("\n")
+}
+
+/// The head of the function's current definition: its docstring and parameter vectors as
+/// written, for the model to keep. `None` when the file does not define it yet.
+pub fn signature(binding: &ProjectBinding) -> Option<String> {
+    let d = top_level(binding)
+        .into_iter()
+        .find(|d| d.name == binding.function && matches!(d.head.as_str(), "defn" | "defn-"))?;
+    let mut out = format!("(defn {}", d.name);
+    if let Some(doc) = &d.doc {
+        out.push_str(&format!("\n  {doc}"));
+    }
+    for a in &d.arglists {
+        out.push_str(&format!("\n  {a}"));
+    }
+    out.push_str("\n  …)");
+    Some(out)
 }
 
 /// Turns a request for `doc`'s fragment into one for its whole file. Returns where the
@@ -735,13 +804,43 @@ mod tests {
         let c = context(&binding("label", &["clean"]));
         assert_eq!(
             c,
-            "(def tax)\n(defn- only-total [o])\n(defn total [order discount])\n(defmulti kind)"
+            "(def tax 0.2)\n(defn- only-total [o])\n(defn total [order discount])\n(defmulti kind)"
         );
         let c = context(&binding("total", &["only-total"]));
         assert!(
             c.contains("(defn label [order])\n  ;; A label for an order."),
             "{c}"
         );
+    }
+
+    #[test]
+    fn the_context_shows_def_values_and_tells_them_from_docstrings() {
+        let file = "(ns a)\n\n(def ^:private tag-key :source)\n\n(def ^:private tag-value \"healthscore\")\n\n\
+                    (def limit \"The limit.\" 10)\n\n(defn f [x] x)\n";
+        let b = ProjectBinding {
+            namespace: "a".into(),
+            function: "f".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: file.into(),
+        };
+        assert_eq!(
+            context(&b),
+            "(def tag-key :source)\n(def tag-value \"healthscore\")\n(def limit 10)\n  ;; The limit."
+        );
+    }
+
+    #[test]
+    fn the_signature_keeps_the_docstring_and_parameters_of_the_function() {
+        assert_eq!(
+            signature(&binding("label", &["clean"])).as_deref(),
+            Some("(defn label\n  \"A label for an order.\"\n  [order]\n  …)")
+        );
+        assert_eq!(
+            signature(&binding("total", &["only-total"])).as_deref(),
+            Some("(defn total\n  [order discount]\n  …)")
+        );
+        assert_eq!(signature(&binding("missing", &[])), None);
     }
 
     #[test]

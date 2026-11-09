@@ -787,8 +787,9 @@ pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize)
     let mut omitted = 0;
     // Linter warnings do not fail the code, but next to failing checks they often point at the
     // cause: a value that is computed and then dropped, or a binding shadowed by mistake.
-    let warnings = lint_warnings(report);
-    let mut used = warnings.as_ref().map_or(0, String::len);
+    let timed_out = report.checks.iter().any(|c| c.status == CheckStatus::Timeout);
+    let (lead, warnings) = lint_warnings(report, timed_out);
+    let mut used = lead.as_ref().map_or(0, String::len) + warnings.as_ref().map_or(0, String::len);
     let mut with_values = 0;
     for c in &report.checks {
         if matches!(c.status, CheckStatus::Passed | CheckStatus::Skipped) {
@@ -844,6 +845,9 @@ pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize)
     }
     if !parts.is_empty() {
         parts.extend(warnings);
+        if let Some(lead) = lead {
+            parts.insert(0, lead);
+        }
     }
     parts.join("\n\n")
 }
@@ -878,24 +882,41 @@ pub fn readable(report: &ValidationReport) -> bool {
 }
 
 /// The linter's warnings in a report, as a section of a failure summary.
-fn lint_warnings(report: &ValidationReport) -> Option<String> {
-    let lint = report.checks.iter().find(|c| c.subject == CheckSubject::Lint)?;
-    let warnings: Vec<String> = lint
+/// The linter warnings as a possible cause of failures. When a call timed out, unused bindings
+/// come first as a separate lead: a loop that computes its next state but never passes it to
+/// `recur` repeats forever, and the timeout itself records no values that would show it.
+fn lint_warnings(report: &ValidationReport, timed_out: bool) -> (Option<String>, Option<String>) {
+    let Some(lint) = report.checks.iter().find(|c| c.subject == CheckSubject::Lint) else {
+        return (None, None);
+    };
+    let (unused, other): (Vec<&String>, Vec<&String>) = lint
         .diagnostics
         .iter()
         .filter(|d| d.starts_with("warning:") || d.contains(": warning:"))
         .take(8)
-        .map(|d| format!("\n  {}", bounded(d, 200)))
-        .collect();
-    if warnings.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Linter warnings — check whether one of these causes a failure above: a value that is \
-         computed but never used usually means the result of a step is dropped instead of being \
-         passed on.{}",
-        warnings.concat()
-    ))
+        .partition(|d| timed_out && d.contains("is bound but never used"));
+    let lines = |ws: &[&String]| {
+        ws.iter()
+            .map(|d| format!("\n  {}", bounded(d, 200)))
+            .collect::<String>()
+    };
+    let lead = (!unused.is_empty()).then(|| {
+        format!(
+            "A call did not finish, so the code most likely loops forever. The linter found values \
+             that are computed but never used; in a loop this usually means the next state is \
+             computed but not passed to recur, so every iteration starts from the same values:{}",
+            lines(&unused)
+        )
+    });
+    let rest = (!other.is_empty()).then(|| {
+        format!(
+            "Linter warnings — check whether one of these causes a failure above: a value that is \
+             computed but never used usually means the result of a step is dropped instead of being \
+             passed on.{}",
+            lines(&other)
+        )
+    });
+    (lead, rest)
 }
 
 /// Counts of a report's checks, for a short status line.
@@ -1303,5 +1324,26 @@ mod tests {
         );
         let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &passing)));
         assert_eq!(failure_summary(&p, &r, 6000), "");
+    }
+
+    #[test]
+    fn a_timed_out_call_leads_with_the_unused_bindings_as_the_likely_endless_loop() {
+        let d = doc();
+        let p = plan(&d, GOOD, &names());
+        let stdout = format!(
+            "{STAGES}{}\n{}\n{{\"event\":\"done\"}}\n",
+            result(0, true),
+            r#"{"event":"result","index":1,"status":"timeout","elapsed-ns":5000000000}"#
+        );
+        let r = build(&p, &d, Ok(&outcome(EvalStatus::Completed, &stdout)));
+        let s = failure_summary(&p, &r, 6000);
+        assert!(
+            s.starts_with("A call did not finish, so the code most likely loops forever."),
+            "{s}"
+        );
+        let lead = s.split("\n\n").next().unwrap();
+        assert!(lead.contains("x is bound but never used"), "{lead}");
+        assert!(lead.contains("recur"), "{lead}");
+        assert_eq!(s.matches("x is bound but never used").count(), 1, "{s}");
     }
 }

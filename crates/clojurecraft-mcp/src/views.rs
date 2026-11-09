@@ -396,6 +396,7 @@ fn task(kind: JobKind) -> &'static str {
         JobKind::Generate => "generate",
         JobKind::ProposeTests => "generate_test_cases",
         JobKind::Explain => "explain",
+        JobKind::Describe => "describe",
     }
 }
 
@@ -454,6 +455,9 @@ pub fn last_job(doc: &FunctionDocument, r: &Report, detail: Detail) -> Value {
         }
         Report::ContractProposed { notes: n } => json!({"outcome": "contract_proposed", "notes": notes(n)}),
         Report::Explained { notes: n } => json!({"outcome": "explained", "notes": notes(n)}),
+        Report::Described { filled, notes: n } => {
+            json!({"outcome": "described", "filled": filled, "notes": notes(n)})
+        }
         Report::TestsProposed {
             added,
             ambiguous,

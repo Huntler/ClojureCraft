@@ -210,9 +210,9 @@ const STRING_RENAMES: [(&str, &str); 8] = [
     ("index", "index-of"),
 ];
 
-/// Fixes two slips that otherwise cost a whole attempt: `str/…` used without requiring
-/// `clojure.string` (its conventional alias), and helpers defined with `defn` instead of `defn-`
-/// next to the public `function`.
+/// Fixes slips that otherwise cost a whole attempt: `str/…` used without requiring
+/// `clojure.string` (its conventional alias), helpers defined with `defn` instead of `defn-`
+/// next to the public `function`, and `function` itself defined with `defn-`.
 pub fn conventions(code: &str, function: &str) -> Tidied {
     let unchanged = || Tidied {
         code: code.to_owned(),
@@ -298,10 +298,21 @@ pub fn conventions(code: &str, function: &str) -> Tidied {
             .and_then(Form::symbol)
             .map(str::to_owned)
     };
-    if forms
+    let public = forms
         .iter()
-        .any(|f| defines(f, "defn") && name_of(f).as_deref() == Some(function))
+        .any(|f| defines(f, "defn") && name_of(f).as_deref() == Some(function));
+    if !public
+        && let Some(private) = forms
+            .iter()
+            .find(|f| defines(f, "defn-") && name_of(f).as_deref() == Some(function))
     {
+        let defn = private.list().unwrap_or_default()[0].span();
+        edits.push((defn.end - 1..defn.end, String::new()));
+        notes.push(format!(
+            "Made {function} public (defn): it is the function asked for."
+        ));
+    }
+    if public {
         let mut made_private = Vec::new();
         for f in forms.iter().skip(1).filter(|f| defines(f, "defn")) {
             let Some(name) = name_of(f).filter(|n| n != function) else {
@@ -465,5 +476,12 @@ mod tests {
         // Without the expected function, the structure check reports the names instead.
         let other = "(ns a)\n(defn g [s] s)\n(defn h [s] s)\n";
         assert_eq!(conventions(other, "f").code, other);
+    }
+
+    #[test]
+    fn the_function_written_as_private_becomes_public() {
+        let t = conventions("(ns a)\n(defn- g [s] s)\n(defn- f [s] (g s))\n", "f");
+        assert_eq!(t.code, "(ns a)\n(defn- g [s] s)\n(defn f [s] (g s))\n");
+        assert_eq!(t.notes, ["Made f public (defn): it is the function asked for."]);
     }
 }

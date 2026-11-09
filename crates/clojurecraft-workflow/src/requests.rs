@@ -239,9 +239,9 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
             ),
             format!(
                 "- The function belongs to the existing namespace {namespace}; its other definitions are \
-                 listed under \"Namespace\". Call them by name where useful, but do not define or change \
-                 them: write only {function} and the private helpers it needs, with names the namespace \
-                 does not use yet.\n"
+                 listed under \"Namespace\". Call them instead of writing the same logic again, but do \
+                 not define or change them: write only {function} and the private helpers it needs, with \
+                 names the namespace does not use yet.\n"
             ),
         ),
         None => (
@@ -252,9 +252,14 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
             String::new(),
         ),
     };
-    let signature = match *arguments {
-        1 => format!("({function} [input] …), taking one argument: the input value of an example"),
-        n => format!(
+    let existing = input.doc.project.as_ref().and_then(crate::project::signature);
+    let signature = match (*arguments, &existing) {
+        (_, Some(head)) => format!(
+            "{function}, which already exists. Keep its docstring and parameter names exactly as \
+             they are:\n{head}\n"
+        ),
+        (1, None) => format!("({function} [input] …), taking one argument: the input value of an example"),
+        (n, None) => format!(
             "({function} [{}] …), taking {n} arguments: the elements of an example's input vector",
             (1..=n).map(|i| format!("arg{i}")).collect::<Vec<_>>().join(" ")
         ),
@@ -263,11 +268,11 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
         "Write a Clojure {version} namespace implementing the transformation specified below.\n\
          Rules:\n\
          {start}\
-         - Define exactly one public function, {signature}. It must return the expected output of every \
-         example and accepted test, and follow the steps, the contract, and the user's answers.\n\
+         - Define exactly one public function, {signature}{period} It must return the expected output of \
+         every example and accepted test, and follow the steps, the contract, and the user's answers.\n\
          {project}\
          - Define helpers with defn-. Top-level forms other than defn, defn-, def, and declare are \
-         not allowed. Write no comments and no example calls.\n\
+         not allowed. {comments}\n\
          - Use {allowed}.{others}\n\
          - The function must be pure: no I/O, printing, randomness, time, atoms, futures, agents, or \
          dynamic vars; no eval, read-string, resolve, or other dynamic evaluation; no Java interop \
@@ -276,6 +281,12 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
          sets) unless the examples show a sequence.\n\
          Answer with only the complete source in a ```clojure code block, nothing before or after it.",
         version = input.clojure_version,
+        period = if existing.is_some() { "" } else { "." },
+        comments = if existing.is_some() {
+            "Write no comments other than that docstring, and no example calls."
+        } else {
+            "Write no comments and no example calls."
+        },
     )
 }
 
@@ -609,6 +620,35 @@ mod tests {
             text.contains("called with the elements of the input as its arguments"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_existing_project_function_keeps_its_docstring_and_parameters() {
+        let mut d = doc();
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "shop.orders".into(),
+            function: "label".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: "(ns shop.orders)\n\n(defn label\n  \"Names an order.\"\n  [order]\n  (:name order))\n"
+                .into(),
+        });
+        let names = Names::for_document(&d, |_| false);
+        let r = generation_request(GenerationInput {
+            doc: &d,
+            names: &names,
+            allowed: &deps::allowed(&d),
+            clojure_version: "1.12.6",
+            documentation: None,
+            seed: 1,
+        });
+        let text = all_text(&r);
+        assert!(
+            text.contains("(defn label\n  \"Names an order.\"\n  [order]\n  …)"),
+            "{text}"
+        );
+        assert!(!text.contains("[input]"), "{text}");
+        assert!(!text.contains("Write no comments."), "{text}");
     }
 
     #[test]

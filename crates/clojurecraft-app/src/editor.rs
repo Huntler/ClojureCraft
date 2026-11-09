@@ -63,6 +63,7 @@ pub enum Action {
     Removed { message: String, undo: Undo },
     Interpret,
     ProposeContract,
+    Describe,
     CancelJob,
     DismissReport,
 }
@@ -126,6 +127,7 @@ pub fn show(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
         }
     }
     save_problem(ui, &status, cx);
+    crate::describe_view::describe(ui, &open.doc, cx);
     ui.add_space(14.0);
 
     section(ui, "Description", "What the function does, in your own words.");

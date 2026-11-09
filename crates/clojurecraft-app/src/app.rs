@@ -510,6 +510,7 @@ impl ClojureCraftApp {
             (JobKind::Generate, None) => {}
             (JobKind::ProposeTests, _) => self.assistant.propose_tests(&doc, &mut ports),
             (JobKind::Explain, _) => self.assistant.explain(&doc, &mut ports),
+            (JobKind::Describe, _) => self.assistant.describe(&doc, &mut ports),
         }
         Ok(())
     }
@@ -1502,6 +1503,7 @@ impl ClojureCraftApp {
                 Action::Removed { message, undo } => self.toast(message, Some(undo)),
                 Action::Interpret => self.start_job(id, JobKind::Interpret),
                 Action::ProposeContract => self.start_job(id, JobKind::ProposeContract),
+                Action::Describe => self.start_job(id, JobKind::Describe),
                 Action::CancelJob => self.cancel_job(),
                 Action::DismissReport => self.assistant.dismiss_report(id),
             }

@@ -4,6 +4,7 @@
 mod app;
 mod contract_view;
 mod dataset_view;
+mod describe_view;
 mod edge_cases_view;
 mod editor;
 mod edn_view;

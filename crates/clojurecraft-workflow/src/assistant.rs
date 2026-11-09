@@ -44,7 +44,7 @@ use crate::answers::{self, InterpretationAnswer};
 use crate::requests::{self, DOCUMENTATION_DROP_ORDER};
 use crate::validation::{self, Plan, ReportContext};
 use crate::{Candidate, GenerationInput, Names, Provenance, deps, readiness};
-use crate::{cleanup, delimiters, edge_cases, edits};
+use crate::{cleanup, delimiters, describe, edge_cases, edits};
 use clojurecraft_clojure::{ClojureRuntime, EvalOutcome, EvalRequest};
 use clojurecraft_domain::{
     DocumentationRef, ExecutionEnvironment, Fingerprint, FunctionDocument, FunctionId, GenerationRunId,
@@ -215,6 +215,8 @@ pub enum JobKind {
     Generate,
     ProposeTests,
     Explain,
+    /// Writes the specification of existing code and records example outputs by running it.
+    Describe,
 }
 
 impl JobKind {
@@ -226,6 +228,7 @@ impl JobKind {
             Self::Generate => "generate the implementation",
             Self::ProposeTests => "propose edge cases",
             Self::Explain => "explain the code",
+            Self::Describe => "describe the code",
         }
     }
 }
@@ -244,6 +247,9 @@ pub enum Phase {
     Repairing,
     Explaining,
     ProposingTests,
+    Describing,
+    /// Running existing code on the described example inputs.
+    Recording,
 }
 
 impl Phase {
@@ -260,6 +266,8 @@ impl Phase {
             Self::Repairing => "Fixing the code",
             Self::Explaining => "Explaining the code",
             Self::ProposingTests => "Proposing edge cases",
+            Self::Describing => "Describing the code",
+            Self::Recording => "Running the examples",
         }
     }
 }
@@ -412,6 +420,15 @@ pub struct Job {
     generation: Option<GenState>,
     /// For an explanation: the code explained and the steps numbered in the request.
     explaining: Option<(String, Vec<Step>)>,
+    describing: Option<Describing>,
+}
+
+/// A description in progress: the code described and the model's answer.
+struct Describing {
+    code: String,
+    answer: Option<describe::DescriptionAnswer>,
+    /// The parts of the specification filled so far.
+    filled: Vec<String>,
 }
 
 impl Job {
@@ -494,6 +511,11 @@ pub enum Report {
     },
     /// The code's explanation was stored.
     Explained {
+        notes: Vec<String>,
+    },
+    /// The specification of existing code was written: `filled` names the parts filled.
+    Described {
+        filled: Vec<String>,
         notes: Vec<String>,
     },
     /// Code was applied to the function.
@@ -589,6 +611,12 @@ impl Assistant {
             self.reports.insert(doc.id, Report::Blocked(r.blocking));
             return Err(());
         }
+        self.start(doc, kind, phase, r.notes);
+        Ok(())
+    }
+
+    /// Starts a job without checking the specification.
+    fn start(&mut self, doc: &FunctionDocument, kind: JobKind, phase: Phase, notes: Vec<String>) {
         self.reports.remove(&doc.id);
         self.job = Some(Job {
             function: doc.id,
@@ -602,12 +630,12 @@ impl Assistant {
             gather: None,
             validation: None,
             spec_basis: doc.spec_fingerprint(),
-            notes: r.notes,
+            notes,
             interpretation: None,
             generation: None,
             explaining: None,
+            describing: None,
         });
-        Ok(())
     }
 
     /// Sends `request` for the current job, ending the job if it cannot be sent.
@@ -716,6 +744,83 @@ impl Assistant {
                 ports,
             );
         }
+    }
+
+    /// Writes the specification of the current code, which may be hand-written: the model
+    /// describes it and proposes example inputs, the code is run to record their outputs, and a
+    /// contract is proposed from the result. Only empty parts of the specification are filled;
+    /// examples are added. The specification need not be complete to start.
+    pub fn describe(&mut self, doc: &FunctionDocument, ports: &mut dyn Ports) {
+        if self.job.is_some() {
+            return;
+        }
+        if let Some(why) = describe::blocker(doc) {
+            self.reports.insert(doc.id, Report::Blocked(vec![why.to_owned()]));
+            return;
+        }
+        let code = doc
+            .implementation
+            .as_ref()
+            .map(|i| i.source.clone())
+            .unwrap_or_default();
+        self.start(doc, JobKind::Describe, Phase::Describing, Vec::new());
+        if let Some(job) = &mut self.job {
+            job.describing = Some(Describing {
+                code: code.clone(),
+                answer: None,
+                filled: Vec::new(),
+            });
+        }
+        self.send(describe::request(doc, &code), Phase::Describing, ports);
+    }
+
+    /// Applies the description and the recorded examples, then proposes a contract unless one is
+    /// accepted.
+    fn described(
+        &mut self,
+        examples: Vec<clojurecraft_domain::Example>,
+        notes: Vec<String>,
+        doc: &mut FunctionDocument,
+        ports: &mut dyn Ports,
+    ) -> Vec<Update> {
+        let Some(job) = &mut self.job else {
+            return Vec::new();
+        };
+        let function = job.function;
+        job.notes.extend(notes);
+        let Some(d) = &mut job.describing else {
+            return Vec::new();
+        };
+        let Some(answer) = &d.answer else {
+            return Vec::new();
+        };
+        if doc.implementation.as_ref().is_none_or(|i| i.source != d.code) {
+            self.end(Report::Failed {
+                what: job_label(JobKind::Describe),
+                message: "the code changed while it was being described".into(),
+                remedies: Vec::new(),
+                raw: None,
+            });
+            return Vec::new();
+        }
+        d.filled = describe::apply(doc, answer, examples);
+        let accepted = doc
+            .contract
+            .as_ref()
+            .is_some_and(|c| c.status == clojurecraft_domain::ContractStatus::Accepted);
+        if accepted {
+            self.finish_description();
+        } else {
+            self.send(requests::contract_request(doc), Phase::Proposing, ports);
+        }
+        vec![Update::Edited(function)]
+    }
+
+    fn finish_description(&mut self) {
+        let Some(job) = &mut self.job else { return };
+        let filled = job.describing.take().map(|d| d.filled).unwrap_or_default();
+        let notes = std::mem::take(&mut job.notes);
+        self.end(Report::Described { filled, notes });
     }
 
     /// Starts a generation; `documentation` says whether a documentation collection is installed.
@@ -983,6 +1088,12 @@ impl Assistant {
             return Vec::new();
         };
         match job.phase {
+            // The description is already applied; only the contract is missing.
+            Phase::Proposing if job.kind == JobKind::Describe => {
+                job.notes.push(format!("No contract was proposed: {e}"));
+                self.finish_description();
+                Vec::new()
+            }
             // Planning only improves retrieval; continue without it.
             Phase::Planning => {
                 job.notes.push(format!(
@@ -1170,6 +1281,31 @@ impl Assistant {
                     Vec::new()
                 }
             },
+            Phase::Proposing if job.kind == JobKind::Describe => {
+                let function = job.function;
+                let accepted = doc
+                    .contract
+                    .as_ref()
+                    .is_some_and(|c| c.status == clojurecraft_domain::ContractStatus::Accepted);
+                let allowed: Vec<String> = deps::allowed(doc).into_iter().collect();
+                let mut updates = Vec::new();
+                match answers::parse_contract(value, allowed) {
+                    Ok(_) if accepted => job
+                        .notes
+                        .push("A contract was accepted meanwhile, so none was proposed.".into()),
+                    Ok((contract, notes)) => {
+                        doc.contract = Some(contract);
+                        job.notes.extend(notes);
+                        if let Some(d) = &mut job.describing {
+                            d.filled.push("a proposed contract".into());
+                        }
+                        updates.push(Update::Edited(function));
+                    }
+                    Err(e) => job.notes.push(format!("No contract was proposed: {e}.")),
+                }
+                self.finish_description();
+                updates
+            }
             Phase::Proposing => {
                 if doc
                     .contract
@@ -1232,7 +1368,40 @@ impl Assistant {
                     Vec::new()
                 }
             },
-            Phase::Retrieving | Phase::Validating | Phase::Analyzing => Vec::new(),
+            Phase::Retrieving | Phase::Validating | Phase::Analyzing | Phase::Recording => Vec::new(),
+            Phase::Describing => {
+                let answer = match describe::parse(value) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.malformed(e, &g.text);
+                        return Vec::new();
+                    }
+                };
+                let Some(d) = &mut job.describing else {
+                    return Vec::new();
+                };
+                let code = d.code.clone();
+                job.notes.extend(answer.notes.iter().cloned());
+                let inputs = answer.inputs.clone();
+                d.answer = Some(answer);
+                if inputs.is_empty() {
+                    return self.described(Vec::new(), Vec::new(), doc, ports);
+                }
+                let started = describe::run_request(doc, &code, &inputs).and_then(|r| ports.validate(r));
+                match started {
+                    Ok(id) => {
+                        job.validation = Some(id);
+                        job.phase = Phase::Recording;
+                        job.output.clear();
+                        job.reasoning.clear();
+                        Vec::new()
+                    }
+                    Err(why) => {
+                        let note = format!("No example outputs were recorded: {why}.");
+                        self.described(Vec::new(), vec![note], doc, ports)
+                    }
+                }
+            }
             Phase::Generating | Phase::Repairing => {
                 let Some(gen_state) = &mut job.generation else {
                     return Vec::new();
@@ -1346,6 +1515,17 @@ impl Assistant {
             self.end(Report::Cancelled);
             return Vec::new();
         };
+        if job.kind == JobKind::Describe {
+            let inputs = job
+                .describing
+                .as_ref()
+                .and_then(|d| d.answer.as_ref())
+                .map(|a| a.inputs.clone())
+                .unwrap_or_default();
+            let (examples, notes) =
+                describe::recorded_examples(&inputs, execution.outcome.as_ref().map_err(String::as_str));
+            return self.described(examples, notes, doc, ports);
+        }
         self.validated(execution.outcome, Some(execution.environment), doc, ports)
     }
 
@@ -3130,6 +3310,183 @@ mod tests {
         };
         assert_eq!(attempts.len(), 1);
         assert!(notes[0].contains("Could not generate"), "{notes:?}");
+    }
+
+    fn hand_written(d: &mut Docs, id: FunctionId) {
+        let doc = d.0.get_mut(&id).unwrap();
+        doc.description.clear();
+        doc.steps.clear();
+        doc.examples.clear();
+        doc.implementation = Some(Implementation::manual(CODE));
+    }
+
+    fn description(inputs: &[(&str, &str)]) -> Value {
+        json!({"description": "Total the order amounts per customer.",
+               "steps": ["Group the orders by :customer.", "Sum the :amount of each group."],
+               "examples": inputs.iter().map(|(n, i)| json!({"name": n, "input": i})).collect::<Vec<_>>()})
+    }
+
+    fn contract_proposal() -> Value {
+        json!({"input": {"description": "orders", "value_type": "vector", "keys": []},
+               "output": {"description": "totals", "value_type": "map", "keys": []},
+               "ordering": "unspecified", "sorted_by": "", "notes": ""})
+    }
+
+    /// Harness output for the last validation request: each call returns the given value, or
+    /// throws when it is `None`.
+    fn returning(p: &FakePorts, values: &[Option<&str>]) -> Execution {
+        let mut out = String::from(
+            "{\"event\":\"read\",\"ok\":true}\n{\"event\":\"check\",\"ok\":true}\n\
+             {\"event\":\"lint\",\"findings\":[]}\n{\"event\":\"load\",\"ok\":true}\n",
+        );
+        for (i, v) in values.iter().enumerate() {
+            out.push_str(&match v {
+                Some(v) => format!(
+                    "{{\"event\":\"result\",\"index\":{i},\"status\":\"ok\",\"actual\":{},\"elapsed-ns\":1000}}\n",
+                    json!(v)
+                ),
+                None => format!(
+                    "{{\"event\":\"result\",\"index\":{i},\"status\":\"error\",\"error\":{{\"phase\":\"call\",\"class\":\"java.lang.NullPointerException\",\"message\":\"boom\"}}}}\n"
+                ),
+            });
+        }
+        out.push_str("{\"event\":\"done\"}\n");
+        assert_eq!(p.validations.last().unwrap().calls.len(), values.len());
+        Execution {
+            outcome: Ok(EvalOutcome {
+                status: EvalStatus::Completed,
+                report: HarnessReport::parse(&out),
+                stderr: String::new(),
+                elapsed: Duration::from_millis(600),
+            }),
+            environment: env(),
+        }
+    }
+
+    #[test]
+    fn describing_hand_written_code_fills_the_specification_with_outputs_the_code_returns() {
+        let (mut a, mut p, mut d, id) = setup();
+        hand_written(&mut d, id);
+        a.describe(&d.0[&id], &mut p);
+        assert_eq!(a.job().unwrap().phase, Phase::Describing);
+        assert!(p.last_text().contains("(group-by :customer)"), "the code is sent");
+
+        reply(
+            &mut a,
+            &mut p,
+            &mut d,
+            description(&[
+                ("two orders", "[{:customer 1 :amount 2} {:customer 1 :amount 3}]"),
+                ("broken", "[{:a"),
+            ]),
+        );
+        assert_eq!(a.job().unwrap().phase, Phase::Recording);
+        let run = p.validations.last().unwrap();
+        assert_eq!(run.calls.len(), 1, "the unreadable input is not run");
+        assert_eq!(run.calls[0].expected, None);
+
+        let e = returning(&p, &[Some("{1 5}")]);
+        let updates = a.on_validated(p.validations.len() as u64, e, &mut d, &mut p);
+        assert_eq!(updates, vec![Update::Edited(id)]);
+        assert_eq!(a.job().unwrap().phase, Phase::Proposing);
+        assert!(p.last_text().contains("Total the order amounts per customer."));
+
+        reply(&mut a, &mut p, &mut d, contract_proposal());
+        let doc = &d.0[&id];
+        assert_eq!(doc.description, "Total the order amounts per customer.");
+        assert_eq!(doc.steps.len(), 2);
+        assert_eq!(doc.examples.len(), 1);
+        assert_eq!(doc.examples[0].name, "two orders");
+        assert_eq!(doc.examples[0].expected.as_str(), "{1 5}");
+        assert_eq!(doc.contract.as_ref().unwrap().status, ContractStatus::Proposed);
+        let Some(Report::Described { filled, notes }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        assert_eq!(
+            *filled,
+            ["description", "steps", "1 example", "a proposed contract"]
+        );
+        assert!(notes.iter().any(|n| n.contains("broken")), "{notes:?}");
+    }
+
+    #[test]
+    fn describing_keeps_the_users_text_an_accepted_contract_and_drops_throwing_inputs() {
+        let (mut a, mut p, mut d, id) = setup();
+        let accepted = Contract::empty(ContractStatus::Accepted);
+        {
+            let doc = d.0.get_mut(&id).unwrap();
+            doc.implementation = Some(Implementation::manual(CODE));
+            doc.contract = Some(accepted.clone());
+        }
+        let before = d.0[&id].clone();
+        a.describe(&d.0[&id], &mut p);
+        reply(
+            &mut a,
+            &mut p,
+            &mut d,
+            description(&[
+                ("known", "[{:customer 1 :amount 2}]"),
+                ("new", "[]"),
+                ("throws", "[nil]"),
+            ]),
+        );
+        let e = returning(&p, &[Some("{1 2}"), Some("{}"), None]);
+        a.on_validated(p.validations.len() as u64, e, &mut d, &mut p);
+
+        assert_eq!(p.sent.len(), 1, "no contract is proposed over an accepted one");
+        let doc = &d.0[&id];
+        assert_eq!(doc.description, before.description);
+        assert_eq!(doc.steps, before.steps);
+        assert_eq!(doc.contract.as_ref(), Some(&accepted));
+        assert_eq!(doc.examples.len(), 2, "only the new input is added");
+        assert_eq!(doc.examples[1].expected.as_str(), "{}");
+        let Some(Report::Described { filled, notes }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        assert_eq!(*filled, ["1 example"]);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("throws") && n.contains("NullPointerException"))
+        );
+    }
+
+    #[test]
+    fn describing_without_a_runtime_still_fills_the_description() {
+        let (mut a, mut p, mut d, id) = setup();
+        hand_written(&mut d, id);
+        p.no_runtime = true;
+        a.describe(&d.0[&id], &mut p);
+        reply(&mut a, &mut p, &mut d, description(&[("empty", "[]")]));
+        assert_eq!(a.job().unwrap().phase, Phase::Proposing);
+        reply(&mut a, &mut p, &mut d, contract_proposal());
+        assert!(d.0[&id].examples.is_empty());
+        assert!(!d.0[&id].description.is_empty());
+        let Some(Report::Described { notes, .. }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        assert!(notes.iter().any(|n| n.contains("Java runtime")), "{notes:?}");
+    }
+
+    #[test]
+    fn code_changed_while_being_described_is_not_described() {
+        let (mut a, mut p, mut d, id) = setup();
+        hand_written(&mut d, id);
+        a.describe(&d.0[&id], &mut p);
+        reply(&mut a, &mut p, &mut d, description(&[("empty", "[]")]));
+        d.0.get_mut(&id).unwrap().implementation = Some(Implementation::manual(WRONG));
+        let e = returning(&p, &[Some("{}")]);
+        a.on_validated(p.validations.len() as u64, e, &mut d, &mut p);
+        assert!(d.0[&id].description.is_empty());
+        assert!(matches!(a.report(id), Some(Report::Failed { .. })));
+    }
+
+    #[test]
+    fn functions_without_code_cannot_be_described() {
+        let (mut a, mut p, d, id) = setup();
+        a.describe(&d.0[&id], &mut p);
+        assert!(p.sent.is_empty());
+        assert!(matches!(a.report(id), Some(Report::Blocked(_))));
     }
 
     /// Edge cases, accepted code, and fixes for failing cases.

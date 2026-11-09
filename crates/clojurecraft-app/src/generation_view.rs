@@ -309,7 +309,10 @@ pub fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mu
         }),
         Report::Cancelled => muted(ui, "Cancelled."),
         // Shown in the specification editor.
-        Report::Interpreted { .. } | Report::ContractProposed { .. } | Report::TestsProposed { .. } => {}
+        Report::Interpreted { .. }
+        | Report::ContractProposed { .. }
+        | Report::TestsProposed { .. }
+        | Report::Described { .. } => {}
         Report::Explained { notes: n } => {
             if !n.is_empty() {
                 boxed(ui, theme::LINE, |ui| notes(ui, n));

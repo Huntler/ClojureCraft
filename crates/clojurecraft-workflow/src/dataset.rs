@@ -1,10 +1,11 @@
-//! A fine-tuning dataset made from saved functions: for each function whose generated code passes
-//! its checks, the opening generation request (the model input) and the validated code (the
-//! output), one JSON object per line.
+//! A fine-tuning dataset made from saved functions: for each function whose code passes its
+//! checks, the opening generation request (the model input) and the validated code (the output),
+//! one JSON object per line. The code is either generated and unedited, or written by hand (for
+//! example imported from a project and described from its code).
 //!
 //! The recorded prompt is used while it still matches the current specification. Otherwise (the
-//! specification changed after generation, or the code predates recorded prompts) the prompt is
-//! rebuilt from the current specification, without the documentation retrieved at the time.
+//! specification changed after generation, the code predates recorded prompts, or was written by
+//! hand) the prompt is rebuilt from the current specification, without retrieved documentation.
 
 use std::collections::BTreeSet;
 
@@ -35,16 +36,22 @@ pub struct Entry {
     pub checks_passed: usize,
 }
 
+/// The `model` of an entry whose code was written by hand.
+pub const HAND_WRITTEN: &str = "hand-written";
+
 /// The dataset entry of `doc`, or why it has none. `reports` are its validation reports, newest
 /// first.
 pub fn entry(doc: &FunctionDocument, reports: &[ValidationReport]) -> Result<Entry, String> {
     let implementation = doc.implementation.as_ref().ok_or("no implementation")?;
-    let generation = implementation
-        .generation
-        .as_ref()
-        .ok_or("the code was written by hand")?;
-    if implementation.is_manually_edited() {
-        return Err("the generated code was edited by hand".into());
+    let generation = implementation.generation.as_ref();
+    match generation {
+        Some(_) if implementation.is_manually_edited() => {
+            return Err("the generated code was edited by hand".into());
+        }
+        None if doc.description.trim().is_empty() => {
+            return Err("the code was written by hand and has no description".into());
+        }
+        _ => {}
     }
     let basis = doc.basis();
     let report = reports
@@ -56,10 +63,9 @@ pub fn entry(doc: &FunctionDocument, reports: &[ValidationReport]) -> Result<Ent
     }
     let names = export::names(doc);
     let rebuilt = rebuilt_prompt(doc, &names, &report.environment.clojure_version);
-    let (messages, prompt_source) = if matches(&generation.prompt, &rebuilt) {
-        (generation.prompt.clone(), PromptSource::Recorded)
-    } else {
-        (rebuilt, PromptSource::Rebuilt)
+    let (messages, prompt_source) = match generation {
+        Some(g) if matches(&g.prompt, &rebuilt) => (g.prompt.clone(), PromptSource::Recorded),
+        _ => (rebuilt, PromptSource::Rebuilt),
     };
     Ok(Entry {
         function_id: doc.id,
@@ -67,8 +73,8 @@ pub fn entry(doc: &FunctionDocument, reports: &[ValidationReport]) -> Result<Ent
         messages,
         output: implementation.source.clone(),
         prompt_source,
-        model: generation.model.display_name.clone(),
-        attempts: generation.attempts,
+        model: generation.map_or_else(|| HAND_WRITTEN.to_owned(), |g| g.model.display_name.clone()),
+        attempts: generation.map_or(0, |g| g.attempts),
         checks_passed: report.checks.len(),
     })
 }
@@ -231,7 +237,21 @@ mod tests {
     }
 
     #[test]
-    fn only_unedited_generated_code_with_current_passing_checks_qualifies() {
+    fn hand_written_code_with_a_description_qualifies_with_a_rebuilt_prompt() {
+        let mut manual = doc(with_docs);
+        manual.implementation.as_mut().unwrap().generation = None;
+        let e = entry(&manual, &[report(&manual, CheckStatus::Passed)]).unwrap();
+        assert_eq!(e.prompt_source, PromptSource::Rebuilt);
+        assert_eq!(e.messages, rebuilt(&manual));
+        assert_eq!(e.model, HAND_WRITTEN);
+        assert_eq!(e.output, CODE);
+
+        manual.description = "  ".into();
+        assert!(entry(&manual, &[report(&manual, CheckStatus::Passed)]).is_err());
+    }
+
+    #[test]
+    fn only_unedited_generated_or_hand_written_code_with_current_passing_checks_qualifies() {
         let good = doc(with_docs);
         let passed = report(&good, CheckStatus::Passed);
         assert!(entry(&good, &[report(&good, CheckStatus::Failed)]).is_err());
@@ -244,10 +264,6 @@ mod tests {
         let mut stale = good.clone();
         stale.examples[0].expected = Edn::new("5");
         assert!(entry(&stale, std::slice::from_ref(&passed)).is_err());
-
-        let mut manual = good.clone();
-        manual.implementation.as_mut().unwrap().generation = None;
-        assert!(entry(&manual, &[report(&manual, CheckStatus::Passed)]).is_err());
 
         let newest_first = [report(&good, CheckStatus::Failed), passed];
         assert!(entry(&good, &newest_first).is_err());
