@@ -902,17 +902,36 @@ window on the same library does not serve; a socket left behind by a crash is re
 `tools/call`. Bad arguments are tool results with `isError` so the agent can correct them;
 unknown methods and tools are JSON-RPC errors.
 
-**Tools.** `list_functions`; `create_function` and `update_function` (name, description, steps
-and examples replaced as a whole, EDN as text, an accepted contract or `null`; all-or-nothing with
-field-level errors such as `examples[1].input: …`, answered with the id and the specification's
-readiness only); `create_functions` (several specifications, all or nothing, errors prefixed
-`functions[i]`); `get_function` (specification and test cases with ids); `generate_test_cases`
+**Tools.** `list_functions` (optional `query` filter); `create_function` and `update_function`
+(name, description, steps and examples replaced as a whole, EDN as text, an accepted contract or
+`null`; all-or-nothing with field-level errors such as `examples[1].input: …`, answered with the
+id and the specification's readiness only); `create_function` with `functions` creates several
+(all or nothing, errors prefixed `functions[i]`; the former tool name `create_functions` is still
+accepted). While a project is open, `create_function` takes the `namespace` (created when
+missing) and `arguments`; the name is the function's symbol, and the specification is recorded in
+`ClojureCraft.json` before the function opens. `get_function` (specification and test cases with ids); `generate_test_cases`
 (from the examples, or from the whole specification); `review_test_cases` (accept, reject,
 reopen, remove, or edit cases and add the agent's own, accepted by default; all-or-nothing;
 accepting records a `TestsAccepted` revision); `run_tests`; `generate` (fresh, or `fix` from the
 failing checks; one function or `function_ids`); `status` (one function, or a line per function
 with `function_ids`); `result`; `accept_code` (code held for review); `submit_code`;
 `export_project`; `cancel` (also empties the queue).
+
+**Fewer calls.** `function_id` and `function_ids` also take a name (the library name or its
+derived function name; in a project the symbol, the display name, or `namespace/function`,
+case-insensitive): the protocol layer resolves names to ids through the application before parsing
+and reports unknown or ambiguous names. Tools that start work (`generate`, `generate_test_cases`,
+`describe`, `run_tests`, `submit_code`) take `wait_seconds` and then answer with the finished
+`status`; `create_function`, `update_function`, and `review_test_cases` with `generate: true` also start
+generation, so specify (or correct), generate, wait, and read the code is one call (the reply is
+the status, with the tool's own reply under `created` or `changed`). A single function's `status` lists only what is not empty or false, the test cases
+waiting for review with their ids (`tests_to_review`), and, once the current code passes every
+check, `result` with namespace, function, and code.
+
+**Token budget.** `tools/list` is sent to every agent session, so its descriptions are one
+sentence, the specification schema appears once (`update_function` refers to it), and the
+conventions (EDN as strings, waiting, names) are stated once in the instructions; a test keeps the
+catalogue under 9,500 bytes.
 
 **Queue.** `generate` for a function while the model works on another queues the generation
 instead of refusing it (a missing model is still reported at once). Queued generations start in

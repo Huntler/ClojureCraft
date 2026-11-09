@@ -1,9 +1,10 @@
 //! The tool catalogue offered to agents and the typed calls the application carries out.
 //!
-//! Every tool that changes a function, starts work, or reads results takes the `function_id`
-//! returned by `create_function` or `list_functions`. Model work (test-case proposals and
-//! generation) runs in the background: the tool returns at once and `status` reports progress,
-//! optionally waiting for the work to finish so that the agent does not poll.
+//! Every tool that changes a function, starts work, or reads results takes a `function_id`: the
+//! id returned by `create_function` or `list_functions`, or a name the application resolves
+//! (see [`Call::Resolve`]). Model work (test-case proposals and generation) runs in the
+//! background; tools that start it take `wait_seconds` to answer with the finished `status`, so a
+//! basic task needs one call instead of a start-and-poll loop.
 
 use clojurecraft_domain::FunctionId;
 use serde::Deserialize;
@@ -27,6 +28,10 @@ pub struct SpecArgs {
     /// An object sets (and accepts) the contract; `null` removes it; absence keeps it.
     #[serde(default, deserialize_with = "present")]
     pub contract: Option<Option<ContractArg>>,
+    /// Project mode, on creation only: the namespace to add the function to.
+    pub namespace: Option<String>,
+    /// Project mode, on creation only: how many arguments the function takes.
+    pub arguments: Option<u32>,
 }
 
 /// Distinguishes an explicit `null` from an absent field.
@@ -159,7 +164,10 @@ pub enum GenerateMode {
 /// A tool call with validated arguments.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
-    ListFunctions,
+    /// With an optional case-insensitive filter on name, namespace, and description.
+    ListFunctions(Option<String>),
+    /// Not a tool: function names (`name`, `function`, or `namespace/function`) to ids, in order.
+    Resolve(Vec<String>),
     CreateFunction(SpecArgs),
     CreateFunctions(Vec<SpecArgs>),
     /// Not a tool: answers a create call once its new functions are open.
@@ -201,25 +209,75 @@ pub struct ExportArgs {
     pub overwrite: bool,
 }
 
+/// A parsed `tools/call`: the call, how long to wait for the work it starts, and whether new
+/// functions are generated right away.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Parsed {
+    pub call: Call,
+    pub wait: u64,
+    pub generate: bool,
+}
+
+/// Tools that take `wait_seconds`.
+const WAITING: [&str; 9] = [
+    "create_function",
+    "update_function",
+    "review_test_cases",
+    "generate",
+    "generate_test_cases",
+    "describe",
+    "run_tests",
+    "submit_code",
+    "status",
+];
+
+/// Tools that take `generate`: change the specification or tests, then generate at once.
+const GENERATING: [&str; 3] = ["create_function", "update_function", "review_test_cases"];
+
 impl Call {
     /// Parses a `tools/call`. `Ok(None)` means the tool does not exist.
-    pub fn parse(name: &str, args: &Value) -> Result<Option<(Self, u64)>, String> {
-        let args = match args {
-            Value::Null => &json!({}),
-            Value::Object(_) => args,
+    pub fn parse(name: &str, args: &Value) -> Result<Option<Parsed>, String> {
+        let mut args = match args {
+            Value::Null => json!({}),
+            Value::Object(_) => args.clone(),
             _ => return Err("arguments must be an object".into()),
         };
+        let mut wait = 0;
+        if WAITING.contains(&name)
+            && let Some(w) = args.as_object_mut().and_then(|o| o.remove("wait_seconds"))
+        {
+            wait = w
+                .as_u64()
+                .ok_or("`wait_seconds` must be a non-negative integer")?
+                .min(MAX_WAIT_SECONDS);
+        }
+        let mut generate = false;
+        if GENERATING.contains(&name)
+            && let Some(g) = args.as_object_mut().and_then(|o| o.remove("generate"))
+        {
+            generate = g.as_bool().ok_or("`generate` must be a boolean")?;
+        }
+        let args = &args;
         let id = || function_id(args);
         let call = match name {
-            "list_functions" => Self::ListFunctions,
-            "create_function" => {
+            "list_functions" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct A {
+                    query: Option<String>,
+                }
+                let a: A = parse(args)?;
+                Self::ListFunctions(a.query.map(|q| q.trim().to_owned()).filter(|q| !q.is_empty()))
+            }
+            "create_function" if args.get("functions").is_none() => {
                 let spec: SpecArgs = parse(args)?;
                 if spec.name.as_deref().is_none_or(|n| n.trim().is_empty()) {
                     return Err("`name` is required".into());
                 }
                 Self::CreateFunction(spec)
             }
-            "create_functions" => {
+            // `create_functions` is the former name, kept for agents that remember it.
+            "create_function" | "create_functions" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct A {
@@ -242,7 +300,11 @@ impl Call {
             "get_function" => Self::GetFunction(id()?),
             "update_function" => {
                 let function = id()?;
-                Self::UpdateFunction(function, parse(&without(args, &["function_id"]))?)
+                let spec: SpecArgs = parse(&without(args, &["function_id"]))?;
+                if spec.namespace.is_some() || spec.arguments.is_some() {
+                    return Err("`namespace` and `arguments` are set on creation only".into());
+                }
+                Self::UpdateFunction(function, spec)
             }
             "generate_test_cases" => {
                 #[derive(Deserialize)]
@@ -305,16 +367,13 @@ impl Call {
                     #[allow(dead_code)]
                     function_ids: Option<Vec<String>>,
                     #[serde(default)]
-                    wait_seconds: u64,
-                    #[serde(default)]
                     verbose: bool,
                 }
                 let a: A = parse(args)?;
-                let call = match one_or_many(args)? {
+                match one_or_many(args)? {
                     One(f) => Self::Status(f, detail(a.verbose)),
                     Many(fs) => Self::StatusMany(fs),
-                };
-                return Ok(Some((call, a.wait_seconds.min(MAX_WAIT_SECONDS))));
+                }
             }
             "result" => {
                 #[derive(Deserialize)]
@@ -379,8 +438,35 @@ impl Call {
             "cancel" => Self::Cancel,
             _ => return Ok(None),
         };
-        Ok(Some((call, 0)))
+        Ok(Some(Parsed { call, wait, generate }))
     }
+
+    /// The `status` that reports on the work this call starts, if it starts any.
+    pub fn follow_up(&self) -> Option<Self> {
+        match self {
+            Self::GenerateTestCases(id, _)
+            | Self::Describe(id)
+            | Self::Generate(id, _)
+            | Self::RunTests(id)
+            | Self::SubmitCode(id, _) => Some(Self::Status(*id, Detail::Compact)),
+            Self::Status(..) | Self::StatusMany(_) => Some(self.clone()),
+            Self::GenerateMany(ids, _) => Some(Self::StatusMany(ids.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a tool of this name exists.
+pub fn exists(name: &str) -> bool {
+    name == "create_functions"
+        || catalogue()
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|t| t["name"] == name))
+}
+
+/// Whether `text` is a function id rather than a name.
+pub fn is_id(text: &str) -> bool {
+    text.trim().parse::<FunctionId>().is_ok()
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T, String> {
@@ -444,44 +530,47 @@ fn function_id(args: &Value) -> Result<FunctionId, String> {
 }
 
 // ---- catalogue -----------------------------------------------------------------------------------
+//
+// Sent to every agent session, so it is kept short: one sentence per tool where possible, the
+// specification schema once, and conventions (EDN strings, waiting) stated in the instructions.
 
-const TYPES: &str = "any, nil, boolean, integer, number, string, keyword, symbol, map, vector, list, \
-                     set, sequential, or your own words";
+const TYPES: &str = "any nil boolean integer number string keyword symbol map vector list set \
+                     sequential, or own words";
 
 fn function_id_schema() -> Value {
-    json!({"type": "string", "description": "Function id from create_function or list_functions."})
+    json!({"type": "string", "description": "Id, name, or namespace/function."})
 }
 
 fn ids_schema() -> Value {
-    json!({
-        "type": "array", "items": {"type": "string"}, "minItems": 1,
-        "description": "Several function ids, instead of function_id."
-    })
+    json!({"type": "array", "items": {"type": "string"}, "description": "Several, instead of function_id."})
+}
+
+fn wait_schema() -> Value {
+    json!({"type": "integer", "description": "Max 300; answer with status once the work ends."})
+}
+
+fn generate_schema() -> Value {
+    json!({"type": "boolean", "description": "Then generate the code."})
 }
 
 fn spec_properties() -> serde_json::Map<String, Value> {
     let shape = json!({
         "type": "object",
-        "additionalProperties": false,
         "properties": {
             "description": {"type": "string"},
-            "type": {"type": "string", "description": format!("Whole value type: {TYPES}.")},
+            "type": {"type": "string", "description": TYPES},
             "keys": {
                 "type": "array",
-                "description": "Keys of the map, or of each map in a collection of maps.",
+                "description": "Map keys (or keys of each map in a collection).",
                 "items": {
                     "type": "object",
-                    "additionalProperties": false,
                     "required": ["key"],
                     "properties": {
-                        "key": {"type": "string", "description": "EDN key, e.g. \":id\"."},
+                        "key": {"type": "string", "description": "e.g. \":id\""},
                         "required": {"type": "boolean"},
-                        "type": {"type": "string", "description": format!("Value type: {TYPES}.")},
-                        "nil": {
-                            "type": "string",
-                            "enum": ["unspecified", "disallowed", "treat_as_missing", "pass_through", "default"]
-                        },
-                        "default": {"type": "string", "description": "EDN default when nil is \"default\"."},
+                        "type": {"type": "string"},
+                        "nil": {"enum": ["unspecified", "disallowed", "treat_as_missing", "pass_through", "default"]},
+                        "default": {"type": "string", "description": "EDN, with nil=default"},
                         "notes": {"type": "string"}
                     }
                 }
@@ -489,41 +578,30 @@ fn spec_properties() -> serde_json::Map<String, Value> {
         }
     });
     let props = json!({
-        "name": {"type": "string", "description": "Title; the Clojure function name is derived from it."},
-        "description": {"type": "string", "description": "What the function does, in prose."},
-        "steps": {
-            "type": "array", "items": {"type": "string"},
-            "description": "Transformation steps in order (replaces all steps)."
-        },
+        "name": {"type": "string", "description": "Title; the function name derives from it (in a project: the symbol)."},
+        "description": {"type": "string", "description": "Input shape, output shape, rules."},
+        "steps": {"type": "array", "items": {"type": "string"}, "description": "In order; replaces all."},
         "examples": {
             "type": "array",
-            "description": "Input/expected-output pairs as EDN (replaces all examples). The function takes one argument.",
+            "description": "Replaces all. With arguments != 1, each input is a vector of the arguments.",
             "items": {
                 "type": "object",
-                "additionalProperties": false,
                 "required": ["input", "expected"],
                 "properties": {
                     "name": {"type": "string"},
-                    "input": {"type": "string", "description": "EDN, e.g. \"[{:id 1 :n 2}]\""},
-                    "expected": {"type": "string", "description": "EDN, or #throws ExceptionClass when the call must throw (e.g. #throws IllegalArgumentException)"}
+                    "input": {"type": "string"},
+                    "expected": {"type": "string", "description": "EDN, or #throws ExceptionClass"}
                 }
             }
         },
         "contract": {
             "type": ["object", "null"],
-            "description": "Accepted input/output contract (checked mechanically on outputs); null removes it.",
-            "additionalProperties": false,
+            "description": "Checked on outputs; null removes it.",
             "properties": {
                 "input": shape.clone(),
                 "output": shape,
-                "ordering": {
-                    "type": "string",
-                    "description": "unspecified, preserve_input, unordered (outputs compared as multisets), or \"sorted: <how>\"."
-                },
-                "allowed_namespaces": {
-                    "type": "array", "items": {"type": "string"},
-                    "description": "Namespaces the code may require. Default: clojure.string, clojure.set."
-                },
+                "ordering": {"type": "string", "description": "unspecified, preserve_input, unordered, or \"sorted: <how>\""},
+                "allowed_namespaces": {"type": "array", "items": {"type": "string"}, "description": "Default clojure.string, clojure.set."},
                 "notes": {"type": "string"}
             }
         }
@@ -538,93 +616,95 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     json!({
         "name": name,
         "description": description,
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": properties,
-            "required": required,
-        }
+        "inputSchema": {"type": "object", "properties": properties, "required": required}
     })
 }
 
 /// The `tools/list` result.
 pub fn catalogue() -> Value {
-    let create = spec_properties();
-    let mut update = spec_properties();
-    update.insert("function_id".into(), function_id_schema());
+    let mut create = spec_properties();
+    create.insert(
+        "namespace".into(),
+        json!({"type": "string", "description": "Project only (required there): namespace to add to; created if missing."}),
+    );
+    create.insert(
+        "arguments".into(),
+        json!({"type": "integer", "description": "Project only: argument count, default 1."}),
+    );
+    create.insert(
+        "functions".into(),
+        json!({"type": "array", "items": {"type": "object"}, "description": "Several specifications with the fields above, instead of one (all or nothing)."}),
+    );
+    create.insert("generate".into(), generate_schema());
+    create.insert("wait_seconds".into(), wait_schema());
+    // The same fields as create_function, without repeating their schemas.
+    let update = json!({
+        "function_id": function_id_schema(),
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "steps": {"type": "array", "items": {"type": "string"}},
+        "examples": {"type": "array", "items": {"type": "object"}},
+        "contract": {"type": ["object", "null"]},
+        "generate": generate_schema(),
+        "wait_seconds": wait_schema()
+    });
     let only_id = json!({"function_id": function_id_schema()});
+    let id_wait = json!({"function_id": function_id_schema(), "wait_seconds": wait_schema()});
     json!([
         tool(
             "list_functions",
-            "List saved functions (id, name, description). While a project is open, only its \
-             functions (with their namespace) and the project root; others cannot be used then.",
-            json!({}),
+            "Functions (id, name, description; namespace and project root while a project is open).",
+            json!({"query": {"type": "string", "description": "Filter on name, namespace, description."}}),
             &[],
         ),
         tool(
             "create_function",
-            "Create a function from a specification. Returns its id and readiness (what still \
-             blocks generation). Not available while a project is open.",
-            Value::Object(create.clone()),
-            &["name"],
-        ),
-        tool(
-            "create_functions",
-            "Create several functions at once (all or nothing). Returns each id and readiness, in order.",
-            json!({
-                "functions": {
-                    "type": "array", "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["name"],
-                        "properties": Value::Object(create),
-                    }
-                }
-            }),
-            &["functions"],
+            "Create functions from specifications; returns ids and readiness. With generate and \
+             wait_seconds, also generates and returns the finished status, with the code when it passes.",
+            Value::Object(create),
+            &[],
         ),
         tool(
             "get_function",
-            "Read a function's specification, test cases (with ids for review), and whether it has code.",
+            "Specification and test cases (with ids).",
             only_id.clone(),
             &["function_id"],
         ),
         tool(
             "update_function",
-            "Change a function's specification. Only the given fields change; steps and examples are replaced as a whole.",
-            Value::Object(update),
+            "Change the given fields of a specification (fields as in create_function); with \
+             generate and wait_seconds, regenerate and return the finished status.",
+            update,
             &["function_id"],
         ),
         tool(
             "generate_test_cases",
-            "Ask the local model to propose edge-case tests (background job; then call status with \
-             wait_seconds, and review_test_cases). source=examples (default) uses title, description, \
-             and examples; source=specification uses everything.",
+            "Model proposes edge-case tests to review. source=specification uses everything, \
+             examples (default) only title, description, examples.",
             json!({
                 "function_id": function_id_schema(),
-                "source": {"type": "string", "enum": ["examples", "specification"]}
+                "source": {"enum": ["examples", "specification"]},
+                "wait_seconds": wait_schema()
             }),
             &["function_id"],
         ),
         tool(
             "review_test_cases",
-            "Accept, reject, reopen, remove, or edit proposed test cases, and add your own (accepted by \
-             default). Accepted cases are regression tests that generation must pass. All-or-nothing.",
+            "Act on test cases by id and add your own (accepted by default). Accepted cases must \
+             pass. All or nothing.",
             json!({
                 "function_id": function_id_schema(),
                 "actions": {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "additionalProperties": false,
                         "required": ["id", "action"],
                         "properties": {
-                            "id": {"type": "string", "description": "Test case id from get_function."},
-                            "action": {"type": "string", "enum": ["accept", "reject", "reopen", "remove", "edit"]},
+                            "id": {"type": "string"},
+                            "action": {"enum": ["accept", "reject", "reopen", "remove", "edit"]},
                             "name": {"type": "string"},
-                            "input": {"type": "string", "description": "EDN (edit)"},
-                            "expected": {"type": "string", "description": "EDN (edit); decides an ambiguous case"}
+                            "input": {"type": "string"},
+                            "expected": {"type": "string"}
                         }
                     }
                 },
@@ -632,115 +712,94 @@ pub fn catalogue() -> Value {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "additionalProperties": false,
                         "required": ["input", "expected"],
                         "properties": {
                             "name": {"type": "string"},
-                            "input": {"type": "string", "description": "EDN"},
-                            "expected": {"type": "string", "description": "EDN, or #throws ExceptionClass when the call must throw"},
-                            "accept": {"type": "boolean", "description": "Default true."}
+                            "input": {"type": "string"},
+                            "expected": {"type": "string"},
+                            "accept": {"type": "boolean"}
                         }
                     }
-                }
+                },
+                "generate": generate_schema(),
+                "wait_seconds": wait_schema()
             }),
             &["function_id"],
         ),
         tool(
             "run_tests",
-            "Run the current code against every example and accepted test case in the sandbox \
-             (background; read the outcome with status).",
-            only_id.clone(),
+            "Check the current code against examples, accepted tests, and contract.",
+            id_wait.clone(),
             &["function_id"],
         ),
         tool(
             "describe",
-            "Let the local model describe the function's existing code (for example code from an \
-             opened project): it fills the description and steps when they are empty, and adds up to \
-             five examples whose expected values are recorded by running the code (background; then \
-             call status with wait_seconds, and get_function). Proposes a contract unless one is \
-             accepted.",
-            only_id.clone(),
+            "For existing code: fill empty description and steps, add up to 5 examples recorded \
+             by running the code, propose a contract.",
+            id_wait.clone(),
             &["function_id"],
         ),
         tool(
             "generate",
-            "Let ClojureCraft write the code: it plans, looks up documentation, generates, validates \
-             against examples, accepted tests, and the contract; failing code is fixed in up to five attempts of one \
-             conversation, where the model first finds the cause by evaluating expressions in the sandbox \
-             (background; then call status with wait_seconds). Give function_ids to generate several: \
-             jobs run one after another, and a job for a busy model is queued, not refused. mode=fix \
-             repairs the current code from its failing checks (run_tests first).",
+            "Write and validate the code, fixing failures in up to 5 attempts. Several functions \
+             queue. mode=fix repairs the current failing code.",
             json!({
                 "function_id": function_id_schema(),
                 "function_ids": ids_schema(),
-                "mode": {"type": "string", "enum": ["fresh", "fix"]}
+                "mode": {"enum": ["fresh", "fix"]},
+                "wait_seconds": wait_schema()
             }),
             &[],
         ),
         tool(
             "status",
-            "Progress of background work and the latest checks of the current code (passed, \
-             failures with expected/actual values), plus a hint for the next step. With function_ids, \
-             one short line per function (outcome, passed, first failure). wait_seconds (max 300) \
-             waits until the work (queued jobs included) finishes before answering. Failures are \
-             compact (the first of each kind; long values replaced by where they differ); \
-             verbose=true lists up to 8 with full values.",
+            "Progress, last job, failing checks, tests to review, next step; the code once all \
+             checks pass. With function_ids, one line each. verbose=true: full failure values.",
             json!({
                 "function_id": function_id_schema(),
                 "function_ids": ids_schema(),
-                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_SECONDS},
+                "wait_seconds": wait_schema(),
                 "verbose": {"type": "boolean"}
             }),
             &[],
         ),
         tool(
             "result",
-            "The function's current code (namespace and function name included) and whether it \
-             passes its checks; also code waiting for acceptance, if any (verbose=true for all of \
-             its failures).",
+            "Current code with namespace and function, whether it passes, and code waiting for acceptance.",
             json!({"function_id": function_id_schema(), "verbose": {"type": "boolean"}}),
             &["function_id"],
         ),
         tool(
             "accept_code",
-            "Use generated code that is waiting for review (for example a fix, code needing another \
-             namespace, or the best of failed attempts).",
+            "Use the generated code waiting for acceptance.",
             only_id,
             &["function_id"],
         ),
         tool(
             "submit_code",
-            "Make your own code the function's code (the previous code stays in its history) and run \
-             the same checks as generation: parse, structure, lint, load, examples, accepted tests, \
-             contract (background; then call status with wait_seconds). Use it when generation keeps \
-             failing. The code is one ns form plus one public defn taking one argument; keep the \
-             namespace and function name from result.",
+            "Your own code becomes the function's code and is checked. One ns form, defn- helpers, \
+             one public defn; keep namespace and function from result.",
             json!({
                 "function_id": function_id_schema(),
-                "code": {"type": "string", "description": "The whole namespace: (ns …) (defn- …)* (defn … [input] …)."}
+                "code": {"type": "string"},
+                "wait_seconds": wait_schema()
             }),
             &["function_id", "code"],
         ),
         tool(
             "export_project",
-            "Write functions as a Clojure project into a directory: each function's code under src/, \
-             a clojure.test file per function built from its examples and accepted test cases (compared \
-             like ClojureCraft's checks) under test/, and deps.edn with a :test alias. Existing files \
-             with other content are only replaced with overwrite=true. Returns the files and how to \
-             run the tests.",
+            "Write functions as a Clojure project: src/, clojure.test files from examples and \
+             accepted tests, deps.edn. Returns files and the test command.",
             json!({
-                "function_ids": {
-                    "type": "array", "items": {"type": "string"}, "minItems": 1,
-                    "description": "Functions to export (ids from create_function or list_functions)."
-                },
-                "directory": {"type": "string", "description": "Absolute path of the project root; created when missing."},
-                "overwrite": {"type": "boolean", "description": "Replace existing files that differ. Default false."}
+                "function_ids": {"type": "array", "items": {"type": "string"}},
+                "directory": {"type": "string", "description": "Absolute; created if missing."},
+                "overwrite": {"type": "boolean", "description": "Replace differing files."}
             }),
             &["function_ids", "directory"],
         ),
         tool(
             "cancel",
-            "Cancel the model job in progress and empty the generation queue.",
+            "Stop the model job and empty the queue.",
             json!({}),
             &[],
         ),
@@ -758,13 +817,13 @@ mod tests {
     #[test]
     fn calls_are_parsed_with_their_arguments() {
         let f = id();
-        let (call, wait) = Call::parse("status", &json!({"function_id": f, "wait_seconds": 9999}))
+        let p = Call::parse("status", &json!({"function_id": f, "wait_seconds": 9999}))
             .unwrap()
             .unwrap();
-        assert!(matches!(call, Call::Status(_, Detail::Compact)));
-        assert_eq!(wait, MAX_WAIT_SECONDS);
+        assert!(matches!(p.call, Call::Status(_, Detail::Compact)));
+        assert_eq!(p.wait, MAX_WAIT_SECONDS);
 
-        let (call, _) = Call::parse(
+        let Parsed { call, .. } = Call::parse(
             "update_function",
             &json!({"function_id": f, "description": "d", "contract": null}),
         )
@@ -777,7 +836,7 @@ mod tests {
         assert_eq!(spec.contract, Some(None), "null removes the contract");
         assert_eq!(spec.name, None);
 
-        let (call, _) = Call::parse("update_function", &json!({"function_id": f}))
+        let Parsed { call, .. } = Call::parse("update_function", &json!({"function_id": f}))
             .unwrap()
             .unwrap();
         let Call::UpdateFunction(_, spec) = call else {
@@ -789,18 +848,18 @@ mod tests {
     #[test]
     fn several_functions_can_be_named_at_once() {
         let (a, b) = (id(), id());
-        let (call, _) = Call::parse("generate", &json!({"function_ids": [a, b, a], "mode": "fix"}))
+        let Parsed { call, .. } = Call::parse("generate", &json!({"function_ids": [a, b, a], "mode": "fix"}))
             .unwrap()
             .unwrap();
         let Call::GenerateMany(ids, GenerateMode::Fix) = call else {
             panic!("{call:?}")
         };
         assert_eq!(ids.len(), 2, "duplicates are dropped");
-        let (call, wait) = Call::parse("status", &json!({"function_ids": [a], "wait_seconds": 5}))
+        let p = Call::parse("status", &json!({"function_ids": [a], "wait_seconds": 5}))
             .unwrap()
             .unwrap();
-        assert!(matches!(call, Call::StatusMany(_)));
-        assert_eq!(wait, 5);
+        assert!(matches!(p.call, Call::StatusMany(_)));
+        assert_eq!(p.wait, 5);
         assert!(Call::parse("status", &json!({"function_id": a, "function_ids": [b]})).is_err());
         assert!(Call::parse("generate", &json!({})).is_err());
         assert!(Call::parse("generate", &json!({"function_ids": []})).is_err());
@@ -833,7 +892,7 @@ mod tests {
         );
         assert!(Call::parse("export_project", &json!({"function_ids": [], "directory": "/p"})).is_err());
         assert!(Call::parse("submit_code", &json!({"function_id": id(), "code": "  "})).is_err());
-        let (call, _) = Call::parse(
+        let Parsed { call, .. } = Call::parse(
             "review_test_cases",
             &json!({"function_id": id(), "add": [{"input": "[]", "expected": "0"}]}),
         )
@@ -855,7 +914,6 @@ mod tests {
                 "export_project" => json!({"function_ids": [id()], "directory": "/tmp/p"}),
                 "submit_code" => json!({"function_id": id(), "code": "(ns a)"}),
                 "create_function" => json!({"name": "n"}),
-                "create_functions" => json!({"functions": [{"name": "n"}]}),
                 "review_test_cases" => {
                     json!({"function_id": id(), "actions": [{"id": id(), "action": "accept"}]})
                 }
@@ -863,5 +921,75 @@ mod tests {
             };
             assert!(Call::parse(name, &args).unwrap().is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn work_can_be_started_and_awaited_in_one_call() {
+        let f = id();
+        let p = Call::parse("generate", &json!({"function_id": f, "wait_seconds": 60}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.wait, 60);
+        assert!(matches!(p.call.follow_up(), Some(Call::Status(..))));
+        let p = Call::parse(
+            "create_function",
+            &json!({"name": "a", "generate": true, "wait_seconds": 30}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(p.generate);
+        assert_eq!(p.wait, 30);
+    }
+
+    #[test]
+    fn one_tool_creates_one_or_several_functions() {
+        let p = Call::parse(
+            "create_function",
+            &json!({"functions": [{"name": "a"}, {"name": "b"}]}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(p.call, Call::CreateFunctions(ref s) if s.len() == 2));
+        let p = Call::parse("create_functions", &json!({"functions": [{"name": "a"}]}))
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(p.call, Call::CreateFunctions(_)),
+            "the former name still works"
+        );
+        let p = Call::parse(
+            "create_function",
+            &json!({"name": "parse-set", "namespace": "app.sets", "arguments": 2}),
+        )
+        .unwrap()
+        .unwrap();
+        let Call::CreateFunction(spec) = p.call else {
+            panic!()
+        };
+        assert_eq!(spec.namespace.as_deref(), Some("app.sets"));
+        assert_eq!(spec.arguments, Some(2));
+        assert!(
+            Call::parse("update_function", &json!({"function_id": id(), "namespace": "x"})).is_err(),
+            "the namespace is fixed after creation"
+        );
+    }
+
+    #[test]
+    fn functions_can_be_filtered() {
+        let p = Call::parse("list_functions", &json!({"query": "  sum "}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.call, Call::ListFunctions(Some("sum".into())));
+        let p = Call::parse("list_functions", &json!({})).unwrap().unwrap();
+        assert_eq!(p.call, Call::ListFunctions(None));
+    }
+
+    #[test]
+    fn the_catalogue_stays_small() {
+        let size = catalogue().to_string().len();
+        assert!(
+            size < 9500,
+            "the tool list costs every agent session tokens: {size} bytes"
+        );
     }
 }

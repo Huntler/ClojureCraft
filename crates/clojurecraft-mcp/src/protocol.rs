@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use clojurecraft_domain::FunctionId;
+
 use crate::Reply;
-use crate::tools::{self, Call};
+use crate::tools::{self, Call, GenerateMode, Parsed};
 
 /// Protocol revisions this server speaks, newest first.
 pub const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -23,19 +25,16 @@ const INVALID_PARAMS: i64 = -32602;
 const POLL: Duration = Duration::from_millis(500);
 
 /// Read by agents on connection: what the server is for and the intended order of calls.
-pub const INSTRUCTIONS: &str = "ClojureCraft writes, tests, and repairs small pure Clojure functions \
-(one argument in, one value out, no side effects) with a local model, so you only specify and read \
-the result. Typical flow: create_function with a clear description, steps, and several EDN \
-examples (input -> expected) -> optionally generate_test_cases, then status with wait_seconds, \
-get_function, and review_test_cases (accept good cases, fix expected values, add your own) -> \
-generate -> status with wait_seconds until working is false -> result for the code. If checks \
-fail, read the failures in status, then improve the specification or tests and generate again, or \
-generate with mode=fix; after repeated failures, write the code yourself and check it with \
-submit_code. For several functions use create_functions, then generate and status with \
-function_ids (generations queue and run one after another). To use the functions in a project, \
-export_project writes their code, clojure.test files from the examples and accepted tests, and \
-deps.edn. For a function that already has code (for example from an opened project), describe \
-fills its empty description and steps and records examples by running the code.";
+pub const INSTRUCTIONS: &str = "ClojureCraft writes, tests, and repairs small pure Clojure functions with a \
+local model; you write the specification and read checked code. All values (input, expected, keys, \
+defaults) are EDN strings, e.g. \"[{:id 1}]\". function_id takes an id, a name, or namespace/function. \
+Fast path: create_function with name, description, steps, 2-3 one-case examples, generate=true, \
+wait_seconds=300; status in the reply has result.code once all checks pass. Tools that start work \
+take wait_seconds and answer with the finished status, whose next field says what to do. On \
+failures, fix the specification or tests with update_function or review_test_cases, passing \
+generate=true and wait_seconds to regenerate in the same call; after 3 failed generations write the code yourself and check it with submit_code. Several \
+functions: create_function with functions=[...], generate with function_ids. export_project writes \
+them as a project with tests. With a project open, create_function needs a namespace.";
 
 /// Carries out tool calls.
 pub trait Handler {
@@ -101,17 +100,101 @@ fn call(params: &Value, handler: &dyn Handler) -> Result<Value, (i64, String)> {
         .and_then(Value::as_str)
         .ok_or((INVALID_PARAMS, "`name` is required".to_owned()))?;
     let args = params.get("arguments").unwrap_or(&Value::Null);
-    let (call, wait) = match Call::parse(name, args) {
+    if !tools::exists(name) {
+        return Err((INVALID_PARAMS, format!("unknown tool `{name}`")));
+    }
+    let args = match resolve(args, handler) {
+        Ok(a) => a,
+        Err(e) => return Ok(tool_result(Err(e))),
+    };
+    let parsed = match Call::parse(name, &args) {
         Ok(Some(c)) => c,
         Ok(None) => return Err((INVALID_PARAMS, format!("unknown tool `{name}`"))),
         Err(e) => return Ok(tool_result(Err(format!("Invalid arguments for {name}: {e}")))),
     };
-    let reply = if wait > 0 {
-        wait_until_idle(&call, Duration::from_secs(wait), handler)
+    Ok(tool_result(run(parsed, handler)))
+}
+
+/// The arguments with function names in `function_id` and `function_ids` replaced by ids.
+fn resolve(args: &Value, handler: &dyn Handler) -> Result<Value, String> {
+    let named = |v: &Value| v.as_str().is_some_and(|t| !tools::is_id(t));
+    let single = args.get("function_id").filter(|v| named(v));
+    let list = args
+        .get("function_ids")
+        .and_then(Value::as_array)
+        .filter(|l| l.iter().any(named));
+    let mut args = args.clone();
+    if let Some(v) = single {
+        let names = vec![v.as_str().unwrap_or_default().to_owned()];
+        args["function_id"] = ids(handler, names)?.swap_remove(0);
+    }
+    if let Some(l) = list {
+        let names = l
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_owned())
+            .collect();
+        args["function_ids"] = Value::Array(ids(handler, names)?);
+    }
+    Ok(args)
+}
+
+fn ids(handler: &dyn Handler, names: Vec<String>) -> Result<Vec<Value>, String> {
+    let n = names.len();
+    match handler.call(Call::Resolve(names))? {
+        Value::Array(ids) if ids.len() == n => Ok(ids),
+        _ => Err("Function names could not be resolved.".into()),
+    }
+}
+
+/// Carries out the call, generates new functions when asked, and waits for the work it started.
+fn run(parsed: Parsed, handler: &dyn Handler) -> Reply {
+    let Parsed { call, wait, generate } = parsed;
+    let batch = matches!(call, Call::CreateFunctions(_));
+    let created_key = if batch || matches!(call, Call::CreateFunction(_)) {
+        "created"
     } else {
-        handler.call(call)
+        "changed"
     };
-    Ok(tool_result(reply))
+    let reply = handler.call(call.clone())?;
+    let started = if generate {
+        let created: Vec<FunctionId> = match (&call, reply.get("functions")) {
+            (Call::UpdateFunction(id, _) | Call::ReviewTestCases { function: id, .. }, _) => vec![*id],
+            (_, Some(Value::Array(list))) => list.iter().filter_map(|f| id_in(&f["id"])).collect(),
+            _ => id_in(&reply["id"]).into_iter().collect(),
+        };
+        let generation = match created.as_slice() {
+            [one] if !batch => Call::Generate(*one, GenerateMode::Fresh),
+            _ => Call::GenerateMany(created, GenerateMode::Fresh),
+        };
+        match handler.call(generation.clone()) {
+            Ok(_) => Some(generation),
+            Err(e) => return Ok(with(reply, "generate_error", json!(e))),
+        }
+    } else {
+        Some(call)
+    };
+    let follow = started.as_ref().and_then(Call::follow_up);
+    let status = match follow {
+        Some(status) if wait > 0 => wait_until_idle(&status, Duration::from_secs(wait), handler)?,
+        _ if generate => return Ok(with(reply, "next", json!("Call status with wait_seconds."))),
+        _ => return Ok(reply),
+    };
+    Ok(if generate {
+        with(status, created_key, reply)
+    } else {
+        status
+    })
+}
+
+fn id_in(v: &Value) -> Option<FunctionId> {
+    v.as_str().and_then(|t| t.parse().ok())
+}
+
+fn with(mut v: Value, key: &str, value: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert(key.to_owned(), value);
+    }
+    v
 }
 
 /// Calls `status` until nothing is working on the function or the time is up.
@@ -143,8 +226,6 @@ fn tool_result(reply: Reply) -> Value {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-
-    use clojurecraft_domain::FunctionId;
 
     use super::*;
 
@@ -245,5 +326,125 @@ mod tests {
         let text: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text["working"], false);
         assert_eq!(h.calls.lock().unwrap().len(), 3);
+    }
+
+    /// Answers like the application: names resolve to one id, a new function gets that id, and
+    /// `status` works for the first `busy` calls.
+    struct App {
+        id: FunctionId,
+        calls: Mutex<Vec<Call>>,
+        busy: usize,
+    }
+
+    impl Handler for App {
+        fn call(&self, call: Call) -> Reply {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(call.clone());
+            let statuses = calls.iter().filter(|c| matches!(c, Call::Status(..))).count();
+            match call {
+                Call::Resolve(names) if names == ["sum-numbers"] => Ok(json!([self.id.to_string()])),
+                Call::Resolve(_) => Err("No function is named that.".into()),
+                Call::CreateFunction(_) => {
+                    Ok(json!({"id": self.id.to_string(), "readiness": {"ready": true}}))
+                }
+                Call::Generate(..) => Ok(json!({"started": "planning"})),
+                Call::Status(..) => Ok(json!({"working": statuses <= self.busy})),
+                _ => Ok(json!({})),
+            }
+        }
+    }
+
+    fn app(busy: usize) -> App {
+        App {
+            id: FunctionId::generate(),
+            calls: Mutex::new(Vec::new()),
+            busy,
+        }
+    }
+
+    fn tool(h: &dyn Handler, name: &str, args: Value) -> Value {
+        let r: Value = serde_json::from_str(
+            &handle_line(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": name, "arguments": args}})
+                .to_string(),
+                h,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        if r["result"]["isError"] == true {
+            return json!({"error": text});
+        }
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn functions_can_be_named_instead_of_given_by_id() {
+        let h = app(0);
+        tool(&h, "get_function", json!({"function_id": "sum-numbers"}));
+        assert_eq!(h.calls.lock().unwrap().last(), Some(&Call::GetFunction(h.id)));
+        let r = tool(&h, "get_function", json!({"function_id": "nope"}));
+        assert!(r["error"].as_str().unwrap().contains("No function"));
+        tool(&h, "generate", json!({"function_ids": ["sum-numbers"]}));
+        assert!(matches!(
+            h.calls.lock().unwrap().last(),
+            Some(Call::GenerateMany(ids, _)) if ids == &[h.id]
+        ));
+    }
+
+    #[test]
+    fn create_generate_and_wait_is_one_call() {
+        let h = app(1);
+        let r = tool(
+            &h,
+            "create_function",
+            json!({"name": "Sum numbers", "generate": true, "wait_seconds": 30}),
+        );
+        assert_eq!(r["working"], false);
+        assert_eq!(
+            r["created"]["id"],
+            h.id.to_string(),
+            "the new id is in the answer"
+        );
+        let calls = h.calls.lock().unwrap();
+        assert!(matches!(calls[0], Call::CreateFunction(_)));
+        assert_eq!(calls[1], Call::Generate(h.id, GenerateMode::Fresh));
+        assert_eq!(calls[2..].len(), 2, "status until the work finished");
+    }
+
+    #[test]
+    fn a_corrected_specification_is_regenerated_in_the_same_call() {
+        let h = app(0);
+        let r = tool(
+            &h,
+            "update_function",
+            json!({"function_id": "sum-numbers", "description": "d", "generate": true, "wait_seconds": 30}),
+        );
+        assert_eq!(r["working"], false);
+        assert!(r.get("changed").is_some());
+        let calls = h.calls.lock().unwrap();
+        assert!(matches!(calls[1], Call::UpdateFunction(..)));
+        assert_eq!(calls[2], Call::Generate(h.id, GenerateMode::Fresh));
+    }
+
+    #[test]
+    fn started_work_can_be_awaited_in_the_same_call() {
+        let h = app(0);
+        let r = tool(
+            &h,
+            "run_tests",
+            json!({"function_id": "sum-numbers", "wait_seconds": 10}),
+        );
+        assert_eq!(r["working"], false);
+        assert!(matches!(h.calls.lock().unwrap().last(), Some(Call::Status(..))));
+        let h = app(0);
+        tool(&h, "run_tests", json!({"function_id": "sum-numbers"}));
+        assert_eq!(
+            h.calls.lock().unwrap().last(),
+            Some(&Call::RunTests(h.id)),
+            "no wait, no status"
+        );
     }
 }

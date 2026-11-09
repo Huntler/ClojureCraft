@@ -5,95 +5,109 @@ description: Generate small pure Clojure functions with the ClojureCraft MCP ser
 
 # Generating Clojure code with ClojureCraft
 
-ClojureCraft writes, runs, and repairs Clojure functions with a local model in a sandbox. You
-specify **what** the function must do (description, steps, EDN examples, tests); it returns code
-that passes those checks. Spend your effort on a precise specification, not on writing or
-debugging the code yourself.
+ClojureCraft writes, runs, tests, and repairs Clojure functions with a **local** model. Its work
+costs nothing on your side; every call you make and every token you read does. So:
 
-**Fits:** pure functions of one argument returning one value, using `clojure.core` (plus
-`clojure.string` and `clojure.set` by default). **Does not fit:** I/O, Java interop, state,
-macros, multi-function namespaces. Write those yourself.
+- **Your job is the specification.** ClojureCraft does the coding, testing, and repairing.
+- **Minimize calls.** Target: one call per batch of functions, plus one call per correction.
+  Think the specification through *before* the first call; do not discover it by trial.
+- **Never poll.** Always pass `wait_seconds: 300`. Every tool that changes or starts work takes it
+  and answers with the finished `status`.
+- **Read only what you need.** Do not call `get_function`, `result`, `list_functions`, or
+  `status` to "check" things: replies already contain the outcome, failures, and code.
 
-## Tools
+**Fits:** pure functions over `clojure.core` (plus `clojure.string`, `clojure.set`), one
+argument (several in an open project via `arguments`). **Does not fit:** I/O, Java interop,
+state, macros. Write those yourself.
 
-| Tool | Purpose |
-|---|---|
-| `list_functions` | Saved functions (id, name, description). Reuse one instead of creating a duplicate. |
-| `create_function` | New function from `name`, `description`, `steps`, `examples`, optional `contract`. Returns its `id` and `readiness`. |
-| `create_functions` | Several at once: `functions` is a list of such specifications (all or nothing). |
-| `get_function` | Specification and test cases, with case ids for review. |
-| `update_function` | Change fields. `steps` and `examples` replace the whole list. `contract: null` removes the contract. |
-| `generate_test_cases` | Background job: the model proposes edge cases (`source`: `examples` or `specification`). |
-| `review_test_cases` | `actions` (accept/reject/reopen/remove/edit by case id) and `add` (your own cases, accepted by default). All or nothing. |
-| `generate` | Background job: write and validate ("Generate"), then fix in up to 5 attempts ("Attempt 1" …) that continue one conversation: the model analyses the failure, may evaluate expressions in the sandbox, and sends only the changed forms. `function_ids` instead of `function_id` generates several; jobs for a busy model are **queued** and run one after another. `mode: "fix"` repairs the current code from its failing checks. |
-| `run_tests` | Background: check the current code against examples and accepted tests. |
-| `status` | Progress, the last job's outcome, check results with failures, and a `next` hint. Pass `wait_seconds` (≤ 300) to wait for background work (queued jobs included) instead of polling. With `function_ids`: one short line per function (`passed`, `first_failure`, `last_job`). Failures are compact (first of each kind; long values replaced by a `difference` such as `at [0 :total]: expected 5 but got 4`); `verbose: true` shows all values. |
-| `result` | Final code with `namespace`, `function`, `passes_all_checks`, and any code waiting for acceptance. |
-| `submit_code` | Your own code becomes the function's code (history keeps the old one) and is checked like generated code. Then `status` with `wait_seconds`. Only under the budget rule below. |
-| `accept_code` | Use code that is held for review (a fix, or code needing a new namespace). |
-| `export_project` | Write functions (`function_ids`) into an absolute `directory` as a Clojure project: `src/` code, one `clojure.test` file per function from its examples and accepted tests, `deps.edn`. Returns `require` forms and commands to run the tests (`clojure -X:test`, or a `java` command using ClojureCraft's own runtime). Differing files are kept unless `overwrite: true`. |
-| `cancel` | Stop the running model job and empty the queue. |
+All EDN values are **strings**: `"[{:id 1 :n 2}]"`. `function_id` accepts an id, the name, or
+(in a project) `namespace/function`; you never need to look ids up.
 
-All EDN values (`input`, `expected`, keys, defaults) are **strings**: `"[{:id 1 :n 2}]"`, `"{1 5}"`.
+## 1. Specify and generate: one call
 
-## Workflow
+```json
+create_function {
+  "name": "sum-by-id",
+  "description": "Input: vector of maps {:id int, :n int}. Output: map id -> sum of :n. Empty input -> {}.",
+  "steps": ["group the maps by :id", "sum :n within each group"],
+  "examples": [
+    {"input": "[{:id 1 :n 2} {:id 1 :n 3} {:id 2 :n 1}]", "expected": "{1 5 2 1}"},
+    {"input": "[]", "expected": "{}"},
+    {"input": "[{:id 1 :n 0}]", "expected": "{1 0}"}
+  ],
+  "contract": {"input": {"type": "vector"}, "output": {"type": "map"}},
+  "generate": true,
+  "wait_seconds": 300
+}
+```
 
-1. **Specify.** Call `create_function` (or `create_functions` for several) with:
-   - a clear `name` (it becomes the function name in kebab-case, in namespace `<name>.core`);
-   - a `description` that states the input shape, the output shape, and the rules;
-   - `steps` for the transformation, in order;
-   - **at least 2–3 small `examples`, one per case** (one line, one record each: the normal
-     case, an optional part missing, an edge value). One big example that mixes every case hides
-     which case fails, and one crash fails it all;
-   - a `contract` when output types or keys matter, for example
-     `{"input": {"type": "vector"}, "output": {"type": "map"}, "ordering": "unordered"}`.
+A good first specification is what saves round trips:
 
-   If `readiness.blocking` is not empty, fix it with `update_function`. It also lists expected
-   outputs that contradict the contract (for example a key marked `required` that an example
-   leaves out); no code can pass those, so fix the contract or the example.
-2. **Edge cases (recommended).** Call `generate_test_cases`, then `status` with
-   `wait_seconds: 120`, then `get_function`. Review each proposed case **critically**: the
-   local model sometimes writes nonsense expectations (for example `"defined"`). Accept cases
-   whose `expected` is right. Correct wrong ones with `edit` (giving `expected`) and then
-   `accept`. Reject the rest. Add your own cases for behaviour you care about (empty input,
-   nil, duplicates).
-3. **Generate.** Call `generate`, then `status` with `wait_seconds: 300`. Repeat `status` while
-   `working` is `true`. For a library, create all functions first, then call `generate` and
-   `status` once each with `function_ids`; open a single function's `status` only when it fails.
-4. **Read the outcome.**
-   - `checks.passed: true`: call `result` and use `code` as is. Mention `namespace` and
-     `function` when you insert it.
-   - `last_job.outcome: "all_attempts_failed"` or failing `checks`: read the `failures`
-     (input, expected, actual, diagnostics). Usually the specification is ambiguous or an
-     expected value is wrong. Fix it with `update_function` or `review_test_cases`, then
-     `generate` again. Use `generate` with `mode: "fix"` only after `run_tests` shows
-     failures of existing code.
-   - `last_job.outcome: "code_waiting_for_acceptance"`: inspect `result.waiting_for_acceptance`,
-     then call `accept_code` if it is acceptable.
-   - `model_unavailable` or `runtime_unavailable`: the person must finish setup in the
-     ClojureCraft window. Tell them, and do not retry in a loop.
-5. Follow the `next` hint in `status` when unsure what to do.
+- **Description** states input shape, output shape, and every rule, including edge behaviour
+  (empty, nil, missing keys, duplicates, ties, ordering).
+- **Steps**: the transformation in order, one operation each.
+- **Examples: 3–5, one case each**: the normal case and every edge case you care about. These
+  are the tests. Put edge cases here instead of reviewing generated ones later.
+- **Contract** when types, required keys, or ordering matter (`"ordering": "unordered"` when
+  order is irrelevant, so correct code is not failed for it).
+- `expected` may be `#throws ExceptionClass` when the call must throw.
+- **Keep each function small**: one grouping, sort, aggregation, or one token format. Split
+  anything bigger into several functions and compose them in your own glue code.
+
+**Several functions: still one call.** `create_function` with `functions: [ {...}, {...} ]`,
+`generate: true`, `wait_seconds: 300`. Generations queue and run one after another; the reply has
+one line per function (`passed`, `first_failure`). If the batch is still `working` after 300 s,
+call `status` with `function_ids` and `wait_seconds: 300` once more.
+
+**Open project:** add `namespace` (created when missing) and use the function's symbol as `name`;
+with `arguments` ≠ 1, each example input is a vector of the arguments. The code is written into
+the project's `.clj` file automatically.
+
+## 2. Read the reply
+
+- **`result` present** (single function): all checks passed. `result.code` is the code with its
+  `namespace` and `function`. Use it unchanged. Done.
+- **Batch, all `passed: true`:** get the code without reading it: in an open project it is
+  already in the files; otherwise `export_project` into the target directory writes `src/`,
+  `clojure.test` files, and `deps.edn` (differing files are kept unless `overwrite`).
+- **`readiness.blocking` or `generate_error`:** the specification is incomplete; fix it (step 3).
+- **Failures** (`checks.failures`, `first_failure`, `last_job.outcome: "all_attempts_failed"`):
+  go to step 3.
+- **`code_waiting_for_acceptance`:** `accept_code` if `passed` is true.
+- **`model_unavailable` / `runtime_unavailable`:** the person must finish setup in the
+  ClojureCraft window. Tell them and stop; do not retry.
+
+## 3. Correct: one call per correction
+
+ClojureCraft already ran up to five repair attempts inside the job. A remaining failure almost
+always means the **specification** is ambiguous or an `expected` value is wrong, not that it
+needs another try. Read the failure, decide which, and fix it in a single call that also
+regenerates:
+
+```json
+update_function {"function_id": "sum-by-id", "description": "...", "examples": [...],
+                 "generate": true, "wait_seconds": 300}
+```
+
+`steps` and `examples` replace the whole list, so send all of them. Add `verbose: true` to a
+`status` only when the compact failure does not tell you enough.
+
+**Budget per function:** first call plus at most 2 corrections. After that, split the function or
+write the code yourself and send it with `submit_code` (`wait_seconds: 300`; keep `namespace` and
+`function` from the earlier reply) so ClojureCraft still runs every check.
+
+## Optional: generated edge cases
+
+Use only for tricky functions where you cannot list the edge cases yourself (costs extra calls).
+`generate_test_cases` with `wait_seconds: 120` returns `tests_to_review`. Answer in **one**
+`review_test_cases` call: accept correct cases, `edit` wrong `expected` values and accept them,
+reject the rest, `add` your own, and pass `generate: true, wait_seconds: 300`. The local model
+sometimes writes wrong expectations; check each one.
 
 ## Rules
 
-- One model job runs at a time; `generate` queues behind it. Other model jobs
-  (`generate_test_cases`) are refused while the model is busy: wait with `status`, then retry.
-- Do not patch generated code by hand. Change the specification or the tests and regenerate,
-  so the checks stay the source of truth.
-- **Keep each function small.** The local model usually writes one grouping, sorting, or
-  aggregation, or the parsing of **one** token format (`"3@10"` → `{:sets 3 :reps 10}`) on the
-  first job. It fails on parsers that split a line into several differently formatted fields. Generate one
-  function per field format and compose them (and the line splitting) in your own glue code.
-- In `status`, attempts are labelled "Generate", "Attempt n", or "Fresh start" (the conversation
-  got stuck and started over). An attempt that failed exactly like the one before shows
-  `same_failure_as` instead of repeating the failure.
-- **Budget rule:** after 2 failed `generate` jobs on one function, simplify or split its
-  specification. After 3, write the code yourself and send it with `submit_code` (keep the
-  `namespace` and `function` from `result`), then fix it from the `status` failures. Do not keep
-  rewriting the specification.
-- Use the code from `result`, not from earlier messages. It is the version that was checked.
-- When the functions belong in a project, use `export_project` instead of copying code and
-  writing tests by hand. Write only the glue (a facade namespace) yourself, and run the returned
-  test command once at the end.
-- The ClojureCraft window must stay open (not minimized). It starts automatically if it is not
-  running.
+- Do not patch generated code by hand; change the specification and regenerate, so the checks
+  stay the source of truth.
+- Use code only from the latest reply.
+- Run the test command `export_project` returns once at the end, not per function.
+- The ClojureCraft window must stay open. It starts automatically when not running.

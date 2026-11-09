@@ -115,8 +115,9 @@ claude mcp add clojurecraft -- "$PWD/target/debug/clojurecraft" mcp
 
 The skill `.claude/skills/clojurecraft/SKILL.md` tells Claude when and how to use these tools;
 Claude Code loads it in this repository, and it can be used elsewhere by copying the
-`clojurecraft` directory to `~/.claude/skills/`. The agent then calls `create_function`, optionally `generate_test_cases` and
-`review_test_cases`, `generate`, `status` with `wait_seconds`, and `result`. Set
+`clojurecraft` directory to `~/.claude/skills/`. The agent's basic task is one call, `create_function` with `generate: true` and
+`wait_seconds`; the rest (`generate_test_cases`, `review_test_cases`, `status`, …) is for
+refinement. Set
 `CLOJURECRAFT_DATA_DIR` in the client's environment for a scratch library, and
 `CLOJURECRAFT_MCP_NO_LAUNCH=1` to fail instead of starting the application. The protocol can be
 exercised by hand:

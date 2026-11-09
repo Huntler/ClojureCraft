@@ -166,7 +166,7 @@ mod tests {
         thread::spawn(move || {
             for r in rx {
                 let answer = match r.call {
-                    Call::ListFunctions => Ok(json!({"functions": []})),
+                    Call::ListFunctions(_) => Ok(json!({"functions": []})),
                     _ => Err("no".into()),
                 };
                 r.respond(answer);

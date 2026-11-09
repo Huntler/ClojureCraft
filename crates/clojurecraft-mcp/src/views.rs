@@ -535,14 +535,36 @@ pub fn pending(last: Option<&Report>) -> Option<&clojurecraft_workflow::assistan
     }
 }
 
-/// Progress, the latest checks, and a hint for the next step.
+/// Test cases waiting for review, as `review_test_cases` needs them.
+fn to_review(doc: &FunctionDocument) -> Vec<Value> {
+    doc.tests
+        .iter()
+        .filter(|t| {
+            matches!(
+                edge_cases::state(t),
+                CaseState::AwaitingAcceptance | CaseState::NeedsClarification
+            )
+        })
+        .map(|t| {
+            let mut v =
+                json!({"id": t.id.to_string(), "input": shorten(t.input.as_str(), COMPACT_INPUT_CHARS)});
+            match &t.expectation {
+                Expectation::Value { expected } => {
+                    v["expected"] = json!(shorten(expected.as_str(), COMPACT_VALUE_CHARS));
+                }
+                Expectation::NeedsClarification { question } => v["question"] = json!(question),
+            }
+            v
+        })
+        .collect()
+}
+
+/// Progress, the latest checks, and a hint for the next step. Only what is not empty or false
+/// is listed. Once the current code passes every check, `result` holds it, and test cases
+/// waiting for review are listed with their ids, so neither needs another call.
 pub fn status(doc: &FunctionDocument, reports: &[ValidationReport], p: &Progress<'_>) -> Value {
     let working = p.job.is_some() || p.checks_running || p.queued.is_some();
-    let mut v = json!({
-        "function_id": doc.id.to_string(),
-        "name": doc.name,
-        "working": working,
-    });
+    let mut v = json!({"working": working});
     if let Some(n) = p.queued {
         v["queued"] = json!(n);
     }
@@ -571,17 +593,15 @@ pub fn status(doc: &FunctionDocument, reports: &[ValidationReport], p: &Progress
         v["checks"] = report(doc, r, true, p.detail);
     }
     let (accepted, proposed, ambiguous) = edge_cases::counts(doc);
-    v["tests"] = json!({
-        "accepted": accepted,
-        "proposed": proposed,
-        "need_expected_value": ambiguous,
-    });
+    if accepted > 0 {
+        v["accepted_tests"] = json!(accepted);
+    }
     let code = doc.implementation.as_ref();
-    v["code"] = json!({
-        "present": code.is_some(),
-        "generated": code.is_some_and(|c| c.generation.is_some()),
-        "edited_by_hand": code.is_some_and(|c| c.generation.is_some() && c.is_manually_edited()),
-    });
+    if code.is_none() {
+        v["has_code"] = json!(false);
+    } else if code.is_some_and(|c| c.generation.is_some() && c.is_manually_edited()) {
+        v["code_edited_by_hand"] = json!(true);
+    }
     if let Some(b) = &p.blocked {
         v["model_unavailable"] = json!(b);
     }
@@ -589,13 +609,21 @@ pub fn status(doc: &FunctionDocument, reports: &[ValidationReport], p: &Progress
         v["runtime_unavailable"] = json!(u);
     }
     let current = latest.filter(|r| r.basis == doc.basis());
+    if !working && proposed + ambiguous > 0 {
+        v["tests_to_review"] = json!(to_review(doc));
+    }
+    let passing = !working && current.is_some_and(ValidationReport::passed);
+    if passing && let Some(c) = code {
+        let n = clojurecraft_workflow::export::names(doc);
+        v["result"] = json!({"namespace": n.namespace, "function": n.function, "code": c.source});
+    }
     let next = if working {
         "Call status with wait_seconds to wait until the work finishes."
     } else if pending(p.last).is_some() {
         "Generated code is waiting: inspect it with result, then accept_code (or change the \
          specification and generate again)."
     } else if proposed + ambiguous > 0 {
-        "Review the proposed test cases (get_function, then review_test_cases)."
+        "Review tests_to_review with review_test_cases (accept, edit expected, or reject)."
     } else if code.is_none() {
         match &p.blocked {
             Some(_) => "Generation cannot start now; see model_unavailable.",
@@ -609,7 +637,7 @@ pub fn status(doc: &FunctionDocument, reports: &[ValidationReport], p: &Progress
     } else if current.is_some_and(|r| !r.passed()) {
         "Checks fail: call generate with mode=fix, or correct the specification or test cases."
     } else {
-        "All checks pass: call result to get the code."
+        "Done: all checks pass; the code is in result."
     };
     v["next"] = json!(next);
     v
@@ -802,6 +830,8 @@ mod tests {
         let passing = report_for(&d, d.basis(), true);
         let s = status(&d, &[passing, failing], &idle());
         assert!(s["next"].as_str().unwrap().contains("result"));
+        assert_eq!(s["result"]["code"], "(ns sum-numbers.core)");
+        assert_eq!(s["result"]["function"], "sum-numbers");
         let r = result(&d, &[report_for(&d, d.basis(), true)], None, Detail::Compact);
         assert_eq!(r["passes_all_checks"], true);
         assert_eq!(r["namespace"], "sum-numbers.core");
@@ -915,6 +945,41 @@ mod tests {
         assert!(v.get("current").is_none());
         assert!(v["failures"][0].get("diagnostics").is_some());
         assert_eq!(v["failures"][1]["diagnostics_as_above"], true);
+    }
+
+    #[test]
+    fn status_omits_empty_parts_and_lists_tests_to_review() {
+        let mut d = doc();
+        let s = status(&d, &[], &idle());
+        assert_eq!(s["has_code"], false);
+        assert!(s.get("accepted_tests").is_none() && s.get("tests_to_review").is_none());
+        assert!(s.get("result").is_none(), "no code, no result");
+
+        let id = edge_cases::add(&mut d);
+        let s = status(&d, &[], &idle());
+        assert_eq!(s["tests_to_review"][0]["id"], id.to_string());
+        assert!(s["next"].as_str().unwrap().contains("review_test_cases"));
+
+        let mut p = idle();
+        p.queued = Some(1);
+        assert!(
+            status(&d, &[], &p).get("tests_to_review").is_none(),
+            "nothing to review while work goes on"
+        );
+    }
+
+    #[test]
+    fn failing_code_is_not_offered_as_the_result() {
+        let mut d = doc();
+        d.implementation = Some(Implementation::manual("(ns sum-numbers.core)"));
+        let failing = report_for(&d, d.basis(), false);
+        assert!(status(&d, &[failing], &idle()).get("result").is_none());
+        let old = report_for(&d, d.basis(), true);
+        d.description = "changed".into();
+        assert!(
+            status(&d, &[old], &idle()).get("result").is_none(),
+            "a pass of an older specification is not a pass"
+        );
     }
 
     #[test]

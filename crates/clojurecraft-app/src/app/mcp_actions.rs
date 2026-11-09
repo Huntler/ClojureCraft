@@ -77,7 +77,8 @@ impl ClojureCraftApp {
             LibraryState::Ready => {}
         }
         let id = match call {
-            Call::ListFunctions => {
+            Call::Resolve(names) => return Step::Done(self.mcp_resolve(names)),
+            Call::ListFunctions(query) => {
                 let project = self.project.as_ref();
                 let mut list: Vec<Value> = Vec::new();
                 if let Some(p) = project {
@@ -99,6 +100,14 @@ impl ClojureCraftApp {
                             .iter()
                             .map(|f| mcp_views::summary(f.id, &f.name, &f.description)),
                     );
+                }
+                if let Some(q) = query {
+                    let q = q.to_lowercase();
+                    list.retain(|v| {
+                        ["name", "namespace", "description"]
+                            .iter()
+                            .any(|k| v[*k].as_str().is_some_and(|t| t.to_lowercase().contains(&q)))
+                    });
                 }
                 let mut reply = json!({ "functions": list });
                 if let Some(p) = project {
@@ -127,9 +136,6 @@ impl ClojureCraftApp {
                     }
                 }
                 return Step::Done(self.mcp_export(args));
-            }
-            Call::CreateFunction(_) | Call::CreateFunctions(_) if self.project.is_some() => {
-                return Step::Done(Err(outside_project(self.project.as_ref())));
             }
             Call::CreateFunction(spec) => {
                 // Answer once the new function is open.
@@ -309,20 +315,80 @@ impl ClojureCraftApp {
         ))
     }
 
-    /// Stores new functions made from `specs` (all or none) and returns their ids; they open
+    /// Ids of functions given by name: the library name or derived function name, or in a project
+    /// the symbol or `namespace/function`; case does not matter. Fails on unknown or ambiguous
+    /// names.
+    fn mcp_resolve(&self, names: &[String]) -> Reply {
+        let candidates: Vec<(FunctionId, Vec<String>)> = match &self.project {
+            Some(p) => p
+                .specs()
+                .map(|(ns, f, spec)| {
+                    (
+                        spec.id,
+                        vec![format!("{ns}/{f}"), f.to_owned(), spec.name.clone()],
+                    )
+                })
+                .collect(),
+            None => self
+                .functions
+                .iter()
+                .map(|f| {
+                    let derived = clojurecraft_workflow::Names::for_document(
+                        &FunctionDocument::new(f.name.clone()),
+                        |_| false,
+                    );
+                    (f.id, vec![f.name.clone(), derived.function])
+                })
+                .collect(),
+        };
+        let mut ids = Vec::new();
+        for name in names {
+            let wanted = name.trim().to_lowercase();
+            let found: Vec<FunctionId> = candidates
+                .iter()
+                .filter(|(_, aliases)| aliases.iter().any(|a| a.to_lowercase() == wanted))
+                .map(|(id, _)| *id)
+                .collect();
+            match found.as_slice() {
+                [id] => ids.push(json!(id.to_string())),
+                [] => return Err(format!("No function is named “{name}”. Use list_functions.")),
+                _ => {
+                    return Err(format!(
+                        "“{name}” names several functions; use namespace/function or an id from list_functions."
+                    ));
+                }
+            }
+        }
+        Ok(Value::Array(ids))
+    }
+
+    /// Adds new functions made from `specs` (all or none) and returns their ids; they open
     /// shortly after.
     fn mcp_create(&mut self, specs: &[SpecArgs]) -> Result<Vec<FunctionId>, String> {
+        let at = |i: usize, e: String| {
+            if specs.len() > 1 {
+                format!("functions[{i}]: {e}")
+            } else {
+                e
+            }
+        };
+        if self.project.is_some() {
+            return self.mcp_create_in_project(specs, &at);
+        }
+        if let Some(i) = specs
+            .iter()
+            .position(|s| s.namespace.is_some() || s.arguments.is_some())
+        {
+            return Err(at(
+                i,
+                "`namespace` and `arguments` apply only while a project is open.".into(),
+            ));
+        }
         let mut names: Vec<String> = self.functions.iter().map(|f| f.name.clone()).collect();
         let mut docs = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             let mut doc = FunctionDocument::new(String::new());
-            edit::apply_spec(&mut doc, spec).map_err(|e| {
-                if specs.len() > 1 {
-                    format!("functions[{i}]: {e}")
-                } else {
-                    e
-                }
-            })?;
+            edit::apply_spec(&mut doc, spec).map_err(|e| at(i, e))?;
             doc.name = session::unique_name(&doc.name, names.iter().map(String::as_str));
             names.push(doc.name.clone());
             docs.push(doc);
@@ -336,6 +402,53 @@ impl ClojureCraftApp {
                 id
             })
             .collect())
+    }
+
+    /// Adds functions to namespaces of the open project (creating missing namespaces), with
+    /// their specifications. Everything is checked before anything is added.
+    fn mcp_create_in_project(
+        &mut self,
+        specs: &[SpecArgs],
+        at: &dyn Fn(usize, String) -> String,
+    ) -> Result<Vec<FunctionId>, String> {
+        let project = self.project.as_mut().ok_or("No project is open.")?;
+        let mut planned: Vec<(String, String)> = Vec::new();
+        for (i, spec) in specs.iter().enumerate() {
+            let namespace = spec
+                .namespace
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| at(i, "`namespace` is required while a project is open.".into()))?;
+            crate::project::validate_namespace(namespace).map_err(|e| at(i, e))?;
+            let function = spec.name.as_deref().unwrap_or_default().trim();
+            crate::project::validate_symbol(function).map_err(|e| at(i, e))?;
+            if project.id_of(namespace, function).is_some()
+                || planned.iter().any(|(n, f)| n == namespace && f == function)
+            {
+                return Err(at(i, format!("{function} is already defined in {namespace}")));
+            }
+            edit::apply_spec(&mut FunctionDocument::new(String::new()), spec).map_err(|e| at(i, e))?;
+            planned.push((namespace.to_owned(), function.to_owned()));
+        }
+        let mut ids = Vec::new();
+        for (spec, (namespace, function)) in specs.iter().zip(&planned) {
+            if !project.contains(namespace) {
+                project.add_namespace(namespace)?;
+            }
+            let id = project.add_function(namespace, function, spec.arguments.unwrap_or(1))?;
+            let mut doc = project
+                .document(namespace, function)
+                .ok_or("The new function could not be read back.")?;
+            edit::apply_spec(&mut doc, spec)?;
+            // Opening syncs from ClojureCraft.json, which must already hold the specification.
+            project.record(&mut doc)?;
+            self.loading.insert(id);
+            self.quiet_open.insert(id);
+            self.library.send(Command::OpenOrInsert(Box::new(doc)));
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Starts generating `id`, or queues it while the model works on something else.
@@ -461,7 +574,8 @@ impl ClojureCraftApp {
                 Ok(self.mcp_status(id, mcp_views::Detail::Compact))
             }
             Call::SubmitCode(_, code) => self.mcp_submit_code(id, code),
-            Call::ListFunctions
+            Call::ListFunctions(_)
+            | Call::Resolve(_)
             | Call::Cancel
             | Call::CreateFunction(_)
             | Call::CreateFunctions(_)
