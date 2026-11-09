@@ -679,7 +679,9 @@ dependencies = [
  "clojurecraft-workflow",
  "eframe",
  "egui",
+ "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

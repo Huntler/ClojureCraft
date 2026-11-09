@@ -21,6 +21,8 @@ mod library;
 mod model;
 mod model_view;
 mod models_view;
+mod project;
+mod project_view;
 mod reference_view;
 mod references;
 mod review;

@@ -2,7 +2,9 @@
 //! implementation and results on the right.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use clojurecraft_clojure::EvalRequest;
@@ -28,6 +30,8 @@ use crate::library::{Command, Library, LibraryEvent, VALIDATIONS_SHOWN};
 use crate::model::RemedyAction;
 use crate::model_view;
 use crate::models_view::ModelsPage;
+use crate::project::Project;
+use crate::project_view::{self, DialogAction, ProjectDialog, TreeAction};
 use crate::references::{ReferencesState, Request};
 use crate::session::{self, OpenDocs, OpenDocument};
 use crate::setup_view::{self, SetupAction, SetupPage};
@@ -50,6 +54,7 @@ const TOAST_LIFETIME: Duration = Duration::from_secs(12);
 /// The centre column never gets narrower than this; side columns give way first.
 const MIN_CENTER_WIDTH: f32 = 440.0;
 const STORAGE_LAST_FUNCTION: &str = "last-function";
+const STORAGE_LAST_PROJECT: &str = "last-project";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
@@ -136,6 +141,13 @@ pub struct ClojureCraftApp {
     mcp_queue: mcp_actions::Queue,
     /// Functions opened for an MCP client; opening them does not change the view.
     quiet_open: HashSet<FunctionId>,
+    /// The open Clojure project; the sidebar shows its namespaces instead of the library.
+    project: Option<Project>,
+    /// The namespace (or namespace prefix) selected in the project tree.
+    project_selected: Option<String>,
+    project_dialog: Option<ProjectDialog>,
+    /// The folder picker's answer, while it is showing.
+    picker: Option<Receiver<Result<Option<PathBuf>, String>>>,
 }
 
 impl ClojureCraftApp {
@@ -160,7 +172,12 @@ impl ClojureCraftApp {
             .and_then(|s| eframe::get_value::<Option<FunctionId>>(s, STORAGE_LAST_FUNCTION))
             .flatten()
             .filter(|_| !first_run);
-        Self {
+        let last_project = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, STORAGE_LAST_PROJECT))
+            .flatten()
+            .filter(|_| !first_run);
+        let mut app = Self {
             jobs,
             library,
             autosaver: None,
@@ -198,7 +215,18 @@ impl ClojureCraftApp {
             mcp_waiting: Vec::new(),
             mcp_queue: mcp_actions::Queue::default(),
             quiet_open: HashSet::new(),
+            project: None,
+            project_selected: None,
+            project_dialog: None,
+            picker: None,
+        };
+        if let Some(path) = last_project {
+            match Project::open(&path) {
+                Ok(project) => app.project = Some(project),
+                Err(e) => app.toast(format!("The last project could not be opened: {e}"), None),
+            }
         }
+        app
     }
 
     /// Whether a documentation build may compute embeddings on the GPU: only with a GPU backend
@@ -376,6 +404,7 @@ impl ClojureCraftApp {
         if let Some(autosaver) = &self.autosaver {
             autosaver.commit(open.doc.clone(), seq, reason);
         }
+        self.record_project(id);
     }
 
     /// The loaded (or now loading) model, as recorded with generated code.
@@ -582,8 +611,12 @@ impl ClojureCraftApp {
                     self.library.send(Command::LoadRevisions(id));
                 }
                 self.docs.entry(id).or_insert_with(|| OpenDocument::new(*draft));
+                self.sync_project_document(id);
                 if self.quiet_open.remove(&id) {
                     return;
+                }
+                if let Some(ns) = self.project.as_ref().and_then(|p| p.namespace_of(id)) {
+                    self.project_selected = Some(ns.to_owned());
                 }
                 self.view = View::Function(id);
                 if created {
@@ -691,6 +724,10 @@ impl ClojureCraftApp {
         if !self.ready() {
             return;
         }
+        if self.project.is_some() {
+            self.project_dialog = Some(ProjectDialog::new_namespace(self.project_selected.as_deref()));
+            return;
+        }
         let name = session::unique_name(
             "Untitled function",
             self.functions.iter().map(|f| f.name.as_str()),
@@ -712,6 +749,8 @@ impl ClojureCraftApp {
         };
         let mut copy = open.doc.clone();
         copy.id = FunctionId::generate();
+        // A copy is a library function, not a second definition of the project namespace.
+        copy.namespace = None;
         copy.name = session::copy_name(&open.doc.name, self.functions.iter().map(|f| f.name.as_str()));
         self.library.send(Command::Insert(Box::new(copy)));
     }
@@ -739,6 +778,7 @@ impl ClojureCraftApp {
             summary.name.clone_from(&open.doc.name);
             summary.description.clone_from(&open.doc.description);
         }
+        self.record_project(id);
     }
 
     fn undo(&mut self, undo: Undo) {
@@ -791,10 +831,233 @@ impl ClojureCraftApp {
         }
     }
 
+    // ---- project --------------------------------------------------------------------------
+
+    /// Opens the project at `path`, replacing (and saving) the one open before.
+    fn open_project(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let project = Project::open(path)?;
+        self.project = Some(project);
+        self.project_selected = None;
+        self.view = View::Welcome;
+        Ok(())
+    }
+
+    fn close_project(&mut self) {
+        self.project = None;
+        self.project_selected = None;
+        if matches!(self.view, View::Function(_)) {
+            self.view = View::Welcome;
+        }
+    }
+
+    /// Reads the project again, picking up namespaces and code changed outside the application.
+    fn reload_project(&mut self) {
+        let Some(root) = self.project.as_ref().map(|p| p.root().to_owned()) else {
+            return;
+        };
+        // Dropping the project writes its pending specification edits first.
+        self.project = None;
+        match Project::open(&root) {
+            Ok(project) => {
+                self.project = Some(project);
+                if let Some(id) = self.current_function() {
+                    self.sync_project_document(id);
+                }
+            }
+            Err(e) => self.toast_error(format!("The project could not be reloaded: {e}")),
+        }
+    }
+
+    fn open_namespace(&mut self, namespace: &str) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(id) = project.id_of(namespace) else {
+            return;
+        };
+        let document = (!self.docs.contains_key(&id))
+            .then(|| project.document(namespace))
+            .flatten();
+        self.project_selected = Some(namespace.to_owned());
+        self.view = View::Function(id);
+        self.expanded = None;
+        match document {
+            None => self.sync_project_document(id),
+            Some(doc) => {
+                if self.loading.insert(id) {
+                    self.open_errors.remove(&id);
+                    self.library.send(Command::OpenOrInsert(Box::new(doc)));
+                }
+            }
+        }
+    }
+
+    fn create_namespace(&mut self, namespace: &str) -> Result<(), String> {
+        let project = self.project.as_mut().ok_or("No project is open.")?;
+        project.add_namespace(namespace)?;
+        self.open_namespace(namespace.trim());
+        Ok(())
+    }
+
+    /// Takes the project's specification and code on disk into an open document of the project.
+    fn sync_project_document(&mut self, id: FunctionId) {
+        let (Some(project), Some(open)) = (self.project.as_mut(), self.docs.get_mut(&id)) else {
+            return;
+        };
+        match project.sync(&mut open.doc) {
+            Ok(true) => self.submit(id, false),
+            Ok(false) => {}
+            Err(e) => self.toast_error(e),
+        }
+    }
+
+    /// Writes a project document's specification and code to the project.
+    fn record_project(&mut self, id: FunctionId) {
+        let (Some(project), Some(open)) = (self.project.as_mut(), self.docs.get(&id)) else {
+            return;
+        };
+        if let Err(e) = project.record(&open.doc) {
+            self.toast_error(e);
+        }
+    }
+
+    /// Shows an error unless the same one is already showing.
+    fn toast_error(&mut self, message: String) {
+        if let Some(t) = self.toasts.iter_mut().find(|t| t.message == message) {
+            t.shown_at = Instant::now();
+            return;
+        }
+        self.toasts.push(Toast {
+            message,
+            undo: None,
+            error: true,
+            shown_at: Instant::now(),
+        });
+    }
+
+    fn save_project(&mut self, ctx: &egui::Context, force: bool) {
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        match project.save_pending(force) {
+            Ok(Some(wait)) => ctx.request_repaint_after(wait),
+            Ok(None) => {}
+            Err(e) => self.toast_error(e),
+        }
+    }
+
+    fn poll_picker(&mut self) {
+        let Some(rx) = &self.picker else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Ok(None),
+        };
+        self.picker = None;
+        let Some(ProjectDialog::Open { path, error, picking }) = &mut self.project_dialog else {
+            return;
+        };
+        *picking = false;
+        match result {
+            Ok(Some(folder)) => {
+                *path = folder.display().to_string();
+                *error = None;
+                match self.open_project(&folder) {
+                    Ok(()) => self.project_dialog = None,
+                    Err(e) => {
+                        if let Some(d) = &mut self.project_dialog {
+                            d.fail(e);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => *error = Some(e),
+        }
+    }
+
+    fn project_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.project_dialog else {
+            return;
+        };
+        let result = match project_view::dialog(ctx, dialog) {
+            DialogAction::None => Ok(()),
+            DialogAction::Close => {
+                self.project_dialog = None;
+                self.picker = None;
+                Ok(())
+            }
+            DialogAction::Browse => {
+                if let ProjectDialog::Open { picking, .. } = dialog {
+                    *picking = true;
+                }
+                self.picker = Some(project_view::pick_folder(ctx));
+                Ok(())
+            }
+            DialogAction::Open(path) => self.open_project(&path).map(|()| self.project_dialog = None),
+            DialogAction::Create(namespace) => self
+                .create_namespace(&namespace)
+                .map(|()| self.project_dialog = None),
+        };
+        if let (Err(e), Some(d)) = (result, &mut self.project_dialog) {
+            d.fail(e);
+        }
+    }
+
+    fn project_sidebar(&mut self, ui: &mut Ui) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let mut command = None;
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(project.title()).heading()).truncate())
+                .on_hover_text(project.root().display().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("More…", |ui| {
+                    if ui.button("Reload from disk").clicked() {
+                        command = Some("reload");
+                    }
+                    if ui.button("Open another project…").clicked() {
+                        command = Some("open");
+                    }
+                    if ui.button("Close project").clicked() {
+                        command = Some("close");
+                    }
+                });
+                let r = ui
+                    .add_enabled(self.ready(), egui::Button::new("+ New"))
+                    .on_hover_text(format!(
+                        "New namespace below the selected one ({})",
+                        keys::label(&NEW_FUNCTION)
+                    ));
+                if r.clicked() {
+                    command = Some("new");
+                }
+            });
+        });
+        ui.label(RichText::new("Namespaces").small().color(theme::MUTED));
+        ui.add_space(6.0);
+        let action = project_view::tree(ui, project, self.project_selected.as_deref());
+        match action {
+            Some(TreeAction::Open(namespace)) => self.open_namespace(&namespace),
+            Some(TreeAction::Select(prefix)) => self.project_selected = Some(prefix),
+            None => {}
+        }
+        match command {
+            Some("reload") => self.reload_project(),
+            Some("open") => self.project_dialog = Some(ProjectDialog::open(String::new())),
+            Some("close") => self.close_project(),
+            Some(_) => self.create(),
+            None => {}
+        }
+    }
+
     // ---- input ----------------------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() || self.expanded.is_some() {
+        if self.dialog.is_some() || self.project_dialog.is_some() || self.expanded.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_shortcut(&NEW_FUNCTION)) {
@@ -884,6 +1147,10 @@ impl ClojureCraftApp {
                 }
             });
         ui.add_space(8.0);
+        if self.project.is_some() {
+            self.project_sidebar(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             ui.heading("Functions");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -895,6 +1162,9 @@ impl ClojureCraftApp {
                 }
             });
         });
+        if ui.button("Open project…").clicked() {
+            self.project_dialog = Some(ProjectDialog::open(String::new()));
+        }
         ui.add_space(4.0);
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.search)
@@ -994,8 +1264,12 @@ impl ClojureCraftApp {
                     LibraryState::Unavailable(e) => Some(e.as_str()),
                     _ => None,
                 };
-                if let WelcomeAction::Create = views::welcome(ui, error) {
-                    self.create();
+                match views::welcome(ui, error, self.project.is_some()) {
+                    WelcomeAction::Create => self.create(),
+                    WelcomeAction::OpenProject => {
+                        self.project_dialog = Some(ProjectDialog::open(String::new()));
+                    }
+                    WelcomeAction::None => {}
                 }
             }
             View::Trash => match views::trash(ui, &self.trash) {
@@ -1332,6 +1606,7 @@ impl eframe::App for ClojureCraftApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_events();
+        self.poll_picker();
         self.review_frame();
         self.handle_close(&ctx);
         self.shortcuts(&ctx);
@@ -1451,8 +1726,10 @@ impl eframe::App for ClojureCraftApp {
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(20.0))
             .show(ui, |ui| self.center(ui));
 
+        self.save_project(&ctx, false);
         self.toasts(&ctx);
         self.dialog(&ctx);
+        self.project_dialog(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1461,12 +1738,19 @@ impl eframe::App for ClojureCraftApp {
             _ => None,
         };
         eframe::set_value(storage, STORAGE_LAST_FUNCTION, &last);
+        let project = self.project.as_ref().map(|p| p.root().to_path_buf());
+        eframe::set_value(storage, STORAGE_LAST_PROJECT, &project);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Stops llama.cpp; it must not outlive the application.
         self.inference.shutdown_model();
         self.knowledge.shutdown();
+        if let Some(project) = &mut self.project
+            && let Err(e) = project.save_pending(true)
+        {
+            tracing::error!(error = %e, "the project specification could not be saved before exit");
+        }
         if let Some(autosaver) = &self.autosaver
             && !autosaver.flush()
         {

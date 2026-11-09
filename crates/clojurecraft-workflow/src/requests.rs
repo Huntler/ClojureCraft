@@ -26,13 +26,15 @@ pub struct Names {
 }
 
 impl Names {
-    /// `is_core` reports whether a symbol names a `clojure.core` var.
+    /// `is_core` reports whether a symbol names a `clojure.core` var. A project namespace set on
+    /// the document is used as is.
     pub fn for_document(doc: &FunctionDocument, is_core: impl Fn(&str) -> bool) -> Self {
         let function = naming::function_symbol(&doc.name, is_core);
-        Self {
-            namespace: naming::namespace_for(&function),
-            function,
-        }
+        let namespace = match doc.namespace.as_deref().map(str::trim) {
+            Some(ns) if !ns.is_empty() => ns.to_owned(),
+            _ => naming::namespace_for(&function),
+        };
+        Self { namespace, function }
     }
 }
 
@@ -492,6 +494,17 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_project_namespace_names_the_generated_namespace() {
+        let mut d = doc();
+        d.namespace = Some("shop.orders.totals".into());
+        let names = Names::for_document(&d, |_| false);
+        assert_eq!(names.namespace, "shop.orders.totals");
+        assert_eq!(names.function, "order-totals");
+        d.namespace = Some("  ".into());
+        assert_eq!(Names::for_document(&d, |_| false).namespace, "order-totals.core");
     }
 
     #[test]

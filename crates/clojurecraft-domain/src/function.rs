@@ -51,6 +51,10 @@ pub struct FunctionDocument {
     /// compared with it instead of replacing it silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted: Option<crate::review::AcceptedCode>,
+    /// The project namespace the function's code lives in; `None` outside a project, where the
+    /// namespace is derived from the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl FunctionDocument {
@@ -68,6 +72,7 @@ impl FunctionDocument {
             tests: Vec::new(),
             benchmarks: Vec::new(),
             accepted: None,
+            namespace: None,
         }
     }
 

@@ -22,9 +22,10 @@ pub fn page_title(ui: &mut Ui, title: &str, subtitle: &str) {
 pub enum WelcomeAction {
     None,
     Create,
+    OpenProject,
 }
 
-pub fn welcome(ui: &mut Ui, library_error: Option<&str>) -> WelcomeAction {
+pub fn welcome(ui: &mut Ui, library_error: Option<&str>, in_project: bool) -> WelcomeAction {
     page_title(
         ui,
         "ClojureCraft",
@@ -36,9 +37,29 @@ pub fn welcome(ui: &mut Ui, library_error: Option<&str>) -> WelcomeAction {
         return WelcomeAction::None;
     }
     let mut action = WelcomeAction::None;
-    if ui.button("Create a function").clicked() {
-        action = WelcomeAction::Create;
+    if in_project {
+        if ui.button("Add a namespace").clicked() {
+            action = WelcomeAction::Create;
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "Or select a namespace in the project tree on the left. Press {} to add one below \
+                 the selected namespace.",
+                keys::label(&keys::NEW_FUNCTION)
+            ))
+            .color(theme::MUTED),
+        );
+        return action;
     }
+    ui.horizontal(|ui| {
+        if ui.button("Create a function").clicked() {
+            action = WelcomeAction::Create;
+        }
+        if ui.button("Open a Clojure project").clicked() {
+            action = WelcomeAction::OpenProject;
+        }
+    });
     ui.add_space(6.0);
     ui.label(
         RichText::new(format!(

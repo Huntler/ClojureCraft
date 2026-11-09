@@ -27,6 +27,9 @@ pub enum Command {
     Create(String),
     /// Stores a complete document as a new function (duplicating an open function).
     Insert(Box<FunctionDocument>),
+    /// Opens a project namespace's function, storing `document` first when the library does not
+    /// have it yet (a project opened for the first time on this machine).
+    OpenOrInsert(Box<FunctionDocument>),
     /// Duplicates the stored draft of a function that is not open.
     Duplicate {
         id: FunctionId,
@@ -202,6 +205,20 @@ fn run(rx: &Receiver<Command>, events: &Sender<Event>, ctx: &egui::Context, secr
                 }),
                 Err(e) => emit(failed("duplicate the function", &e)),
             },
+            Command::OpenOrInsert(document) => {
+                let id = document.id;
+                let opened = match store.load_draft(id) {
+                    Err(StoreError::NotFound(_)) => store.insert_function(*document),
+                    other => other.and_then(|draft| store.restore_function(id).map(|()| draft)),
+                };
+                match opened {
+                    Ok(draft) => emit(LibraryEvent::Opened {
+                        draft: Box::new(draft),
+                        created: false,
+                    }),
+                    Err(e) => emit(open_failed(id, &e)),
+                }
+            }
             Command::Duplicate { id, name } => match store.duplicate_function(id, &name) {
                 Ok(draft) => emit(LibraryEvent::Opened {
                     draft: Box::new(draft),

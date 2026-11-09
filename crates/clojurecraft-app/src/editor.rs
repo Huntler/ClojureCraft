@@ -99,6 +99,15 @@ pub fn show(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
     let mut changed = false;
     let status = open.status();
     changed |= header(ui, open, &status, cx);
+    if let Some(namespace) = &open.doc.namespace {
+        ui.label(
+            RichText::new(format!(
+                "Namespace {namespace}: the name above is its main function"
+            ))
+            .small()
+            .color(theme::MUTED),
+        );
+    }
     save_problem(ui, &status, cx);
     ui.add_space(14.0);
 
