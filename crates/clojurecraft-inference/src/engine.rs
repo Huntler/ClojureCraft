@@ -10,6 +10,24 @@ use crate::http::{Cancel, Control, HttpError};
 use crate::process::{LlamaServer, ServerConfig};
 use crate::protocol::{Accumulator, ChatRequest, StreamEvent, Turn, error_from_body, parse_props};
 
+/// Environment variable naming a directory that receives every chat request body and its answer,
+/// for inspecting exactly what the model was given.
+pub const PROMPT_LOG_VAR: &str = "CLOJURECRAFT_PROMPT_LOG";
+
+fn log_exchange(dir: &std::path::Path, body: &Value, turn: &Turn) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = dir.join(format!("{}-{n:03}", std::process::id()));
+    let request = serde_json::to_string_pretty(body).unwrap_or_default();
+    let answer = format!("finish: {:?}\n\n{}", turn.finish, turn.content);
+    if let Err(e) = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(stem.with_extension("request.json"), request))
+        .and_then(|()| std::fs::write(stem.with_extension("answer.txt"), answer))
+    {
+        tracing::warn!("could not write the prompt log to {}: {e}", dir.display());
+    }
+}
+
 /// Estimated memory a load needs, compared against what is free before starting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryNeed {
@@ -303,7 +321,11 @@ impl Session for LlamaSession {
             }
             return Err(GenerationError::Transport("the answer stream ended early".into()));
         }
-        Ok(acc.finish())
+        let turn = acc.finish();
+        if let Some(dir) = std::env::var_os(PROMPT_LOG_VAR) {
+            log_exchange(&PathBuf::from(dir), &request.body(false), &turn);
+        }
+        Ok(turn)
     }
 
     fn log_tail(&self, lines: usize) -> String {

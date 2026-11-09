@@ -416,9 +416,14 @@ struct Timings {
     predicted_per_second: Option<f64>,
 }
 
+/// llama.cpp answers "Compute error." when the GPU fails a computation, which on Metal is the
+/// device running out of memory (`kIOGPUCommandBufferCallbackErrorOutOfMemory` in its log).
 fn is_memory_message(m: &str) -> bool {
     let m = m.to_ascii_lowercase();
-    m.contains("out of memory") || m.contains("failed to allocate") || m.contains("outofdevicememory")
+    m.contains("out of memory")
+        || m.contains("failed to allocate")
+        || m.contains("outofdevicememory")
+        || m.contains("compute error")
 }
 
 fn error_from_value(status: u16, err: &Value) -> GenerationError {
@@ -603,6 +608,15 @@ mod tests {
         assert!(matches!(
             error_from_body(500, "plain failure"),
             GenerationError::Rejected { status: 500, .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_gpu_computation_is_out_of_memory() {
+        let body = r#"{"error":{"code":500,"message":"Compute error.","type":"server_error"}}"#;
+        assert!(matches!(
+            error_from_body(500, body),
+            GenerationError::OutOfMemory(_)
         ));
     }
 

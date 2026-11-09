@@ -148,6 +148,25 @@ impl HardwareReport {
     }
 }
 
+/// Bytes one process may keep in use on an Apple GPU before Metal fails its commands: Metal's
+/// default working set (3/4 of memory above 32 GiB, else 2/3), or the `iogpu.wired_limit_mb` the
+/// user set instead.
+pub fn metal_working_set(total_ram: u64, wired_limit: Option<u64>) -> u64 {
+    wired_limit.unwrap_or(if total_ram > 32 * GIB {
+        total_ram / 4 * 3
+    } else {
+        total_ram / 3 * 2
+    })
+}
+
+/// The GPU memory limit set with `iogpu.wired_limit_mb`, if any.
+pub fn metal_wired_limit() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    return macos::wired_limit();
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 /// Probes the current machine.
 pub fn detect() -> HardwareReport {
     let mut report = HardwareReport {
@@ -199,6 +218,13 @@ mod tests {
             driver_version: None,
             source: DetectionSource::Manual,
         }
+    }
+
+    #[test]
+    fn metal_working_set_follows_memory_size_and_the_wired_limit() {
+        assert_eq!(metal_working_set(36 * GIB, None), 27 * GIB);
+        assert_eq!(metal_working_set(16 * GIB, None), 16 * GIB / 3 * 2);
+        assert_eq!(metal_working_set(36 * GIB, Some(32 * GIB)), 32 * GIB);
     }
 
     #[test]

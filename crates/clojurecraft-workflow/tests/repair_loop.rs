@@ -13,11 +13,11 @@ use clojurecraft_domain::{
     InferenceRuntime, ModelIdentity, Step,
 };
 use clojurecraft_inference::{
-    Finish, GenerateRequest, Generation, PromptPlan, RequestId, Role, ServiceEvent, Usage,
+    Cancel, Finish, GenerateRequest, Generation, PromptPlan, RequestId, Role, ServiceEvent, ToolCall, Usage,
 };
 use clojurecraft_runtime::{DataDirs, Manifest, components, platform_key};
 use clojurecraft_workflow::assistant::{
-    Assistant, Execution, Gather, MAX_ATTEMPTS, ModelContext, Ports, Report, SAMPLES, Update,
+    Assistant, Execution, Gather, MAX_ATTEMPTS, ModelContext, Phase, Ports, Report, Update,
 };
 use serde_json::{Value, json};
 
@@ -79,6 +79,10 @@ impl Ports for RealPorts {
         Ok(self.executions.len() as u64)
     }
     fn cancel_validation(&mut self, _: u64) {}
+
+    fn runtime(&self) -> Option<ClojureRuntime> {
+        Some(self.rt.clone())
+    }
 }
 
 fn model() -> ModelContext {
@@ -130,7 +134,10 @@ struct Harness {
 
 impl Harness {
     fn new(rt: ClojureRuntime) -> Self {
-        let d = doc();
+        Self::with_doc(rt, doc())
+    }
+
+    fn with_doc(rt: ClojureRuntime, d: FunctionDocument) -> Self {
         let id = d.id;
         Self {
             a: Assistant::default(),
@@ -211,19 +218,13 @@ impl Harness {
 const WRONG: &str = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (update-vals (group-by :customer orders) count))\n";
 const RIGHT: &str = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (update-vals (group-by :customer orders)\n               (fn [os] (reduce + (map :amount os)))))\n";
 
-fn explanation() -> Value {
-    json!({"summary": "Groups then sums.", "steps": [], "symbols": []})
-}
-
 #[test]
-fn a_wrong_candidate_is_repaired_from_real_diagnostics() {
+fn a_wrong_candidate_is_fixed_from_real_diagnostics() {
     let Some(rt) = runtime() else { return };
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
-    for _ in 0..SAMPLES {
-        h.answer(json!({"code": WRONG, "assumptions": []}));
-    }
+    h.answer(json!({"code": WRONG, }));
 
     let first = &h.stored[0];
     assert!(!first.passed());
@@ -237,26 +238,45 @@ fn a_wrong_candidate_is_repaired_from_real_diagnostics() {
         example.actual.as_ref().map(Edn::as_str),
         Some("{\"a\" 2, \"b\" 1}")
     );
-    // The repair request holds the real values the harness reported.
+    // The analysis request holds the real values the harness reported, and a tool that runs
+    // expressions against the failing code in the sandbox.
     let prompt = h.last_prompt();
-    let repair = SAMPLES + 1;
-    assert!(
-        prompt.contains(&format!("attempt {repair} of {MAX_ATTEMPTS}")),
-        "{prompt}"
-    );
+    assert!(prompt.contains("Find out why Example 1"), "{prompt}");
     assert!(prompt.contains("Actual: {\"a\" 2, \"b\" 1}"), "{prompt}");
     assert!(prompt.contains("at [\"a\"]: expected 5 but got 2"), "{prompt}");
+    assert!(prompt.contains("clojure_eval"), "{prompt}");
+    let tools = h.p.sent.last().unwrap().tools.clone();
+    let call = |expression: &str| {
+        let call = ToolCall {
+            id: "1".into(),
+            name: "clojure_eval".into(),
+            arguments: json!({ "expression": expression }).to_string(),
+        };
+        tools.execute(&call, &Cancel::default()).message()
+    };
+    assert_eq!(
+        call("(order-totals [{:customer \"a\" :amount 2} {:customer \"a\" :amount 3}])"),
+        "(order-totals [{:customer \"a\" :amount 2} {:customer \"a\" :amount 3}]) => {\"a\" 2}"
+    );
+    assert_eq!(
+        call("(count (group-by :customer []))"),
+        "(count (group-by :customer [])) => 0"
+    );
+    assert!(call("(/ 1 0)").contains("threw java.lang.ArithmeticException: Divide by zero"));
+    assert!(
+        call("(slurp \"/etc/passwd\")").starts_with("error:"),
+        "the sandbox's checks apply"
+    );
 
-    h.answer(json!({"code": RIGHT, "assumptions": []}));
+    h.answer(json!("count is used instead of summing the amounts"));
+    h.answer(json!({"code": RIGHT, }));
     let last = h.stored.last().unwrap();
     assert!(last.passed(), "{:?}", last.checks);
-    assert_eq!(h.p.sent.last().unwrap().role, Role::Explanation);
-    h.answer(explanation());
 
     let Some(Report::Generated { attempts, .. }) = h.a.report(h.id) else {
         panic!("{:?}", h.a.report(h.id))
     };
-    assert_eq!(attempts.len(), repair as usize);
+    assert_eq!(attempts.len(), 2);
     let i = h.docs[&h.id].implementation.as_ref().unwrap();
     assert_eq!(i.source, RIGHT);
     assert!(
@@ -269,15 +289,13 @@ fn a_wrong_candidate_is_repaired_from_real_diagnostics() {
 }
 
 #[test]
-fn lint_and_load_failures_reach_the_repair_prompt() {
+fn lint_and_load_failures_reach_the_fix_prompt() {
     let Some(rt) = runtime() else { return };
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
     let code = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (sum-by :amount orders))\n";
-    for _ in 0..SAMPLES {
-        h.answer(json!({"code": code, "assumptions": []}));
-    }
+    h.answer(json!({"code": code, }));
     let r = &h.stored[0];
     let status = |s: CheckSubject| r.checks.iter().find(|c| c.subject == s).map(|c| c.status);
     assert_eq!(status(CheckSubject::Lint), Some(CheckStatus::Failed));
@@ -295,10 +313,13 @@ fn every_attempt_failing_ends_unresolved_with_every_report_stored() {
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     h.a.generate(&d, model(), false, &mut h.p);
-    for _ in 0..MAX_ATTEMPTS {
-        h.answer(json!({"code": WRONG, "assumptions": []}));
+    while h.a.job().is_some() {
+        if h.a.job().unwrap().phase == Phase::Analyzing {
+            h.answer(json!("no idea"));
+        } else {
+            h.answer(json!({"code": WRONG, }));
+        }
     }
-    assert_eq!(h.p.sent.len() as u32, MAX_ATTEMPTS);
     assert_eq!(h.stored.len() as u32, MAX_ATTEMPTS);
     assert!(h.a.job().is_none());
     assert!(matches!(h.a.report(h.id), Some(Report::Unresolved { .. })));
@@ -313,7 +334,7 @@ fn an_exception_shows_the_locals_of_the_running_code() {
     // `:amt` is missing, so `+` meets nil inside `amount-of`.
     let broken = "(ns order-totals.core)\n\n(defn- amount-of [order]\n  (+ 0 (:amt order)))\n\n(defn order-totals [orders]\n  (update-vals (group-by :customer orders)\n               (fn [os] (reduce + (map amount-of os)))))\n";
     h.a.generate(&d, model(), false, &mut h.p);
-    h.answer(json!({"code": broken, "assumptions": []}));
+    h.answer(json!({"code": broken, }));
 
     let example = h.stored[0]
         .checks
@@ -335,10 +356,7 @@ fn an_exception_shows_the_locals_of_the_running_code() {
     // The empty example did not throw, so it was not run again.
     assert!(h.p.executions[0].outcome.as_ref().unwrap().report.probes.len() == 1);
 
-    // Repairs see the values.
-    for _ in 1..SAMPLES {
-        h.answer(json!({"code": broken, "assumptions": []}));
-    }
+    // The fix request sees the values.
     assert!(
         h.last_prompt().contains("order = {:customer \"a\", :amount 2}"),
         "{}",
@@ -347,17 +365,12 @@ fn an_exception_shows_the_locals_of_the_running_code() {
 }
 
 #[test]
-fn a_wrong_value_shows_each_steps_value_and_the_locals_entered() {
+fn a_wrong_value_shows_the_locals_entered() {
     let Some(rt) = runtime() else { return };
     let mut h = Harness::new(rt);
     let d = h.docs[&h.id].clone();
     let wrong = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (let [groups (group-by :customer orders)]\n    (update-vals groups count)))\n";
-    let answer = json!({
-        "code": wrong,
-        "steps": [{"step": 1, "code": "(group-by :customer orders)"},
-                  {"step": 2, "code": "(update-vals groups count)"}],
-        "assumptions": []
-    });
+    let answer = json!({"code": wrong});
     h.a.generate(&d, model(), false, &mut h.p);
     h.answer(answer.clone());
     let example = h.stored[0]
@@ -368,9 +381,6 @@ fn a_wrong_value_shows_each_steps_value_and_the_locals_entered() {
     assert_eq!(example.status, CheckStatus::Failed);
     let diagnostics = example.diagnostics.join("\n");
     for needle in [
-        "Values after each transformation step in this call",
-        "step 1 \"group orders by :customer\": value of `(group-by :customer orders)` (line 4) = {\"a\" [{:customer \"a\", :amount 2} {:customer \"a\", :amount 3}], \"b\" [{:customer \"b\", :amount 1}]}",
-        "step 2 \"sum :amount per group\": value of `(update-vals groups count)` (line 5) = {\"a\" 2, \"b\" 1}",
         "Values of the locals in each scope the call entered, in source order:",
         "in (defn order-totals [orders]) at line 3 (entered once): orders = [",
         "in let at line 4 (entered once): groups = {\"a\"",
@@ -382,13 +392,60 @@ fn a_wrong_value_shows_each_steps_value_and_the_locals_entered() {
     }
     // The passing example was not run again.
     assert_eq!(h.p.executions[0].outcome.as_ref().unwrap().report.probes.len(), 1);
-    // A repair carries the values.
-    for _ in 1..SAMPLES {
-        h.answer(answer.clone());
-    }
+    // The fix request carries the values.
     assert!(
-        h.last_prompt().contains("step 2 \"sum :amount per group\""),
+        h.last_prompt()
+            .contains("in let at line 4 (entered once): groups = {\"a\""),
         "{}",
         h.last_prompt()
+    );
+}
+
+#[test]
+fn helpers_run_by_printing_a_lazy_step_value_keep_their_recorded_values() {
+    let Some(rt) = runtime() else { return };
+    let mut d = FunctionDocument::new("Parse workout");
+    d.description = "Parse workout lines".into();
+    d.steps = vec![
+        Step::new("split text input by line break"),
+        Step::new("split each line at white space or @"),
+        Step::new("convert the items into a map"),
+        Step::new("drop lines without a workout"),
+    ];
+    d.examples = vec![Example::direct(
+        "",
+        Edn::new("\"2026-12-01 Pull-up 3@10 5kg\\n2026-12-03 Jogging\""),
+        Edn::new(
+            "[{:date \"2026-12-01\" :workout \"pull-up\" :sets 3 :reps 10 :weight 5} {:date \"2026-12-03\" :workout \"jogging\"}]",
+        ),
+    )];
+    let mut h = Harness::with_doc(rt, d.clone());
+    // The code of a captured failing run: `(parse-number "5kg")` is nil. The probe after
+    // `(remove nil?)` prints the lazy result, which runs the helpers and their probes.
+    let wrong = "(ns parse-workout.core\n  (:require [clojure.string :as str]))\n\n(defn- parse-number [s]\n  (if (str/includes? s \".\")\n    (parse-double s)\n    (parse-long s)))\n\n(defn- parse-workout-entry [entry]\n  (let [[date workout & rest] (str/split entry #\"[\\s@]+\")]\n    (if (and date workout)\n      (reduce (fn [acc [k v]]\n                (assoc acc k (parse-number v)))\n              {:date date :workout (str/lower-case workout)}\n              (map vector [:sets :reps :weight] rest))\n      nil)))\n\n(defn parse-workout [input]\n  (->> input\n       str/split-lines\n       (map parse-workout-entry)\n       (remove nil?)))\n";
+    let answer = json!({"code": wrong});
+    h.a.generate(&d, model(), false, &mut h.p);
+    h.answer(answer);
+    let example = h.stored[0]
+        .checks
+        .iter()
+        .find(|c| matches!(c.subject, CheckSubject::Example(_)))
+        .unwrap();
+    assert_eq!(example.status, CheckStatus::Failed);
+    let diagnostics = example.diagnostics.join("\n");
+    for needle in [
+        "in (defn- parse-workout-entry [entry]) at line 9 (entered 2 times, once per element; values while building element [0]): entry = \"2026-12-01 Pull-up 3@10 5kg\"",
+        "in (defn- parse-number [s]) at line 4",
+        "k = :weight, v = \"5kg\"",
+    ] {
+        assert!(
+            diagnostics.contains(needle),
+            "missing {needle:?} in\n{diagnostics}"
+        );
+    }
+    assert!(!diagnostics.contains("never evaluated"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("at [0 :weight]: expected an integer 5 but got nil\n"),
+        "{diagnostics}"
     );
 }

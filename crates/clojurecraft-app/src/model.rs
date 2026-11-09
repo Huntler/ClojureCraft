@@ -30,8 +30,19 @@ impl MemoryProbe for HardwareProbe {
         let device = r
             .gpus
             .iter()
-            .filter(|g| !g.unified_memory && g.vendor != GpuVendor::Apple)
-            .filter_map(|g| Some(g.vram_total_bytes?.saturating_sub(g.vram_used_bytes?)))
+            .filter_map(|g| {
+                if g.vendor == GpuVendor::Apple {
+                    let ram = g.vram_total_bytes?;
+                    Some(clojurecraft_hardware::metal_working_set(
+                        ram,
+                        clojurecraft_hardware::metal_wired_limit(),
+                    ))
+                } else if g.unified_memory {
+                    None
+                } else {
+                    Some(g.vram_total_bytes?.saturating_sub(g.vram_used_bytes?))
+                }
+            })
             .max();
         MemoryAvailable {
             device,
@@ -119,8 +130,7 @@ fn memory_need(
     layers: Option<u32>,
 ) -> MemoryNeed {
     match (backend, gpu_layers) {
-        // Unified memory and CPU inference both use system memory.
-        (Backend::Cpu | Backend::Metal, _) => MemoryNeed {
+        (Backend::Cpu, _) => MemoryNeed {
             device: 0,
             host: est.total(),
         },
@@ -441,8 +451,8 @@ mod tests {
         assert_eq!(
             memory_need(&est, Backend::Metal, None, Some(32)),
             MemoryNeed {
-                device: 0,
-                host: 10 * GIB
+                device: 10 * GIB,
+                host: 0
             }
         );
         assert_eq!(

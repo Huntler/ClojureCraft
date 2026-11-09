@@ -445,10 +445,24 @@ fn values(plan: &Plan, result: &CallResult, run: &clojurecraft_clojure::ProbeCal
         .and_then(|s| intermediate::describe_steps(s, run));
     let locals = plan.locals.as_ref().and_then(|l| match &result.error {
         Some(e) if result.status == CallStatus::Error => locals::describe(l, e, run),
-        _ if result.status == CallStatus::Ok => locals::describe_returned(l, run),
+        _ if result.status == CallStatus::Ok => locals::describe_returned(l, run, wrong_element(result)),
         _ => None,
     });
     steps.into_iter().chain(locals).collect()
+}
+
+/// The first wrong element of a sequential result, from the difference the harness reported
+/// ("at [2 :weight]: …") and the actual value.
+fn wrong_element(result: &CallResult) -> Option<locals::WrongElement> {
+    let rest = result.difference.as_deref()?.strip_prefix("at [")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let index = digits.parse().ok()?;
+    let actual = clojurecraft_edn::parse_value(result.actual.as_deref()?);
+    let of = match &actual.values.first()?.kind {
+        clojurecraft_edn::NodeKind::Vector(items) | clojurecraft_edn::NodeKind::List(items) => items.len(),
+        _ => return None,
+    };
+    Some(locals::WrongElement { index, of })
 }
 
 /// Builds the report for `plan` from the harness outcome, or from the reason it could not run.
@@ -775,6 +789,35 @@ pub fn failure_summary(plan: &Plan, report: &ValidationReport, max_chars: usize)
         parts.extend(warnings);
     }
     parts.join("\n\n")
+}
+
+/// What a fix should start from: the first failing example or test, or else the first failing
+/// check.
+pub fn focus(plan: &Plan, report: &ValidationReport) -> Option<crate::requests::Focus> {
+    use crate::requests::Focus;
+    let failing =
+        |c: &&clojurecraft_domain::Check| !matches!(c.status, CheckStatus::Passed | CheckStatus::Skipped);
+    let call = report
+        .checks
+        .iter()
+        .filter(failing)
+        .find_map(|c| plan.calls.iter().find(|p| p.subject == c.subject));
+    if let Some(c) = call {
+        return Some(Focus::Call {
+            label: c.label.clone(),
+            input: c.input.trim().to_owned(),
+        });
+    }
+    let c = report.checks.iter().find(failing)?;
+    Some(Focus::Check(format!("the check \"{}\"", plan.label(&c.subject))))
+}
+
+/// Whether the checked code could be read as Clojure.
+pub fn readable(report: &ValidationReport) -> bool {
+    !report
+        .checks
+        .iter()
+        .any(|c| c.subject == CheckSubject::Parse && c.status != CheckStatus::Passed)
 }
 
 /// The linter's warnings in a report, as a section of a failure summary.

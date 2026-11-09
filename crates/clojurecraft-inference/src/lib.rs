@@ -33,7 +33,7 @@ pub use roles::Role;
 pub use schema::{Field, Schema};
 pub use service::{
     GenerateRequest, Generation, InferenceService, MemoryAvailable, MemoryProbe, ModelStatus, RequestId,
-    ServiceEvent,
+    ServiceEvent, planned_sections,
 };
 pub use tools::{Tool, ToolContext, ToolLimits, ToolOutcome, ToolSet};
 

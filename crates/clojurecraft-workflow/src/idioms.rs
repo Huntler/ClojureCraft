@@ -2,7 +2,7 @@
 //! specification. Each one is a single copyable form, which a small model uses far more reliably
 //! than a page of reference documentation.
 
-use clojurecraft_domain::FunctionDocument;
+use clojurecraft_domain::{ExampleInput, FunctionDocument};
 use clojurecraft_inference::Section;
 
 /// Prompt label of the idioms section.
@@ -91,6 +91,16 @@ const IDIOMS: &[(&[&str], &str)] = &[
     ),
 ];
 
+/// The suffix idiom, also chosen by a number with a unit such as "5kg" in the steps or examples.
+const SUFFIX: usize = 5;
+
+/// Whether `text` has a digit directly followed by a letter, as in "5kg" or "800g".
+fn number_with_unit(text: &str) -> bool {
+    text.as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && w[1].is_ascii_alphabetic())
+}
+
 /// The idioms the specification's wording calls for, as an optional prompt section.
 pub fn section(doc: &FunctionDocument) -> Option<Section> {
     let mut text = doc.description.to_lowercase();
@@ -98,10 +108,17 @@ pub fn section(doc: &FunctionDocument) -> Option<Section> {
         text.push('\n');
         text.push_str(&s.text.to_lowercase());
     }
+    // Only a digit directly followed by a letter counts, so dates such as "2026-12-01" do not.
+    let units = number_with_unit(&text)
+        || doc.examples.iter().any(|e| match &e.input {
+            ExampleInput::Direct { value } => number_with_unit(value.as_str()),
+            ExampleInput::FunctionOutput { .. } => false,
+        });
     let chosen: Vec<&str> = IDIOMS
         .iter()
-        .filter(|(words, _)| words.iter().any(|w| text.contains(w)))
-        .map(|(_, idiom)| *idiom)
+        .enumerate()
+        .filter(|(i, (words, _))| words.iter().any(|w| text.contains(w)) || (*i == SUFFIX && units))
+        .map(|(_, (_, idiom))| *idiom)
         .collect();
     if chosen.is_empty() {
         return None;
@@ -137,5 +154,14 @@ mod tests {
             s.text
         );
         assert!(!s.text.contains("frequencies"), "{}", s.text);
+    }
+
+    #[test]
+    fn a_number_with_a_unit_chooses_the_suffix_idiom() {
+        let mut d = FunctionDocument::new("w");
+        d.steps = vec![Step::new("parse weight e.g. \"5kg\" to 5")];
+        assert!(section(&d).unwrap().text.contains("Remove a suffix"));
+        d.steps = vec![Step::new("parse the date 2026-12-01")];
+        assert!(section(&d).is_none_or(|s| !s.text.contains("Remove a suffix")));
     }
 }

@@ -502,3 +502,33 @@ fn library_search_trash_and_duplication() {
     store.restore_function(b.id).unwrap();
     assert_eq!(store.list_functions(Listing::Active, "").unwrap().len(), 3);
 }
+
+/// The library worker stores a validation report on its connection while the autosaver commits
+/// the generated code as a revision on another. The commit waits for the other write instead of
+/// failing with "database is locked".
+#[test]
+fn a_revision_commits_while_another_connection_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut saver = open(dir.path());
+    let mut doc = saver.create_function("f").unwrap().document;
+    spec(&mut doc);
+    let basis = doc.basis();
+    let id = doc.id;
+    let (writing, started) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn({
+        let dir = dir.path().to_owned();
+        move || {
+            let mut library = open(&dir);
+            library.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+            library.record_validation(id, &report(basis, Vec::new())).unwrap();
+            writing.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            library.connection().execute_batch("COMMIT").unwrap();
+        }
+    });
+    started.recv().unwrap();
+    let committed = saver.commit_revision(&doc, 1, RevisionReason::new(RevisionKind::Generated));
+    worker.join().unwrap();
+    assert!(committed.is_ok(), "{:?}", committed.err());
+    assert_eq!(saver.validation_reports(id).unwrap().len(), 1);
+}

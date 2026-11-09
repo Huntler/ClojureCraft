@@ -15,6 +15,8 @@ use clojurecraft_store::{
     Store, StoreError,
 };
 
+use clojurecraft_workflow::dataset::{self, Entry};
+
 use crate::jobs::Event;
 
 /// Quiet period after the last keystroke before a draft is written.
@@ -46,6 +48,8 @@ pub enum Command {
     LoadRevisions(FunctionId),
     /// Reads one revision with its content.
     LoadRevision(RevisionId),
+    /// Collects the fine-tuning dataset entries of all saved functions.
+    LoadDataset,
 }
 
 pub enum LibraryEvent {
@@ -87,6 +91,14 @@ pub enum LibraryEvent {
         revisions: Vec<RevisionSummary>,
     },
     Revision(Box<Revision>),
+    /// Every saved function with its dataset entry or why it has none, in library order.
+    Dataset(Vec<DatasetRow>),
+}
+
+pub struct DatasetRow {
+    pub id: FunctionId,
+    pub name: String,
+    pub entry: Result<Entry, String>,
 }
 
 /// Validation reports kept per function for display; older ones stay in the library.
@@ -152,6 +164,13 @@ fn run(rx: &Receiver<Command>, events: &Sender<Event>, ctx: &egui::Context, secr
                 match store.revisions(function) {
                     Ok(revisions) => emit(LibraryEvent::Revisions { function, revisions }),
                     Err(e) => emit(failed("read the history", &e)),
+                }
+                continue;
+            }
+            Command::LoadDataset => {
+                match dataset(&store) {
+                    Ok(rows) => emit(LibraryEvent::Dataset(rows)),
+                    Err(e) => emit(failed("collect the dataset", &e)),
                 }
                 continue;
             }
@@ -245,6 +264,28 @@ fn list(store: &Store, emit: &impl Fn(LibraryEvent)) {
         Ok((active, trash)) => emit(LibraryEvent::Listed { active, trash }),
         Err(e) => emit(failed("list saved functions", &e)),
     }
+}
+
+fn dataset(store: &Store) -> Result<Vec<DatasetRow>, StoreError> {
+    let functions = store.list_functions(Listing::Active, "")?;
+    Ok(functions
+        .into_iter()
+        .map(|f| {
+            let entry = store
+                .load_draft(f.id)
+                .and_then(|draft| {
+                    let doc = draft.document;
+                    let reports = store.validation_for(doc.id, &doc.basis())?;
+                    Ok(dataset::entry(&doc, &reports))
+                })
+                .unwrap_or_else(|e| Err(format!("unreadable: {e}")));
+            DatasetRow {
+                id: f.id,
+                name: f.name,
+                entry,
+            }
+        })
+        .collect())
 }
 
 fn failed(action: &'static str, error: &StoreError) -> LibraryEvent {

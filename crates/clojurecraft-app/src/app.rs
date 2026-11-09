@@ -13,6 +13,7 @@ use clojurecraft_inference::{GenerateRequest, RequestId};
 use clojurecraft_store::{Autosaver, FunctionSummary};
 use egui::{Id, Key, RichText, Ui};
 
+use crate::dataset_view::{self, DatasetAction, DatasetPage};
 use crate::editor::{self, Action, AssistStatus, EditorContext, ExpandTarget, Focus, Undo};
 use crate::edn_view::EdnCache;
 use crate::execution::ExecutionState;
@@ -55,6 +56,7 @@ enum View {
     Welcome,
     Function(FunctionId),
     Trash,
+    Dataset,
     Knowledge,
     Settings,
     Setup,
@@ -116,6 +118,7 @@ pub struct ClojureCraftApp {
     pending_reports: Vec<(FunctionId, ValidationReport)>,
     setup_page: SetupPage,
     models_page: ModelsPage,
+    dataset_page: DatasetPage,
     toasts: Vec<Toast>,
     dialog: Option<Dialog>,
     edn: EdnCache,
@@ -181,6 +184,7 @@ impl ClojureCraftApp {
             pending_reports: Vec::new(),
             setup_page: SetupPage::default(),
             models_page: ModelsPage::default(),
+            dataset_page: DatasetPage::default(),
             toasts: Vec::new(),
             dialog: None,
             edn: EdnCache::default(),
@@ -472,6 +476,7 @@ impl ClojureCraftApp {
             }
             (JobKind::Generate, None) => {}
             (JobKind::ProposeTests, _) => self.assistant.propose_tests(&doc, &mut ports),
+            (JobKind::Explain, _) => self.assistant.explain(&doc, &mut ports),
         }
         Ok(())
     }
@@ -511,6 +516,7 @@ impl ClojureCraftApp {
     fn panel_action(&mut self, id: FunctionId, action: PanelAction) -> RemedyAction {
         match action {
             PanelAction::Generate => self.start_job(id, JobKind::Generate),
+            PanelAction::Explain => self.start_job(id, JobKind::Explain),
             PanelAction::Cancel => self.cancel_job(),
             PanelAction::AcceptPending => {
                 let result = match self.docs.get_mut(&id) {
@@ -533,8 +539,17 @@ impl ClojureCraftApp {
         RemedyAction::None
     }
 
+    fn load_dataset(&mut self) {
+        self.dataset_page.loading = true;
+        self.library.send(Command::LoadDataset);
+    }
+
     fn library_event(&mut self, event: LibraryEvent) {
         match event {
+            LibraryEvent::Dataset(rows) => {
+                self.dataset_page.loading = false;
+                self.dataset_page.rows = Some(rows);
+            }
             LibraryEvent::Ready(autosaver) => {
                 self.autosaver = Some(autosaver);
                 self.library_state = LibraryState::Ready;
@@ -610,6 +625,7 @@ impl ClojureCraftApp {
                 self.toast("Deleted permanently".into(), None);
             }
             LibraryEvent::Failed { action, error } => {
+                self.dataset_page.loading = false;
                 self.toasts.push(Toast {
                     message: format!("Could not {action}: {error}"),
                     undo: None,
@@ -853,12 +869,16 @@ impl ClojureCraftApp {
                     self.view = View::Setup;
                 }
                 for (view, label) in [
+                    (View::Dataset, "Fine-tune dataset".to_owned()),
                     (View::Knowledge, "Knowledge sources".to_owned()),
                     (View::Settings, "Settings".to_owned()),
                     (View::Trash, trash_label),
                 ] {
                     let r = list_item(ui, self.view == view, &label);
                     if r.clicked() {
+                        if view == View::Dataset && self.view != View::Dataset {
+                            self.load_dataset();
+                        }
                         self.view = view;
                     }
                 }
@@ -983,6 +1003,11 @@ impl ClojureCraftApp {
                 Some(TrashAction::Purge(f)) => self.dialog = Some(Dialog::Purge(f)),
                 None => {}
             },
+            View::Dataset => {
+                if let DatasetAction::Refresh = dataset_view::page(ui, &mut self.dataset_page) {
+                    self.load_dataset();
+                }
+            }
             View::Knowledge => {
                 let cx = knowledge_view::PageContext {
                     gpu_free: self.gpu_free(),
@@ -1284,6 +1309,10 @@ impl Ports for AppPorts<'_> {
 
     fn cancel_validation(&mut self, id: u64) {
         self.execution.cancel(id);
+    }
+
+    fn runtime(&self) -> Option<clojurecraft_clojure::ClojureRuntime> {
+        self.execution.runtime().ok()
     }
 }
 

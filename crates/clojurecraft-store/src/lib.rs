@@ -22,7 +22,7 @@ use clojurecraft_domain::{
     Basis, BenchmarkConfigId, BenchmarkResult, ExampleId, Fingerprint, FunctionDocument, FunctionId,
     RevisionId, RevisionKind, RevisionPin, RevisionReason, SecretRegistry, Timestamp, ValidationReport,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
 pub use autosave::{AutosaveEvent, Autosaver};
@@ -265,7 +265,7 @@ impl Store {
     pub fn insert_function(&mut self, document: FunctionDocument) -> Result<Draft> {
         let json = self.encode_document(&document, "function draft")?;
         let now = Timestamp::now().0;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "INSERT INTO functions (id, name, description, created_at, updated_at, draft_seq,
                                     draft_format, draft, draft_content_fp)
@@ -330,7 +330,7 @@ impl Store {
     /// Writes the draft unless a newer edit sequence is already stored.
     pub fn save_draft(&mut self, document: &FunctionDocument, seq: u64) -> Result<SaveOutcome> {
         let json = self.encode_document(document, "function draft")?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let outcome = write_draft(&tx, document, &json, seq, None)?;
         tx.commit()?;
         Ok(outcome)
@@ -411,7 +411,7 @@ impl Store {
     /// Permanently deletes a trashed function with all its history and results. Refused while
     /// any other function (draft or revision) takes example input from it.
     pub fn purge_function(&mut self, id: FunctionId) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let deleted: Option<Option<i64>> = tx
             .query_row(
                 "SELECT deleted_at FROM functions WHERE id = ?1",
@@ -461,7 +461,7 @@ impl Store {
             })?;
         let revision = self.load_revision(head.id)?;
         let json = self.encode_document(&revision.document, "function draft")?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let stored: i64 = tx.query_row(
             "SELECT draft_seq FROM functions WHERE id = ?1",
             [id.to_string()],
@@ -489,7 +489,7 @@ impl Store {
     ) -> Result<CommitOutcome> {
         let json = self.encode_document(document, "function revision")?;
         let reason_json = encode(&reason, "revision reason")?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         reject_stale(&tx, document.id, seq)?;
         let head = head_revision(&tx, document.id)?;
         let outcome = match head {
@@ -554,7 +554,7 @@ impl Store {
         let current = self.load_draft(function)?;
         let current_json = self.encode_document(&current.document, "function revision")?;
         let target_json = self.encode_document(&target.document, "function revision")?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         reject_stale(&tx, function, seq)?;
         let mut head = head_revision(&tx, function)?;
         if head
@@ -830,6 +830,16 @@ impl Store {
             return Err(StoreError::SecretDetected { record });
         }
         Ok(json)
+    }
+
+    /// A write transaction that holds the write lock from its start. A deferred transaction that
+    /// reads first cannot write once another connection (the autosaver, the library worker) has
+    /// committed since its read, and fails at once with "database is locked"; this one waits for
+    /// the lock under the busy timeout and then reads current data.
+    fn write(&mut self) -> Result<Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 
     #[doc(hidden)]

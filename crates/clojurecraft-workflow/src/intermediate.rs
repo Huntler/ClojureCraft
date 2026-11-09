@@ -900,9 +900,11 @@ mod tests {
                 requires: Vec::new(),
                 assumptions: Vec::new(),
                 omitted_context: Vec::new(),
+                prompt: Vec::new(),
                 explanation: Some(Explanation {
                     summary: String::new(),
                     steps: mappings,
+                    assumptions: Vec::new(),
                     symbols: Vec::new(),
                 }),
             }),
@@ -1079,12 +1081,14 @@ mod tests {
                     evaluations: 1,
                     values: vec![value("({:amount 3, :paid true})", true)],
                     locals: vec![],
+                    entries: vec![],
                 },
                 ProbeCapture {
                     id: 1,
                     evaluations: 1,
                     values: vec![value("(3 …", false)],
                     locals: vec![],
+                    entries: vec![],
                 },
             ],
         };

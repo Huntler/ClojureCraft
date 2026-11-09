@@ -219,9 +219,11 @@ fn generated(source: &str, steps: &[(&str, (u32, u32))]) -> FunctionDocument {
             requires: Vec::new(),
             assumptions: Vec::new(),
             omitted_context: Vec::new(),
+            prompt: Vec::new(),
             explanation: Some(Explanation {
                 summary: String::new(),
                 steps: mappings,
+                assumptions: Vec::new(),
                 symbols: Vec::new(),
             }),
         }),

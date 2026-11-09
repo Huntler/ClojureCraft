@@ -144,17 +144,20 @@ impl Ports for DevPorts<'_> {
     }
 
     fn cancel_validation(&mut self, _: u64) {}
+
+    fn runtime(&self) -> Option<ClojureRuntime> {
+        self.runtime.as_ref().ok().cloned()
+    }
 }
 
-fn print_validation(r: &ValidationReport) {
+fn print_validation(label: &str, r: &ValidationReport) {
     let failing: Vec<_> = r
         .checks
         .iter()
         .filter(|c| !matches!(c.status, CheckStatus::Passed | CheckStatus::Skipped))
         .collect();
     println!(
-        "    attempt {}: {}",
-        r.attempt.unwrap_or(0),
+        "    {label}: {}",
         if r.passed() {
             "all checks passed".to_owned()
         } else {
@@ -179,12 +182,26 @@ fn print_validation(r: &ValidationReport) {
     }
 }
 
+/// The label of the attempt a report belongs to, with its notes (such as the forms a fix changed).
+fn validated_label(assistant: &Assistant, r: &ValidationReport) -> String {
+    let attempt = assistant
+        .job()
+        .and_then(|j| j.attempts().iter().find(|a| Some(a.number) == r.attempt));
+    match attempt {
+        Some(a) => match &a.note {
+            Some(n) => format!("{} ({n})", a.label()),
+            None => a.label(),
+        },
+        None => format!("attempt {}", r.attempt.unwrap_or(0)),
+    }
+}
+
 fn print_attempts(attempts: &[Attempt]) {
     for a in attempts {
         match (&a.report, &a.note) {
-            (Some(r), _) => print_validation(r),
-            (None, Some(n)) => println!("    attempt {}: {n}", a.number),
-            (None, None) => println!("    attempt {}: not checked", a.number),
+            (Some(r), _) => print_validation(&a.label(), r),
+            (None, Some(n)) => println!("    {}: {n}", a.label()),
+            (None, None) => println!("    {}: not checked", a.label()),
         }
     }
 }
@@ -233,7 +250,7 @@ fn drive(
         if let Some((id, execution)) = ports.validated.take() {
             for u in assistant.on_validated(id, execution, docs, ports) {
                 if let Update::Validated(_, r) = u {
-                    print_validation(&r);
+                    print_validation(&validated_label(assistant, &r), &r);
                 }
             }
             continue;
@@ -255,7 +272,7 @@ fn drive(
                     match u {
                         Update::Edited(_) => {}
                         Update::Commit(_, r) => println!("  would record revision: {:?}", r.kind),
-                        Update::Validated(_, r) => print_validation(&r),
+                        Update::Validated(_, r) => print_validation(&validated_label(assistant, &r), &r),
                     }
                 }
             }

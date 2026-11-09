@@ -65,6 +65,10 @@ pub struct ProbeCapture {
     /// For a probe of locals ([`PROBE_LOCALS`]): their values the last time it was reached.
     #[serde(default)]
     pub locals: Vec<LocalValue>,
+    /// For a probe of locals reached more than once: their values on each of the first few
+    /// times, in order.
+    #[serde(default)]
+    pub entries: Vec<Vec<LocalValue>>,
 }
 
 /// A local's value recorded by [`PROBE_LOCALS`].

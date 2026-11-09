@@ -397,38 +397,15 @@ pub fn parse_contract(
 // ---- generation -------------------------------------------------------------------------------
 
 /// Step references a generation answer may give at most, and the length of each quote.
-pub const MAX_STEP_REFERENCES: usize = 20;
-pub const MAX_STEP_QUOTE: usize = 400;
-/// Length of the plan written before the code; the generation grammar uses the same bound.
-pub const MAX_PLAN: usize = 1000;
-
 pub fn generation_schema() -> Schema {
-    Schema::object(vec![
-        Field::optional("plan", prose(MAX_PLAN))
-            .describe("how each example's input becomes its expected output, before writing code"),
-        Field::required("code", Schema::string())
-            .describe("the complete Clojure source: the ns declaration followed by the definitions"),
-        Field::required(
-            "steps",
-            Schema::array(
-                Schema::object(vec![
-                    Field::required("step", Schema::integer(Some(1), Some(99))),
-                    Field::required("code", prose(MAX_STEP_QUOTE))
-                        .describe("the code from \"code\" that carries out the step, copied exactly"),
-                ]),
-                Some(MAX_STEP_REFERENCES),
-            ),
-        ),
-        Field::required("assumptions", strings(8)),
-    ])
+    Schema::object(vec![Field::required("code", Schema::string()).describe(
+        "the complete Clojure source: the ns declaration followed by the definitions",
+    )])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedCode {
     pub code: String,
-    pub assumptions: Vec<String>,
-    /// For each transformation step (numbered from 1), the code the model says carries it out.
-    pub steps: Vec<(u32, String)>,
     /// The code arrived escaped twice (line breaks as `\n` text) and was unescaped.
     pub unescaped: bool,
 }
@@ -447,15 +424,6 @@ fn undo_double_escaping(code: &str) -> Option<String> {
 #[derive(Deserialize)]
 struct RawGeneration {
     code: String,
-    assumptions: Vec<String>,
-    #[serde(default)]
-    steps: Vec<RawStepReference>,
-}
-
-#[derive(Deserialize)]
-struct RawStepReference {
-    step: u32,
-    code: String,
 }
 
 /// Removes a Markdown code fence the model may have put around the code.
@@ -469,7 +437,7 @@ fn strip_fence(code: &str) -> &str {
 }
 
 /// A plain-text generation answer (see [`crate::grammar`]) in the JSON shape that
-/// [`parse_generation`] reads: `plan`, `code`, `steps`, and `assumptions`.
+/// [`parse_generation`] reads.
 pub fn generation_from_text(text: &str) -> Result<Value, String> {
     const FENCE: &str = "```clojure";
     let open = text
@@ -477,31 +445,23 @@ pub fn generation_from_text(text: &str) -> Result<Value, String> {
         .ok_or("the answer has no ```clojure code block")?;
     let body = &text[open + FENCE.len()..];
     let close = body.rfind("```").ok_or("the code block is not closed")?;
-    let plan = text[..open].trim().trim_start_matches("PLAN:").trim();
-    let mut steps = Vec::new();
-    let mut assumptions = Vec::new();
-    let mut in_assumptions = false;
-    for line in body[close + 3..].lines().map(str::trim) {
-        if line == "ASSUMPTIONS:" {
-            in_assumptions = true;
-        } else if in_assumptions {
-            if let Some(a) = line.strip_prefix("- ") {
-                assumptions.push(a.trim());
-            }
-        } else if let Some((n, quote)) = line
-            .strip_prefix("STEP ")
-            .and_then(|l| l.split_once(": "))
-            .and_then(|(n, q)| Some((n.parse::<u32>().ok()?, q.trim())))
-        {
-            steps.push(serde_json::json!({"step": n, "code": quote}));
-        }
+    Ok(serde_json::json!({"code": body[..close].trim()}))
+}
+
+/// A fix answer (see [`crate::grammar::fix`]): the analysis and the changed forms.
+pub fn fix_from_text(text: &str) -> Result<(String, String), String> {
+    const FENCE: &str = "```clojure";
+    let open = text
+        .find(FENCE)
+        .ok_or("the answer has no ```clojure code block")?;
+    let body = &text[open + FENCE.len()..];
+    let close = body.rfind("```").ok_or("the code block is not closed")?;
+    let analysis = text[..open].trim().trim_start_matches("ANALYSIS:").trim();
+    let code = body[..close].trim();
+    if code.is_empty() {
+        return Err("the answer contains no code".into());
     }
-    Ok(serde_json::json!({
-        "plan": plan,
-        "code": body[..close].trim(),
-        "steps": steps,
-        "assumptions": assumptions,
-    }))
+    Ok((analysis.to_owned(), code.to_owned()))
 }
 
 pub fn parse_generation(v: &Value) -> Result<GeneratedCode, String> {
@@ -520,18 +480,14 @@ pub fn parse_generation(v: &Value) -> Result<GeneratedCode, String> {
     code.push('\n');
     Ok(GeneratedCode {
         code,
-        assumptions: items(&raw.assumptions, MAX_ITEM),
-        steps: raw
-            .steps
-            .iter()
-            .filter(|s| !s.code.trim().is_empty())
-            .map(|s| (s.step, strip_fence(&s.code).to_owned()))
-            .collect(),
         unescaped: unescaped.is_some(),
     })
 }
 
 // ---- explanation ------------------------------------------------------------------------------
+
+/// Assumptions an explanation may list.
+const MAX_ASSUMPTIONS: usize = 4;
 
 pub fn explanation_schema(steps: usize) -> Schema {
     let step_number = Schema::integer(
@@ -552,6 +508,7 @@ pub fn explanation_schema(steps: usize) -> Schema {
                 Some(steps),
             ),
         ),
+        Field::required("assumptions", strings(MAX_ASSUMPTIONS)),
         Field::required(
             "symbols",
             Schema::array(
@@ -582,6 +539,8 @@ struct RawSymbol {
 struct RawExplanation {
     summary: String,
     steps: Vec<RawStep>,
+    #[serde(default)]
+    assumptions: Vec<String>,
     symbols: Vec<RawSymbol>,
 }
 
@@ -601,7 +560,7 @@ pub fn parse_explanation(v: &Value, steps: &[&Step], source: &str) -> Result<Exp
         mapped.push(StepMapping {
             step: step.id,
             step_text: step.text.trim().to_owned(),
-            lines: locate(source, &excerpt),
+            lines: locate_step(source, &excerpt),
             excerpt: text(&excerpt, MAX_PROSE),
             explanation: text(&s.explanation, MAX_ITEM * 2),
         });
@@ -621,7 +580,31 @@ pub fn parse_explanation(v: &Value, steps: &[&Step], source: &str) -> Result<Exp
     Ok(Explanation {
         summary: text(&raw.summary, MAX_PROSE),
         steps: mapped,
+        assumptions: items(&raw.assumptions, MAX_ITEM),
         symbols,
+    })
+}
+
+/// Where a step's quoted code is in `source`. Models often quote a pipeline stage with the
+/// threaded value, for example `(group-by :customer orders)` for the stage `(group-by :customer)`,
+/// so the call is also tried without its last argument and without its first.
+fn locate_step(source: &str, quote: &str) -> Option<clojurecraft_domain::LineRange> {
+    locate(source, quote).or_else(|| {
+        let forms = crate::structure::read_all(quote).ok()?;
+        let [form] = forms.as_slice() else {
+            return None;
+        };
+        let items = form.list().filter(|i| i.len() >= 3)?;
+        let without = |skip: usize| {
+            let parts: Vec<&str> = items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .map(|(_, f)| &quote[f.span()])
+                .collect();
+            format!("({})", parts.join(" "))
+        };
+        locate(source, &without(items.len() - 1)).or_else(|| locate(source, &without(1)))
     })
 }
 
@@ -652,20 +635,17 @@ mod tests {
                        "output": {"description": "", "value_type": "map", "keys": []},
                        "ordering": "unspecified", "sorted_by": "", "notes": ""}),
             ),
-            (
-                generation_schema(),
-                json!({"code": "(ns a)", "steps": [{"step": 1, "code": "(ns a)"}], "assumptions": []}),
-            ),
+            (generation_schema(), json!({"code": "(ns a)"})),
             (
                 explanation_schema(2),
-                json!({"summary": "s", "steps": [{"step": 2, "code": "c", "explanation": "e"}], "symbols": []}),
+                json!({"summary": "s", "steps": [{"step": 2, "code": "c", "explanation": "e"}], "assumptions": [], "symbols": []}),
             ),
         ];
         for (schema, value) in cases {
             schema.validate(&value).unwrap();
         }
         assert!(explanation_schema(2)
-            .validate(&json!({"summary": "s", "steps": [{"step": 3, "code": "c", "explanation": "e"}], "symbols": []}))
+            .validate(&json!({"summary": "s", "steps": [{"step": 3, "code": "c", "explanation": "e"}], "assumptions": [], "symbols": []}))
             .is_err());
     }
 
@@ -724,12 +704,6 @@ mod tests {
         assert!(parse_generation(&json!({"code": "  ", "assumptions": []})).is_err());
         let huge = json!({"code": "x".repeat(MAX_CODE_CHARS + 1), "assumptions": []});
         assert!(parse_generation(&huge).unwrap_err().contains("longer than"));
-        let with_steps = json!({"code": "(ns a)", "assumptions": [],
-                                "steps": [{"step": 1, "code": "(inc x)"}, {"step": 2, "code": " "}]});
-        assert_eq!(
-            parse_generation(&with_steps).unwrap().steps,
-            [(1, "(inc x)".to_owned())]
-        );
     }
 
     #[test]
@@ -769,17 +743,35 @@ mod tests {
     }
 
     #[test]
+    fn explained_steps_quoted_with_the_threaded_value_are_found_in_the_pipeline() {
+        let (a, b, c) = (Step::new("group"), Step::new("collect"), Step::new("count"));
+        let source =
+            "(ns a)\n(defn f [orders]\n  (->> orders\n       (group-by :customer)\n       (into [])))\n";
+        let v = json!({"summary": "s", "assumptions": ["orders have a :customer", " "], "symbols": [],
+            "steps": [{"step": 1, "code": "(group-by :customer orders)", "explanation": ""},
+                      {"step": 2, "code": "(into [] x)", "explanation": ""},
+                      {"step": 3, "code": "(map inc xs)", "explanation": ""}]});
+        let e = parse_explanation(&v, &[&a, &b, &c], source).unwrap();
+        let starts: Vec<Option<u32>> = e.steps.iter().map(|m| m.lines.map(|l| l.start)).collect();
+        assert_eq!(starts, [Some(4), Some(5), None]);
+        assert_eq!(e.assumptions, ["orders have a :customer"]);
+    }
+
+    #[test]
     fn text_answers_read_like_json_answers() {
-        let text = "PLAN: split lines, then parse\n```clojure\n(ns a)\n(defn f [s] (str \"x\"))\n```\n\
-                    STEPS:\nSTEP 1: (str \"x\")\nSTEP 2: (inc: x)\nASSUMPTIONS:\n- input is a string\n- \n";
+        let text = "```clojure\n(ns a)\n(defn f [s] (str \"x\"))\n```";
         let g = parse_generation(&generation_from_text(text).unwrap()).unwrap();
         assert_eq!(g.code, "(ns a)\n(defn f [s] (str \"x\"))\n");
-        assert_eq!(
-            g.steps,
-            vec![(1, "(str \"x\")".to_owned()), (2, "(inc: x)".to_owned())]
-        );
-        assert_eq!(g.assumptions, vec!["input is a string".to_owned()]);
-        assert!(generation_from_text("PLAN: p\n```clojure\n(ns a)").is_err());
+        assert!(generation_from_text("```clojure\n(ns a)").is_err());
         assert!(generation_from_text("(ns a)").is_err());
+    }
+
+    #[test]
+    fn fix_answers_split_into_analysis_and_changed_forms() {
+        let (analysis, code) =
+            fix_from_text("ANALYSIS: \"5kg\" -> nil\n```clojure\n(defn- w [t] t)\n```").unwrap();
+        assert_eq!(analysis, "\"5kg\" -> nil");
+        assert_eq!(code, "(defn- w [t] t)");
+        assert!(fix_from_text("ANALYSIS: a\n```clojure\n```").is_err());
     }
 }

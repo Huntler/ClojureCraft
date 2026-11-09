@@ -5,6 +5,8 @@ use clojurecraft_domain::{
     Check, CheckStatus, CheckSubject, Contract, ExampleInput, Expectation, Freshness, FunctionDocument,
     KeySpec, NilBehavior, OrderingRequirement, Shape, ValidationReport,
 };
+#[cfg(test)]
+use clojurecraft_workflow::assistant::AttemptKind;
 use clojurecraft_workflow::assistant::{Attempt, Job, JobKind, Report};
 use clojurecraft_workflow::edge_cases::{self, CaseState};
 use serde_json::{Value, json};
@@ -393,11 +395,12 @@ fn task(kind: JobKind) -> &'static str {
         JobKind::ProposeContract => "propose_contract",
         JobKind::Generate => "generate",
         JobKind::ProposeTests => "generate_test_cases",
+        JobKind::Explain => "explain",
     }
 }
 
 fn attempt(doc: &FunctionDocument, a: &Attempt, detail: Detail) -> Value {
-    let mut v = json!({"attempt": a.number, "passed": a.passed()});
+    let mut v = json!({"attempt": a.label(), "passed": a.passed()});
     if let Some(r) = &a.report {
         let failing: Vec<&Check> = r
             .checks
@@ -450,6 +453,7 @@ pub fn last_job(doc: &FunctionDocument, r: &Report, detail: Detail) -> Value {
             json!({"outcome": "interpreted", "questions": questions, "notes": notes(n)})
         }
         Report::ContractProposed { notes: n } => json!({"outcome": "contract_proposed", "notes": notes(n)}),
+        Report::Explained { notes: n } => json!({"outcome": "explained", "notes": notes(n)}),
         Report::TestsProposed {
             added,
             ambiguous,
@@ -546,9 +550,8 @@ pub fn status(doc: &FunctionDocument, reports: &[ValidationReport], p: &Progress
             "phase": job.phase.label(),
             "seconds": job.started.elapsed().as_secs(),
         });
-        if let Some((n, max)) = job.attempt() {
-            j["attempt"] = json!(n);
-            j["max_attempts"] = json!(max);
+        if let Some(progress) = job.progress() {
+            j["attempt"] = json!(progress);
         }
         v["job"] = j;
     }
@@ -676,8 +679,12 @@ pub fn result(
             v["checks"] = json!("not checked against the current specification and tests");
         }
         if let Some(g) = &i.generation {
-            if !g.assumptions.is_empty() {
-                v["assumptions"] = json!(g.assumptions);
+            let assumptions = match &g.explanation {
+                Some(e) if !e.assumptions.is_empty() => &e.assumptions,
+                _ => &g.assumptions,
+            };
+            if !assumptions.is_empty() {
+                v["assumptions"] = json!(assumptions);
             }
             if let Some(e) = &g.explanation
                 && !e.summary.is_empty()
@@ -802,20 +809,22 @@ mod tests {
         let failing = report_for(&d, d.basis(), false);
         let att = |number| Attempt {
             number,
+            kind: AttemptKind::Fix(number),
             code: Some("(ns sum-numbers.core)".into()),
             report: Some(failing.clone()),
             note: None,
         };
         let empty = Attempt {
             number: 4,
+            kind: AttemptKind::Fix(4),
             code: None,
             report: None,
             note: Some("cut off".into()),
         };
         let list = attempt_list(&d, &[att(1), att(2), att(3), empty, att(5)], Detail::Compact);
         assert!(list[0]["first_failure"].is_object());
-        assert_eq!(list[1]["same_failure_as"], 1);
-        assert_eq!(list[2]["same_failure_as"], 1);
+        assert_eq!(list[1]["same_failure_as"], "Attempt 1");
+        assert_eq!(list[2]["same_failure_as"], "Attempt 1");
         assert!(list[1].get("first_failure").is_none());
         assert!(list[3].get("same_failure_as").is_none());
         assert!(

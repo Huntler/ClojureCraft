@@ -526,7 +526,8 @@ pub struct GenerationRecord {
     /// Namespaces required by the code, besides `clojure.core`.
     #[serde(default)]
     pub requires: Vec<String>,
-    /// Decisions the model made where the specification was silent.
+    /// Decisions the model made where the specification was silent; only code generated before
+    /// assumptions moved to the explanation has them.
     #[serde(default)]
     pub assumptions: Vec<String>,
     /// Optional prompt content left out to fit the context (for example documentation).
@@ -534,6 +535,17 @@ pub struct GenerationRecord {
     pub omitted_context: Vec<String>,
     #[serde(default)]
     pub explanation: Option<Explanation>,
+    /// The opening generation request as it was sent (system and user messages); the input the
+    /// code answers. Empty for code generated before prompts were recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt: Vec<PromptMessage>,
+}
+
+/// One chat message of a model request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptMessage {
+    pub role: String,
+    pub content: String,
 }
 
 /// A plain-language explanation of generated code.
@@ -542,6 +554,9 @@ pub struct Explanation {
     pub summary: String,
     /// Which code implements each transformation step.
     pub steps: Vec<StepMapping>,
+    /// Decisions the code makes where the specification is silent.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
     /// Standard-library functions used and what each does here.
     pub symbols: Vec<SymbolUse>,
 }

@@ -108,6 +108,11 @@ workout-log parser from the MCP example:
   grammar requires `(ns …)` first and only `defn`/`defn-`/`def`/`declare` after it, and allows no
   comments (the model rambled in `;;` comments until cut off).
 - **Plan first.** The answer starts with a short trace of example 1 before the code.
+- **Code only (2026-11-09).** The plan, `STEPS:` and `ASSUMPTIONS:` were removed: a generation
+  answer is only the ```` ```clojure ```` block. Steps and assumptions come from an explanation
+  the user asks for in the Explain tab, which gets the whole specification and the code. The
+  repair loop's diagnostics no longer show per-step values (locals still are), since there are
+  no step quotes until the code is explained.
 - **Checks.** Expected outputs that contradict the accepted contract block generation before
   any attempt. A new lint error reports a form whose value a `let`/`fn`/`do` body throws away (a
   misplaced parenthesis, or `(assoc m …)` written as if it changed `m`). Thrown errors quote the
@@ -183,3 +188,33 @@ community fine-tunes/merges (provenance and license unclear).
    quality rank, then by larger quantization.
 3. Recommend the best `smoke-tested` entry that fits fully, else the best that fits with partial
    offload. Unverified entries are shown but never recommended.
+
+## Conversation-based fixing with a sandbox tool (2026-11-08)
+
+**How a job runs now**
+- A failing generation is fixed in one conversation: "Generate", then up to 5 attempts.
+- Each attempt has two requests:
+  - an analysis request, without grammar and with the `clojure_eval` sandbox tool;
+  - a fix request, with grammar, for the changed top-level forms only, which are merged by name.
+- A stuck conversation starts over ("Fresh start").
+- See `docs/model-input-walkthrough.md` for what the model receives.
+
+**Benchmark** (`clojurecraft-devtool generate`, context 16384, Metal, M3 Pro 36 GB). Each cell
+names the attempt that passed in each run:
+
+| Spec | Qwen3-Coder 30B-A3B IQ4_XS | Qwen2.5-Coder 7B Q8_0 |
+|---|---|---|
+| Parse workout (library draft) | failed, Fresh start, Attempt 4 (250–400 s); one earlier run: Attempt 1 (90 s) | failed ×3 (185–206 s) |
+| order-totals | Generate ×2 (20 s) | Generate ×2 (46 s) |
+| top-scorers | Attempt 2 ×2 (100–125 s) | Generate ×2 (51–55 s) |
+| normalize-keys | Generate ×2 (22–24 s) | Attempt 1 (78 s), failed (119 s) |
+| nested-tags | Generate ×2 (19–21 s) | Attempt 1 (64 s), Attempt 3 (115 s) |
+
+**Observations**
+- The workout parser passes on the 30B in 3 of 4 runs. The 4 runs measured before the tool
+  (conversation without the tool, or an exhausted tool-round limit) all failed. The 30B uses the tool heavily (90 tool calls over the run) and finds causes such as
+  `(str/split "5kg" #"([a-zA-Z]+)$") => ["5"]` by itself.
+- The 7B never called the tool. Without it, the analysis is guesswork, and the workout parser
+  still fails. Simple specs pass on it as before.
+- Tool rounds cost time: an attempt with analysis takes 30–90 s on the 30B, mostly because of
+  JVM start-up per evaluation (about 1 s) and repeated analysis text.

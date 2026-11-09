@@ -544,8 +544,8 @@
 
     (= expected actual) nil
 
-    :else (str (at path) ": expected " (describe expected) " " (show expected)
-               " but got " (describe actual) " " (show actual))))
+    :else (letfn [(typed [x] (if (nil? x) "nil" (str (describe x) " " (show x))))]
+            (str (at path) ": expected " (typed expected) " but got " (typed actual)))))
 
 (def ^:private type-checks
   {:nil [nil? "nil"]
@@ -740,6 +740,7 @@
 
 (def ^:private probe-state (atom nil))
 (def ^:private probe-values-kept 3)
+(def ^:private probe-entries-kept 8)
 (def ^:private probe-print-length 20)
 (def ^:private probe-print-level 6)
 (def ^:private probe-print-chars 4000)
@@ -778,13 +779,19 @@
 (defn probe!
   "Records `v` as a value of probe `id` during an instrumented call and returns it unchanged."
   [id v]
-  (when-let [state @probe-state]
-    (let [{:keys [n values] :or {n 0 values []}} (get state id)]
-      (reset! probe-state
-              (assoc state id {:n (inc n)
-                               :values (if (< (count values) probe-values-kept)
-                                         (conj values (preview v))
-                                         values)}))))
+  ;; Printing a lazy value runs code that records other probes, so the value is printed before
+  ;; the state is read and the update is a swap.
+  (when @probe-state
+    (let [kept? (< (count (get-in @probe-state [id :values])) probe-values-kept)
+          shown (when kept? (preview v))]
+      (swap! probe-state
+             (fn [state]
+               (when state
+                 (let [{:keys [n values] :or {n 0 values []}} (get state id)]
+                   (assoc state id {:n (inc n)
+                                    :values (if (and shown (< (count values) probe-values-kept))
+                                              (conj values shown)
+                                              values)})))))))
   v)
 
 (defn probe-first
@@ -793,12 +800,20 @@
   (probe! id v))
 
 (defn record-locals!
-  "Records the current values of the locals `names` as probe `id`; only the latest values are
-   kept, so after an exception they are those of the scope that was running."
+  "Records the current values of the locals `names` as probe `id`: the latest values, so after an
+   exception they are those of the scope that was running, and those of the first few entries,
+   so a wrong element of a result can be traced to the entry that built it."
   [id names values]
-  (when-let [state @probe-state]
-    (let [{:keys [n] :or {n 0}} (get state id)]
-      (reset! probe-state (assoc state id {:n (inc n) :locals (mapv vector names values)})))))
+  (swap! probe-state
+         (fn [state]
+           (when state
+             (let [{:keys [n entries] :or {n 0 entries []}} (get state id)
+                   current (mapv vector names values)]
+               (assoc state id {:n (inc n)
+                                :locals current
+                                :entries (if (< (count entries) probe-entries-kept)
+                                           (conj entries current)
+                                           entries)}))))))
 
 (defmacro probe-locals!
   "Records the locals `names` as probe `id` whenever evaluation reaches `expr`, then evaluates
@@ -878,10 +893,11 @@
                    :status (cond (= run ::timeout) "timeout" (:error run) "error" :else "ok")
                    :message (when-let [t (and (map? run) (:error run))] (str (.getMessage ^Throwable t)))
                    :consistent (and (not= run ::timeout) (same-outcome? original run))
-                   :probes (vec (for [[id {:keys [n values locals]}] (sort-by key captured)]
-                                  (cond-> {:id id :count n :values (or values [])}
-                                    locals (assoc :locals (mapv (fn [[nm v]] (assoc (preview v) :name nm))
-                                                                locals)))))})
+                   :probes (vec (for [[id {:keys [n values locals entries]}] (sort-by key captured)]
+                                  (let [shown (fn [ls] (mapv (fn [[nm v]] (assoc (preview v) :name nm)) ls))]
+                                    (cond-> {:id id :count n :values (or values [])}
+                                      locals (assoc :locals (shown locals))
+                                      (next entries) (assoc :entries (mapv shown entries))))))})
             (when (= run ::timeout)
               (emit {:event "halted"})
               (.halt (Runtime/getRuntime) 0))))))))

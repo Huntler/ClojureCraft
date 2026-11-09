@@ -308,9 +308,18 @@ fn values_text(locals: &[clojurecraft_clojure::LocalValue]) -> String {
         .join(", ")
 }
 
-/// The latest locals of every scope a call that returned (with a wrong value) entered, in
-/// source order, with how often each was entered; `None` when there is nothing to show.
-pub fn describe_returned(locals: &Locals, run: &ProbeCall) -> Option<String> {
+/// The first wrong element of a result: its index and how many elements the result has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrongElement {
+    pub index: usize,
+    pub of: usize,
+}
+
+/// The locals of every scope a call that returned (with a wrong value) entered, in source order,
+/// with how often each was entered; `None` when there is nothing to show. A scope entered once
+/// per element of the result shows the values of the entry that built `wrong`, otherwise the
+/// latest values.
+pub fn describe_returned(locals: &Locals, run: &ProbeCall, wrong: Option<WrongElement>) -> Option<String> {
     if !run.consistent {
         return None;
     }
@@ -320,15 +329,25 @@ pub fn describe_returned(locals: &Locals, run: &ProbeCall) -> Option<String> {
         let Some(capture) = run.capture(s.id).filter(|c| !c.locals.is_empty()) else {
             continue;
         };
-        let times = match capture.evaluations {
-            1 => "entered once".to_owned(),
-            n => format!("entered {n} times, latest values"),
+        let per_element = wrong.and_then(|w| {
+            let n = u64::try_from(w.of).ok()?;
+            (capture.evaluations == n && n > 1)
+                .then(|| capture.entries.get(w.index).map(|e| (w.index, e)))
+                .flatten()
+        });
+        let (times, shown) = match (capture.evaluations, per_element) {
+            (1, _) => ("entered once".to_owned(), &capture.locals),
+            (n, Some((i, entry))) => (
+                format!("entered {n} times, once per element; values while building element [{i}]"),
+                entry,
+            ),
+            (n, None) => (format!("entered {n} times, latest values"), &capture.locals),
         };
         let text = format!(
             "  in {} at line {} ({times}): {}",
             s.label,
             s.lines.0,
-            values_text(&capture.locals)
+            values_text(shown)
         );
         if used + text.len() > MAX_CHARS {
             parts.push("  (more scopes are not shown)".to_owned());
@@ -483,12 +502,14 @@ mod tests {
                     evaluations: 1,
                     values: vec![],
                     locals: vec![local("weight", "nil")],
+                    entries: vec![],
                 },
                 ProbeCapture {
                     id: 1,
                     evaluations: 1,
                     values: vec![],
                     locals: vec![local("input", "\"x\"")],
+                    entries: vec![],
                 },
                 ProbeCapture {
                     id: 2,
@@ -500,12 +521,14 @@ mod tests {
                         local("sets-reps", "\"3x8 @ 60kg\""),
                         local("weight", "nil"),
                     ],
+                    entries: vec![],
                 },
                 ProbeCapture {
                     id: 3,
                     evaluations: 1,
                     values: vec![],
                     locals: vec![local("a", "1")],
+                    entries: vec![],
                 },
             ],
         };
@@ -542,17 +565,19 @@ mod tests {
                     evaluations: 3,
                     values: vec![],
                     locals: vec![local("date", "\"2026-03-04\""), local("weight", "nil")],
+                    entries: vec![],
                 },
                 ProbeCapture {
                     id: 8,
                     evaluations: 1,
                     values: vec![],
                     locals: vec![local("input", "\"x\"")],
+                    entries: vec![],
                 },
             ],
         };
         assert_eq!(
-            describe_returned(&l, &run).unwrap(),
+            describe_returned(&l, &run, None).unwrap(),
             "Values of the locals in each scope the call entered, in source order:\n  in (defn w [input]) at line 7 (entered once): input = \"x\"\n  in (fn [[date exercise sets-reps weight]]) at line 10 (entered 3 times, latest values): date = \"2026-03-04\", weight = nil"
         );
     }

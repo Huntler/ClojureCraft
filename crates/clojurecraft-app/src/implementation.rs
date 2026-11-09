@@ -60,16 +60,18 @@ pub enum Tab {
     Result,
     EdgeCases,
     Steps,
+    Explain,
     Sources,
     History,
 }
 
 impl Tab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Implementation,
         Self::Result,
         Self::EdgeCases,
         Self::Steps,
+        Self::Explain,
         Self::Sources,
         Self::History,
     ];
@@ -81,6 +83,7 @@ impl Tab {
             Self::EdgeCases => "Edge cases",
             Self::History => "History",
             Self::Steps => "Steps",
+            Self::Explain => "Explain",
             Self::Sources => "Sources",
         }
     }
@@ -188,6 +191,11 @@ pub fn show(
             Tab::Steps => {
                 if let Some(a) = crate::step_preview_view::show(ui, doc, &steps) {
                     action = ColumnAction::Steps(a);
+                }
+            }
+            Tab::Explain => {
+                if let Some(a) = crate::explain_view::show(ui, doc, assistant, blocked.as_deref()) {
+                    action = ColumnAction::Generation(a);
                 }
             }
             Tab::Sources => {

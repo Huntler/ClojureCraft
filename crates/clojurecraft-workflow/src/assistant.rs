@@ -9,11 +9,13 @@
 //! - an interpretation is stored next to the user's text, and its questions stay open until the
 //!   user answers them;
 //! - a contract proposal is stored as proposed, and never replaces an accepted contract;
-//! - generated code is validated (see [`crate::validation`]). A new generation first writes up to
-//!   [`SAMPLES`] independent candidates (new seed, higher temperature), because failures are
-//!   mostly sampling noise and checking a candidate is cheap; then the best failing candidate is
-//!   sent back with its diagnostics for repair, at most [`MAX_REPAIRS`] times. The first passing
-//!   candidate ends the loop;
+//! - generated code is validated (see [`crate::validation`]). Failing code starts a
+//!   conversation: the model's answer stays in the history, the reply shows the checked code and
+//!   its failures and asks the model to find out first why the first failing example failed, and
+//!   the model answers with an analysis and only the forms it changes (see [`crate::edits`]). At
+//!   most [`MAX_FIXES`] fixes follow a generation. A conversation that is stuck (a fix that
+//!   returns earlier code, or fails exactly like the code before it) starts over with a fresh
+//!   generation and an empty history. The first passing code ends the loop;
 //! - before checking, closing delimiters that do not match are inferred from the indentation
 //!   (see [`crate::delimiters`]) and harmless extras are removed (see [`crate::cleanup`]); both
 //!   are noted on the attempt;
@@ -39,16 +41,15 @@ use std::hash::{BuildHasher, RandomState};
 use std::time::Instant;
 
 use crate::answers::{self, InterpretationAnswer};
-use crate::intermediate::StepLines;
 use crate::requests::{self, DOCUMENTATION_DROP_ORDER};
 use crate::validation::{self, Plan, ReportContext};
 use crate::{Candidate, GenerationInput, Names, Provenance, deps, readiness};
-use crate::{cleanup, delimiters, edge_cases};
-use clojurecraft_clojure::{EvalOutcome, EvalRequest};
+use crate::{cleanup, delimiters, edge_cases, edits};
+use clojurecraft_clojure::{ClojureRuntime, EvalOutcome, EvalRequest};
 use clojurecraft_domain::{
-    DocumentationRef, ExecutionEnvironment, Explanation, Fingerprint, FunctionDocument, FunctionId,
-    GenerationRunId, GenerationSettings, InferenceRuntime, Interpretation, ModelIdentity, RevisionKind,
-    RevisionReason, Timestamp, ValidationReport,
+    DocumentationRef, ExecutionEnvironment, Fingerprint, FunctionDocument, FunctionId, GenerationRunId,
+    GenerationSettings, InferenceRuntime, Interpretation, ModelIdentity, PromptMessage, RevisionKind,
+    RevisionReason, Step, Timestamp, ValidationReport,
 };
 use clojurecraft_inference::{
     GenerateRequest, Generation, GenerationError, Remedy, RequestId, Role, ServiceEvent, StreamEvent,
@@ -62,14 +63,11 @@ pub const MAX_EXCERPTS: usize = 10;
 /// the answer's token limit; the service still caps the total at half the context.
 pub const REASONING_ALLOWANCE: u32 = 6144;
 
-/// Candidates written for a new generation before any repair.
-pub const SAMPLES: u32 = 3;
+/// Fixes after the first generation, each continuing the conversation about the failing code.
+pub const MAX_FIXES: u32 = 5;
 
-/// Repairs after the candidates (or after the first repair of a fix).
-pub const MAX_REPAIRS: u32 = 3;
-
-/// Attempts of a generation at most: the candidates plus the repairs.
-pub const MAX_ATTEMPTS: u32 = SAMPLES + MAX_REPAIRS;
+/// Model answers of a generation at most: the generation and its fixes.
+pub const MAX_ATTEMPTS: u32 = 1 + MAX_FIXES;
 
 /// Characters of failure diagnostics sent with a repair request.
 const MAX_FAILURE_CHARS: usize = 6000;
@@ -171,6 +169,11 @@ pub trait Ports {
     /// runtime is installed).
     fn validate(&mut self, request: EvalRequest) -> Result<u64, String>;
     fn cancel_validation(&mut self, id: u64);
+    /// The sandboxed runtime, for the tool that lets the model evaluate expressions while it
+    /// analyses failing code; `None` when code cannot be run.
+    fn runtime(&self) -> Option<ClojureRuntime> {
+        None
+    }
 }
 
 /// The open functions the assistant may change.
@@ -211,6 +214,20 @@ pub enum JobKind {
     ProposeContract,
     Generate,
     ProposeTests,
+    Explain,
+}
+
+impl JobKind {
+    /// What the job does, as in "Could not {label}"; a failed job's report names it so.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interpret => "check the specification",
+            Self::ProposeContract => "propose a contract",
+            Self::Generate => "generate the implementation",
+            Self::ProposeTests => "propose edge cases",
+            Self::Explain => "explain the code",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +239,8 @@ pub enum Phase {
     Retrieving,
     Generating,
     Validating,
+    /// Finding out why the code failed, before fixing it.
+    Analyzing,
     Repairing,
     Explaining,
     ProposingTests,
@@ -237,18 +256,31 @@ impl Phase {
             Self::Retrieving => "Looking up documentation",
             Self::Generating => "Writing the code",
             Self::Validating => "Checking the code",
-            Self::Repairing => "Repairing the code",
+            Self::Analyzing => "Finding the cause",
+            Self::Repairing => "Fixing the code",
             Self::Explaining => "Explaining the code",
             Self::ProposingTests => "Proposing edge cases",
         }
     }
 }
 
-/// One generation or repair attempt and how it fared.
+/// What an attempt asked the model for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptKind {
+    /// Code written from the specification.
+    Generate,
+    /// Code written afresh because the conversation about failing code got stuck.
+    Restart,
+    /// The n-th fix of failing code in this job.
+    Fix(u32),
+}
+
+/// One model answer of a generation and how it fared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Attempt {
-    /// 1 for the initial generation.
+    /// The answer's position in the job, from 1.
     pub number: u32,
+    pub kind: AttemptKind,
     /// The code, when the model produced usable code.
     pub code: Option<String>,
     /// The validation report, when the code was checked.
@@ -260,6 +292,30 @@ pub struct Attempt {
 impl Attempt {
     pub fn passed(&self) -> bool {
         self.report.as_ref().is_some_and(ValidationReport::passed)
+    }
+
+    /// How the attempt is named: "Generate", "Attempt 2", or "Fresh start".
+    pub fn label(&self) -> String {
+        self.kind.label()
+    }
+}
+
+impl AttemptKind {
+    pub fn label(self) -> String {
+        match self {
+            Self::Generate => "Generate".into(),
+            Self::Restart => "Fresh start".into(),
+            Self::Fix(n) => format!("Attempt {n}"),
+        }
+    }
+
+    /// The sampling temperature this kind of attempt runs with.
+    pub fn temperature(self) -> f32 {
+        match self {
+            Self::Generate => Role::Generation.profile().temperature,
+            Self::Restart => requests::RESTART_TEMPERATURE,
+            Self::Fix(_) => requests::FIX_TEMPERATURE,
+        }
     }
 }
 
@@ -281,12 +337,22 @@ struct GenState {
     candidate: Option<Candidate>,
     plan: Option<Plan>,
     /// For a fix: the current code and the report of its failing checks, which the first
-    /// attempt repairs instead of writing code afresh.
+    /// attempt fixes instead of writing code afresh.
     start: Option<(String, ValidationReport)>,
+    /// What the attempt in progress asks for.
+    kind: AttemptKind,
+    /// The conversation about failing code so far; empty before the first fix.
+    turns: Vec<requests::Turn>,
+    /// The model's last usable answer, as given, for the conversation history.
+    answer: Option<String>,
+    /// The code the fix in progress changes.
+    base: Option<String>,
     /// The namespace and function of the code being fixed.
     start_names: Option<Names>,
     /// What was changed in the current candidate before it was checked.
     prepared: Vec<String>,
+    /// The last generation request as sent; empty for a job that only fixes existing code.
+    prompt: Vec<PromptMessage>,
 }
 
 impl GenState {
@@ -294,36 +360,24 @@ impl GenState {
         self.seed.wrapping_add(u64::from(self.attempt - 1))
     }
 
-    /// Attempts this generation may make: a fix starts with a repair, so it has no candidates.
+    /// Attempts this generation may make: a fix of the current code starts with a fix, so it
+    /// has no generation.
     fn max_attempts(&self) -> u32 {
         if self.start.is_some() {
-            1 + MAX_REPAIRS
+            MAX_FIXES
         } else {
             MAX_ATTEMPTS
         }
     }
 
-    /// Whether `attempt` writes a fresh candidate rather than repairing one.
-    fn is_sample(&self, attempt: u32) -> bool {
-        self.start.is_none() && attempt <= SAMPLES
-    }
-
-    /// The sampling temperature `attempt` ran with.
-    fn temperature(&self, attempt: u32) -> f32 {
-        match (self.is_sample(attempt), attempt) {
-            (true, 1) => Role::Generation.profile().temperature,
-            (true, _) => requests::SAMPLE_TEMPERATURE,
-            (false, _) => requests::REPAIR_TEMPERATURE,
-        }
-    }
-
-    /// Repairs made up to and including `attempt`.
-    fn repairs(&self, attempt: u32) -> u32 {
-        if self.start.is_some() {
-            attempt
-        } else {
-            attempt.saturating_sub(SAMPLES)
-        }
+    /// The kind of the next fix: fixes are numbered through the whole job.
+    fn next_fix(&self) -> AttemptKind {
+        let done = self
+            .attempts
+            .iter()
+            .filter(|a| matches!(a.kind, AttemptKind::Fix(_)))
+            .count();
+        AttemptKind::Fix(u32::try_from(done).unwrap_or(u32::MAX) + 1)
     }
 
     fn input(&self) -> GenerationInput<'_> {
@@ -356,12 +410,30 @@ pub struct Job {
     notes: Vec<String>,
     interpretation: Option<InterpretationAnswer>,
     generation: Option<GenState>,
+    /// For an explanation: the code explained and the steps numbered in the request.
+    explaining: Option<(String, Vec<Step>)>,
 }
 
 impl Job {
     /// The attempt in progress and the maximum, for a generation.
     pub fn attempt(&self) -> Option<(u32, u32)> {
         self.generation.as_ref().map(|g| (g.attempt, g.max_attempts()))
+    }
+
+    /// What the attempt in progress asks for, for a generation.
+    pub fn attempt_kind(&self) -> Option<AttemptKind> {
+        self.generation.as_ref().map(|g| g.kind)
+    }
+
+    /// The attempt in progress, named as the attempts list names it, with how many model
+    /// answers remain after it: "Attempt 2 (3 more at most)".
+    pub fn progress(&self) -> Option<String> {
+        let g = self.generation.as_ref()?;
+        let left = g.max_attempts().saturating_sub(g.attempt);
+        Some(match left {
+            0 => format!("{}, the last", g.kind.label()),
+            n => format!("{} ({n} more at most)", g.kind.label()),
+        })
     }
 
     /// Attempts finished so far in this generation.
@@ -381,7 +453,6 @@ pub struct Pending {
     pub candidate: Candidate,
     pub names: Names,
     pub provenance: Provenance,
-    pub explanation: Option<Explanation>,
     /// Supported namespaces the code uses that the function does not allow yet.
     pub needs_approval: Vec<String>,
     /// The current implementation was written or edited by hand.
@@ -419,6 +490,10 @@ pub enum Report {
     TestsProposed {
         added: usize,
         ambiguous: usize,
+        notes: Vec<String>,
+    },
+    /// The code's explanation was stored.
+    Explained {
         notes: Vec<String>,
     },
     /// Code was applied to the function.
@@ -466,18 +541,26 @@ pub struct Assistant {
     model_reasons: bool,
 }
 
+/// Why the current code cannot be explained: only unedited generated code can.
+pub fn explain_blocker(doc: &FunctionDocument) -> Option<&'static str> {
+    match &doc.implementation {
+        Some(i) if i.source.trim().is_empty() => Some("There is no code to explain yet."),
+        Some(i) if i.generation.is_none() => Some("Only generated code can be explained."),
+        Some(i) if i.is_manually_edited() => {
+            Some("The code was edited by hand; only unedited generated code can be explained.")
+        }
+        Some(_) => None,
+        None => Some("Generate the code first."),
+    }
+}
+
 fn random_seed() -> u64 {
     // RandomState is seeded randomly per instance.
     RandomState::new().hash_one(Instant::now())
 }
 
 fn job_label(kind: JobKind) -> &'static str {
-    match kind {
-        JobKind::Interpret => "check the specification",
-        JobKind::ProposeContract => "propose a contract",
-        JobKind::Generate => "generate the implementation",
-        JobKind::ProposeTests => "propose edge cases",
-    }
+    kind.label()
 }
 
 impl Assistant {
@@ -522,6 +605,7 @@ impl Assistant {
             notes: r.notes,
             interpretation: None,
             generation: None,
+            explaining: None,
         });
         Ok(())
     }
@@ -609,6 +693,31 @@ impl Assistant {
         }
     }
 
+    /// Explains the current generated code: which code carries out each step, and the decisions
+    /// it makes where the specification is silent. The explanation is stored with the code.
+    pub fn explain(&mut self, doc: &FunctionDocument, ports: &mut dyn Ports) {
+        if let Some(why) = explain_blocker(doc) {
+            self.reports.insert(doc.id, Report::Blocked(vec![why.to_owned()]));
+            return;
+        }
+        let code = doc
+            .implementation
+            .as_ref()
+            .map(|i| i.source.clone())
+            .unwrap_or_default();
+        if self.begin(doc, JobKind::Explain, Phase::Explaining).is_ok() {
+            if let Some(job) = &mut self.job {
+                let steps = requests::numbered_steps(doc).into_iter().cloned().collect();
+                job.explaining = Some((code.clone(), steps));
+            }
+            self.send(
+                requests::explanation_request(doc, &code),
+                Phase::Explaining,
+                ports,
+            );
+        }
+    }
+
     /// Starts a generation; `documentation` says whether a documentation collection is installed.
     pub fn generate(
         &mut self,
@@ -676,6 +785,11 @@ impl Assistant {
                 start,
                 start_names,
                 prepared: Vec::new(),
+                kind: AttemptKind::Generate,
+                turns: Vec::new(),
+                answer: None,
+                base: None,
+                prompt: Vec::new(),
             });
             if !documentation {
                 job.notes
@@ -739,15 +853,29 @@ impl Assistant {
                 .clone()
                 .unwrap_or_else(|| Names::for_document(&g.spec, |s| core.contains(s))),
         );
-        let (request, phase) = match &g.start {
+        let (request, phase) = match g.start.clone() {
             Some((code, report)) => {
                 let names = g.names.as_ref().expect("names were just set");
-                let plan = validation::plan(&g.spec, code, names);
-                let failures = validation::failure_summary(&plan, report, MAX_FAILURE_CHARS);
-                (
-                    requests::repair_request(g.input(), code, &failures, 1, g.max_attempts(), None),
-                    Phase::Repairing,
-                )
+                let plan = validation::plan(&g.spec, &code, names);
+                let failures = validation::failure_summary(&plan, &report, MAX_FAILURE_CHARS);
+                let focus = validation::focus(&plan, &report);
+                let (feedback, fix) = requests::feedback(
+                    &code,
+                    &failures,
+                    focus.as_ref(),
+                    validation::readable(&report),
+                    ports.runtime().is_some(),
+                );
+                g.turns = vec![requests::Turn {
+                    answer: requests::existing_code_answer(&code),
+                    feedback,
+                    analysis: None,
+                    fix,
+                }];
+                g.base = Some(code);
+                g.kind = AttemptKind::Fix(1);
+                self.analyze(ports);
+                return;
             }
             None => (requests::generation_request(g.input()), Phase::Generating),
         };
@@ -825,19 +953,14 @@ impl Assistant {
                         self.end(Report::Cancelled);
                         Vec::new()
                     }
-                    Err(e) => self.failed(e, doc, ports),
+                    Err(e) => self.failed(e, ports),
                 }
             }
             _ => Vec::new(),
         }
     }
 
-    fn failed(
-        &mut self,
-        e: &GenerationError,
-        doc: &mut FunctionDocument,
-        ports: &mut dyn Ports,
-    ) -> Vec<Update> {
+    fn failed(&mut self, e: &GenerationError, ports: &mut dyn Ports) -> Vec<Update> {
         // A reasoning model that used up its budget thinking is asked once more with room to
         // think, and keeps that room for later requests.
         if let GenerationError::CutOff { reasoning_chars, .. } = e
@@ -868,10 +991,19 @@ impl Assistant {
                 self.retrieve(Vec::new(), ports);
                 Vec::new()
             }
-            // The code is kept without an explanation.
-            Phase::Explaining => {
-                job.notes.push(format!("The code could not be explained: {e}."));
-                self.finish_passing(doc, None)
+            // A fix can still be asked for without an analysis.
+            Phase::Analyzing
+                if matches!(
+                    e,
+                    GenerationError::Malformed { .. }
+                        | GenerationError::CutOff { .. }
+                        | GenerationError::ToolRounds(_)
+                ) =>
+            {
+                job.notes
+                    .push(format!("The analysis of a failure was not usable: {e}"));
+                self.analyzed(String::new(), ports);
+                Vec::new()
             }
             // A malformed or cut-off answer is a failed attempt; others may still succeed.
             Phase::Generating | Phase::Repairing
@@ -944,18 +1076,35 @@ impl Assistant {
         let Some(job) = &mut self.job else {
             return Vec::new();
         };
-        // Generation answers are plain text, read into the same shape as a structured answer.
+        if job.phase == Phase::Analyzing {
+            let mut analysis = g.text.trim().to_owned();
+            let checked = crate::eval_tool::transcript(&g.tool_calls);
+            if !checked.is_empty() {
+                analysis.push_str(&format!("\n\nChecked in the sandbox:\n{checked}"));
+            }
+            self.analyzed(analysis, ports);
+            return Vec::new();
+        }
+        // Generation answers are plain text, read into the same shape as a structured answer; a
+        // fix's changed forms are merged into the code it fixes first.
         let from_text;
         let value = match (&g.value, job.phase) {
             (Some(v), _) => Some(v),
             (None, Phase::Generating | Phase::Repairing) => {
                 let read = if g.finish == clojurecraft_inference::Finish::Length {
                     Err("the answer was cut off at its length limit".to_owned())
+                } else if job.phase == Phase::Repairing
+                    && let Some(state) = &mut job.generation
+                {
+                    fix_answer(state, &g.text)
                 } else {
                     answers::generation_from_text(&g.text)
                 };
                 match read {
                     Ok(v) => {
+                        if let Some(state) = &mut job.generation {
+                            state.answer = Some(g.text.clone());
+                        }
                         from_text = v;
                         Some(&from_text)
                     }
@@ -971,12 +1120,6 @@ impl Assistant {
             match job.phase {
                 Phase::Generating | Phase::Repairing => {
                     return self.attempt_without_code("The model gave no structured answer.".into(), ports);
-                }
-                // Checked code is kept without an explanation.
-                Phase::Explaining => {
-                    job.notes
-                        .push("The code could not be explained: the model gave no structured answer.".into());
-                    return self.finish_passing(doc, None);
                 }
                 _ => {
                     self.malformed("no structured answer".into(), &g.text);
@@ -1089,7 +1232,7 @@ impl Assistant {
                     Vec::new()
                 }
             },
-            Phase::Retrieving | Phase::Validating => Vec::new(),
+            Phase::Retrieving | Phase::Validating | Phase::Analyzing => Vec::new(),
             Phase::Generating | Phase::Repairing => {
                 let Some(gen_state) = &mut job.generation else {
                     return Vec::new();
@@ -1106,7 +1249,7 @@ impl Assistant {
                 };
                 let (code, prepared) = prepare(&generated.code, &names.function);
                 generated.code = code;
-                gen_state.prepared = prepared;
+                gen_state.prepared.extend(prepared);
                 gen_state.omitted = g.plan.omitted.iter().map(|(label, _)| label.clone()).collect();
                 if gen_state
                     .omitted
@@ -1125,16 +1268,19 @@ impl Assistant {
                             .into(),
                     );
                 }
-                let quoted = std::mem::take(&mut generated.steps);
+                if job.phase == Phase::Generating
+                    && let Some(request) = &job.last_request
+                {
+                    gen_state.prompt = requests::prompt_messages(request, Some(&g.plan.included));
+                }
                 let candidate = Candidate::check(generated, &names, &gen_state.allowed);
-                let lines = step_lines(&gen_state.spec, &candidate.code, &quoted);
-                let plan = validation::plan_with_steps(&gen_state.spec, &candidate.code, &names, lines);
+                let plan = validation::plan(&gen_state.spec, &candidate.code, &names);
                 let request = plan.request.clone();
                 gen_state.candidate = Some(candidate);
                 gen_state.plan = Some(plan);
                 match request {
                     // Parse or structure problems: the report is complete without running.
-                    None => self.validated(Err("not run".into()), None, ports),
+                    None => self.validated(Err("not run".into()), None, doc, ports),
                     Some(r) => match ports.validate(r) {
                         Ok(id) => {
                             job.validation = Some(id);
@@ -1143,26 +1289,40 @@ impl Assistant {
                             job.reasoning.clear();
                             Vec::new()
                         }
-                        Err(why) => self.unvalidated(why, ports),
+                        Err(why) => self.unvalidated(why, doc),
                     },
                 }
             }
             Phase::Explaining => {
-                let code = job
-                    .generation
-                    .as_ref()
-                    .and_then(|g| g.candidate.as_ref())
-                    .map(|c| c.code.clone())
-                    .unwrap_or_default();
-                let steps = requests::numbered_steps(doc);
-                let explanation = match answers::parse_explanation(value, &steps, &code) {
-                    Ok(e) => Some(e),
-                    Err(e) => {
-                        job.notes.push(format!("The code could not be explained: {e}."));
-                        None
-                    }
+                let function = job.function;
+                let (code, steps) = job.explaining.clone().unwrap_or_default();
+                let current = doc
+                    .implementation
+                    .as_mut()
+                    .filter(|i| i.source == code)
+                    .and_then(|i| i.generation.as_mut());
+                let Some(generation) = current else {
+                    self.end(Report::Failed {
+                        what: job_label(JobKind::Explain),
+                        message: "the code changed while it was being explained".into(),
+                        remedies: Vec::new(),
+                        raw: None,
+                    });
+                    return Vec::new();
                 };
-                self.finish_passing(doc, explanation)
+                let steps: Vec<&Step> = steps.iter().collect();
+                match answers::parse_explanation(value, &steps, &code) {
+                    Ok(e) => {
+                        generation.explanation = Some(e);
+                        let notes = std::mem::take(&mut job.notes);
+                        self.end(Report::Explained { notes });
+                        vec![Update::Edited(function)]
+                    }
+                    Err(e) => {
+                        self.malformed(e, &g.text);
+                        Vec::new()
+                    }
+                }
             }
         }
     }
@@ -1182,19 +1342,20 @@ impl Assistant {
             return Vec::new();
         }
         job.validation = None;
-        if docs.document(job.function).is_none() {
+        let Some(doc) = docs.document(job.function) else {
             self.end(Report::Cancelled);
             return Vec::new();
-        }
-        self.validated(execution.outcome, Some(execution.environment), ports)
+        };
+        self.validated(execution.outcome, Some(execution.environment), doc, ports)
     }
 
-    /// Records the current candidate's report and decides what follows: an explanation of
-    /// passing code, a repair, or the end of the loop.
+    /// Records the current candidate's report and decides what follows: passing code ends the
+    /// loop, failing code is repaired.
     fn validated(
         &mut self,
         outcome: Result<EvalOutcome, String>,
         environment: Option<ExecutionEnvironment>,
+        doc: &mut FunctionDocument,
         ports: &mut dyn Ports,
     ) -> Vec<Update> {
         let Some(job) = &mut self.job else {
@@ -1225,14 +1386,14 @@ impl Assistant {
         let note = std::mem::take(&mut g.prepared);
         g.attempts.push(Attempt {
             number: g.attempt,
+            kind: g.kind,
             code: Some(candidate.code.clone()),
             report: Some(report.clone()),
             note: (!note.is_empty()).then(|| note.join(" ")),
         });
         let mut updates = vec![Update::Validated(function, Box::new(report))];
         if passed {
-            let request = requests::explanation_request(&g.spec, &candidate.code);
-            self.send(request, Phase::Explaining, ports);
+            updates.extend(self.finish_passing(doc));
         } else {
             updates.extend(self.next_attempt(ports));
         }
@@ -1241,7 +1402,7 @@ impl Assistant {
 
     /// The candidate could not be run at all (for example, no Java runtime). It is kept, as
     /// before validation existed, but marked as unchecked.
-    fn unvalidated(&mut self, why: String, ports: &mut dyn Ports) -> Vec<Update> {
+    fn unvalidated(&mut self, why: String, doc: &mut FunctionDocument) -> Vec<Update> {
         if let Some(job) = &mut self.job {
             job.notes.push(format!("The code was not run: {why}"));
             if let Some(g) = &mut job.generation
@@ -1251,15 +1412,14 @@ impl Assistant {
                 note.push(format!("Not run: {why}"));
                 g.attempts.push(Attempt {
                     number: g.attempt,
+                    kind: g.kind,
                     code: Some(c.code.clone()),
                     report: None,
                     note: Some(note.join(" ")),
                 });
-                let request = requests::explanation_request(&g.spec, &c.code);
-                self.send(request, Phase::Explaining, ports);
             }
         }
-        Vec::new()
+        self.finish_passing(doc)
     }
 
     /// The attempt produced no code to check.
@@ -1270,6 +1430,7 @@ impl Assistant {
             g.prepared.clear();
             g.attempts.push(Attempt {
                 number: g.attempt,
+                kind: g.kind,
                 code: None,
                 report: None,
                 note: Some(note),
@@ -1278,8 +1439,9 @@ impl Assistant {
         self.next_attempt(ports)
     }
 
-    /// Starts the next attempt, or ends the loop after the last one: another candidate while
-    /// candidates remain, then a repair of the best candidate so far.
+    /// Starts the next attempt, or ends the loop after the last one. Failing code continues the
+    /// conversation with a fix; a stuck conversation starts over with a fresh generation; an
+    /// unusable answer is asked for again from the same point.
     fn next_attempt(&mut self, ports: &mut dyn Ports) -> Vec<Update> {
         let Some(job) = &mut self.job else {
             return Vec::new();
@@ -1294,20 +1456,23 @@ impl Assistant {
             return Vec::new();
         }
         g.attempt += 1;
-        if g.is_sample(g.attempt) {
-            let mut request = requests::generation_request(g.input());
-            request.temperature = Some(requests::SAMPLE_TEMPERATURE);
-            self.send(request, Phase::Generating, ports);
-            return Vec::new();
-        }
-        let Some(best) = best_attempt(&g.attempts) else {
-            // No candidate had code to repair: write the code afresh.
-            let mut request = requests::generation_request(g.input());
-            request.temperature = Some(requests::REPAIR_TEMPERATURE);
-            self.send(request, Phase::Repairing, ports);
-            return Vec::new();
-        };
-        let (Some(code), Some(report)) = (best.code.clone(), best.report.clone()) else {
+        let checked = g
+            .attempts
+            .last()
+            .and_then(|a| Some((a.code.clone()?, a.report.clone()?)));
+        let Some((code, report)) = checked else {
+            // The last answer was unusable: ask again with a new seed.
+            g.answer = None;
+            if g.turns.is_empty() {
+                g.kind = AttemptKind::Restart;
+                let mut request = requests::generation_request(g.input());
+                request.temperature = Some(requests::RESTART_TEMPERATURE);
+                self.send(request, Phase::Generating, ports);
+            } else {
+                g.kind = g.next_fix();
+                let request = requests::fix_request(g.input(), &g.turns);
+                self.send(request, Phase::Repairing, ports);
+            }
             return Vec::new();
         };
         let names = g.names.as_ref().expect("names are set before code is written");
@@ -1316,18 +1481,70 @@ impl Assistant {
             validation::failure_summary(&plan, r, MAX_FAILURE_CHARS)
         };
         let failures = summary(&code, &report);
-        // Another attempt failing exactly like the one being repaired (same code, or the same
-        // failures) means the model is stuck on one approach.
-        let repeated = g.attempts.iter().rev().find_map(|e| match (&e.code, &e.report) {
-            _ if e.number == best.number => None,
-            (Some(c), _) if *c == code => Some((best.number, e.number)),
-            (Some(c), Some(er)) if summary(c, er) == failures => Some((best.number, e.number)),
-            _ => None,
+        if conversation_stuck(&g.attempts, &code, &failures, &summary) {
+            job.notes.push(format!(
+                "{} returned code that failed exactly like earlier code, so the conversation started \
+                 over with a fresh generation.",
+                g.attempts.last().map_or_else(String::new, Attempt::label)
+            ));
+            g.turns.clear();
+            g.base = None;
+            g.answer = None;
+            g.kind = AttemptKind::Restart;
+            let mut request = requests::generation_request(g.input());
+            request.temperature = Some(requests::RESTART_TEMPERATURE);
+            self.send(request, Phase::Generating, ports);
+            return Vec::new();
+        }
+        let plan = validation::plan(&g.spec, &code, names);
+        let focus = validation::focus(&plan, &report);
+        let answer = g
+            .answer
+            .take()
+            .unwrap_or_else(|| requests::existing_code_answer(&code));
+        let (feedback, fix) = requests::feedback(
+            &code,
+            &failures,
+            focus.as_ref(),
+            validation::readable(&report),
+            ports.runtime().is_some(),
+        );
+        g.turns.push(requests::Turn {
+            answer,
+            feedback,
+            analysis: None,
+            fix,
         });
-        let request =
-            requests::repair_request(g.input(), &code, &failures, g.attempt, g.max_attempts(), repeated);
-        self.send(request, Phase::Repairing, ports);
+        g.base = Some(code);
+        g.kind = g.next_fix();
+        self.analyze(ports);
         Vec::new()
+    }
+
+    /// Asks the model why the code it is fixing failed, with the sandbox at hand.
+    fn analyze(&mut self, ports: &mut dyn Ports) {
+        let Some(g) = self.job.as_ref().and_then(|j| j.generation.as_ref()) else {
+            return;
+        };
+        let tools = match (ports.runtime(), &g.base) {
+            (Some(rt), Some(code)) => crate::eval_tool::EvalTool::set(rt, code),
+            _ => clojurecraft_inference::ToolSet::default(),
+        };
+        let request = requests::analysis_request(g.input(), &g.turns, tools);
+        self.send(request, Phase::Analyzing, ports);
+    }
+
+    /// Keeps the analysis (with what the model evaluated) in the conversation and asks for the
+    /// fix it names.
+    fn analyzed(&mut self, analysis: String, ports: &mut dyn Ports) {
+        let Some(g) = self.job.as_mut().and_then(|j| j.generation.as_mut()) else {
+            return;
+        };
+        if let Some(t) = g.turns.last_mut() {
+            t.analysis = Some(analysis);
+        }
+        let request = requests::fix_request(g.input(), &g.turns);
+        self.send(request, Phase::Repairing, ports);
     }
 
     fn provenance(g: &GenState, spec_basis: Fingerprint) -> Provenance {
@@ -1336,7 +1553,7 @@ impl Assistant {
             model: g.model.model.clone(),
             runtime: g.model.runtime.clone(),
             settings: GenerationSettings {
-                temperature: g.temperature(g.attempt),
+                temperature: g.kind.temperature(),
                 top_p: profile.top_p,
                 seed: Some(g.seed_now()),
                 context_length: g.model.context_length,
@@ -1346,6 +1563,11 @@ impl Assistant {
             spec_basis,
             omitted_context: g.omitted.clone(),
             attempts: g.attempt,
+            prompt: if g.prompt.is_empty() {
+                requests::prompt_messages(&requests::generation_request(g.input()), None)
+            } else {
+                g.prompt.clone()
+            },
         }
     }
 
@@ -1375,9 +1597,7 @@ impl Assistant {
             let candidate = Candidate::check(
                 answers::GeneratedCode {
                     code,
-                    assumptions: Vec::new(),
                     unescaped: false,
-                    steps: Vec::new(),
                 },
                 &names,
                 &g.allowed,
@@ -1387,7 +1607,7 @@ impl Assistant {
             }
             let mut provenance = Self::provenance(g, job.spec_basis.clone());
             provenance.settings.seed = Some(g.seed.wrapping_add(u64::from(attempt.number - 1)));
-            provenance.settings.temperature = g.temperature(attempt.number);
+            provenance.settings.temperature = attempt.kind.temperature();
             provenance.attempts = attempt.number;
             Some(Box::new(Pending {
                 needs_approval: candidate.structure.needs_approval.clone(),
@@ -1399,7 +1619,6 @@ impl Assistant {
                 candidate,
                 names,
                 provenance,
-                explanation: None,
                 attempts: Vec::new(),
                 notes: Vec::new(),
             }))
@@ -1416,11 +1635,7 @@ impl Assistant {
     }
 
     /// Applies passing (or unchecked) code, or holds it for review.
-    fn finish_passing(
-        &mut self,
-        doc: &mut FunctionDocument,
-        explanation: Option<Explanation>,
-    ) -> Vec<Update> {
+    fn finish_passing(&mut self, doc: &mut FunctionDocument) -> Vec<Update> {
         let Some(mut job) = self.job.take() else {
             return Vec::new();
         };
@@ -1433,17 +1648,15 @@ impl Assistant {
         let provenance = Self::provenance(&g, job.spec_basis.clone());
         let mut notes = std::mem::take(&mut job.notes);
         notes.extend(candidate.structure.warnings.iter().map(|w| format!("Note: {w}.")));
-        let repairs = g.repairs(g.attempt);
-        if repairs > 0 {
-            notes.push(format!(
-                "The code passed after {repairs} repair{}.",
-                if repairs == 1 { "" } else { "s" }
-            ));
-        } else if g.attempt > 1 {
-            notes.push(format!(
-                "Candidate {} passed; the earlier ones failed their checks.",
-                g.attempt
-            ));
+        match g.kind {
+            AttemptKind::Generate => {}
+            AttemptKind::Restart => notes.push(
+                "The code passed after a fresh start; the earlier attempts failed their checks.".into(),
+            ),
+            AttemptKind::Fix(n) => notes.push(format!(
+                "The code passed after {n} fix{}.",
+                if n == 1 { "" } else { "es" }
+            )),
         }
         // Results computed against an earlier specification must not replace current work.
         let spec_changed = doc.spec_fingerprint() != g.spec.spec_fingerprint()
@@ -1474,7 +1687,6 @@ impl Assistant {
             candidate,
             names,
             provenance,
-            explanation,
             attempts: g.attempts,
             notes,
         };
@@ -1499,7 +1711,7 @@ impl Assistant {
             .as_ref()
             .filter(|r| pending.fix && r.passed())
             .cloned();
-        match crate::implementation(&pending.candidate, pending.explanation, pending.provenance) {
+        match crate::implementation(&pending.candidate, pending.provenance) {
             Some(implementation) => {
                 doc.implementation = Some(implementation);
                 let mut notes = pending.notes;
@@ -1591,6 +1803,43 @@ impl Assistant {
 
 /// Generated code made ready for checking: closing delimiters inferred from the indentation when
 /// the code cannot be read, and harmless extras removed. Returns the code and what was changed.
+/// Reads a fix answer and merges its changed forms into the code it fixes, into the shape of a
+/// generation answer; the merge is noted on the attempt.
+fn fix_answer(g: &mut GenState, text: &str) -> Result<serde_json::Value, String> {
+    let (_, edit) = answers::fix_from_text(text)?;
+    let base = g.base.clone().unwrap_or_default();
+    let function = g.names.as_ref().map_or("", |n| n.function.as_str());
+    let applied = edits::apply(&base, &edit, function)?;
+    g.prepared.push(applied.summary());
+    Ok(serde_json::json!({"code": applied.code}))
+}
+
+/// Whether the conversation since its last generation is going in circles: the newest code is
+/// code it already checked, or fails exactly like the code before it.
+fn conversation_stuck(
+    attempts: &[Attempt],
+    code: &str,
+    failures: &str,
+    summary: &dyn Fn(&str, &ValidationReport) -> String,
+) -> bool {
+    let start = attempts
+        .iter()
+        .rposition(|a| matches!(a.kind, AttemptKind::Generate | AttemptKind::Restart))
+        .unwrap_or(0);
+    let Some((last, earlier)) = attempts[start..].split_last() else {
+        return false;
+    };
+    if !matches!(last.kind, AttemptKind::Fix(_)) {
+        return false;
+    }
+    let checked: Vec<(&String, &ValidationReport)> = earlier
+        .iter()
+        .filter_map(|a| Some((a.code.as_ref()?, a.report.as_ref()?)))
+        .collect();
+    checked.iter().any(|(c, _)| c.as_str() == code)
+        || checked.last().is_some_and(|(c, r)| summary(c, r) == failures)
+}
+
 fn prepare(code: &str, function: &str) -> (String, Vec<String>) {
     let mut notes = Vec::new();
     let mut code = code.to_owned();
@@ -1605,75 +1854,6 @@ fn prepare(code: &str, function: &str) -> (String, Vec<String>) {
     let fixed = cleanup::conventions(&tidied.code, function);
     notes.extend(fixed.notes);
     (fixed.code, notes)
-}
-
-/// Where the code of each step is, from the model's quotes of it; `None` without steps.
-fn step_lines(spec: &FunctionDocument, code: &str, quoted: &[(u32, String)]) -> Option<StepLines> {
-    let steps = requests::numbered_steps(spec);
-    if steps.is_empty() {
-        return None;
-    }
-    Some(
-        steps
-            .iter()
-            .enumerate()
-            .map(|(i, step)| {
-                let number = u32::try_from(i + 1).unwrap_or(u32::MAX);
-                let lines = quoted
-                    .iter()
-                    .find(|(n, _)| *n == number)
-                    .ok_or_else(|| "The model attributed no code to this step.".to_owned())
-                    .and_then(|(_, quote)| {
-                        std::iter::once(quote.clone())
-                            .chain(pipeline_stage_variants(quote))
-                            .find_map(|q| crate::locate::locate(code, &q))
-                            .ok_or_else(|| "The code quoted for this step was not found.".to_owned())
-                    });
-                (step.id, lines)
-            })
-            .collect(),
-    )
-}
-
-/// A quoted pipeline stage as it appears inside `->>` or `->`: models often quote
-/// `(group-by :customer orders)` for the stage `(group-by :customer)`, so the call is also tried
-/// without its last argument and without its first.
-fn pipeline_stage_variants(quote: &str) -> Vec<String> {
-    let Ok(forms) = crate::structure::read_all(quote) else {
-        return Vec::new();
-    };
-    let [form] = forms.as_slice() else {
-        return Vec::new();
-    };
-    let Some(items) = form.list().filter(|i| i.len() >= 3) else {
-        return Vec::new();
-    };
-    let text = |skip: usize| {
-        let parts: Vec<&str> = items
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != skip)
-            .map(|(_, f)| &quote[f.span()])
-            .collect();
-        format!("({})", parts.join(" "))
-    };
-    vec![text(items.len() - 1), text(1)]
-}
-
-/// The failed attempt most worth repairing: code that loads before code that does not, then the
-/// most passing checks, then the most recent.
-fn best_attempt(attempts: &[Attempt]) -> Option<&Attempt> {
-    attempts
-        .iter()
-        .filter(|a| a.code.is_some() && a.report.is_some())
-        .max_by_key(|a| {
-            let report = a.report.as_ref().expect("filtered above");
-            let loads = report.checks.iter().any(|c| {
-                c.subject == clojurecraft_domain::CheckSubject::Load
-                    && c.status == clojurecraft_domain::CheckStatus::Passed
-            });
-            (loads, validation::tally(report).passed, a.number)
-        })
 }
 
 /// The namespace and function the current implementation defines: as recorded when it was
@@ -1729,7 +1909,7 @@ mod tests {
         CheckStatus, CheckSubject, ClarificationStatus, Contract, ContractStatus, Edn, Example,
         Implementation, Step,
     };
-    use clojurecraft_inference::{Finish, PromptPlan, Usage};
+    use clojurecraft_inference::{Finish, Placement, Priority, PromptPlan, Usage};
     use serde_json::{Value, json};
 
     use super::*;
@@ -1897,6 +2077,13 @@ mod tests {
     /// Harness output for the last validation request: every call returns `actual`, matching when
     /// `pass`.
     fn execution(p: &FakePorts, pass: bool) -> Execution {
+        execution_with(p, (!pass).then_some("3"))
+    }
+
+    /// Like [`execution`], failing with `wrong` as the value at `[1]` unless it is `None`.
+    fn execution_with(p: &FakePorts, wrong: Option<&str>) -> Execution {
+        let pass = wrong.is_none();
+        let wrong = wrong.unwrap_or("2");
         let req = p.validations.last().unwrap();
         let mut out = String::from(
             "{\"event\":\"read\",\"ok\":true}\n{\"event\":\"check\",\"ok\":true}\n\
@@ -1904,8 +2091,8 @@ mod tests {
         );
         for i in 0..req.calls.len() {
             out.push_str(&format!(
-                "{{\"event\":\"result\",\"index\":{i},\"status\":\"ok\",\"actual\":\"{{1 3}}\",\"match\":{pass},\"difference\":{},\"elapsed-ns\":1000}}\n",
-                if pass { "null" } else { "\"at [1]: expected 2 but got 3\"" }
+                "{{\"event\":\"result\",\"index\":{i},\"status\":\"ok\",\"actual\":\"{{1 {wrong}}}\",\"match\":{pass},\"difference\":{},\"elapsed-ns\":1000}}\n",
+                if pass { "null".to_owned() } else { format!("\"at [1]: expected 2 but got {wrong}\"") }
             ));
         }
         out.push_str("{\"event\":\"done\"}\n");
@@ -1926,6 +2113,34 @@ mod tests {
         a.on_validated(id, e, d, p)
     }
 
+    /// Lets the last validation fail with `wrong` as the value at `[1]`.
+    fn failed_with(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs, wrong: &str) -> Vec<Update> {
+        let id = p.validations.len() as u64;
+        let e = execution_with(p, Some(wrong));
+        a.on_validated(id, e, d, p)
+    }
+
+    /// Answers the running request with plain text, as the model does under the grammar.
+    fn reply_text(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs, text: &str) -> Vec<Update> {
+        let (id, role) = p.last();
+        let mut g = answer(role, json!(null), vec![]);
+        g.value = None;
+        g.text = text.to_owned();
+        finish(a, p, d, id, Ok(g))
+    }
+
+    /// A fix answer that changes the public function to `body`.
+    fn fix_text(body: &str) -> String {
+        format!("```clojure\n(defn order-totals [orders]\n  {body})\n```")
+    }
+
+    /// Answers the analysis request of a fix.
+    fn analysis(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs) {
+        assert_eq!(a.job().unwrap().phase, Phase::Analyzing);
+        reply_text(a, p, d, "count is used instead of a sum");
+        assert_eq!(a.job().unwrap().phase, Phase::Repairing);
+    }
+
     fn reports(updates: &[Update]) -> Vec<&ValidationReport> {
         updates
             .iter()
@@ -1942,6 +2157,7 @@ mod tests {
     fn explanation() -> Value {
         json!({"summary": "Groups, then sums.",
                "steps": [{"step": 1, "code": "(group-by :customer)", "explanation": "groups"}],
+               "assumptions": ["amounts are numbers"],
                "symbols": [{"symbol": "update-vals", "purpose": "sums each group"}]})
     }
 
@@ -1978,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_plans_retrieves_writes_validates_explains_and_commits() {
+    fn a_generation_plans_retrieves_writes_validates_and_commits() {
         let (mut a, mut p, mut d, id) = setup();
         a.generate(&d.0[&id], model(), true, &mut p);
         assert_eq!(p.last().1, Role::RetrievalPlanning);
@@ -2008,12 +2224,7 @@ mod tests {
         a.on_model(&stream(99, "stale"), &mut d, &mut p);
         assert_eq!(a.job().unwrap().output, "{\"code\"");
 
-        let updates = reply(
-            &mut a,
-            &mut p,
-            &mut d,
-            json!({"code": CODE, "assumptions": ["amounts are numbers"]}),
-        );
+        let updates = reply(&mut a, &mut p, &mut d, json!({"code": CODE}));
         assert!(updates.is_empty());
         assert_eq!(a.job().unwrap().phase, Phase::Validating);
         assert_eq!(a.job().unwrap().attempt(), Some((1, MAX_ATTEMPTS)));
@@ -2025,11 +2236,12 @@ mod tests {
         let stored = reports(&updates);
         assert!(stored.len() == 1 && stored[0].passed() && stored[0].attempt == Some(1));
         assert_eq!(stored[0].source.as_deref(), Some(CODE));
-        assert_eq!(p.last().1, Role::Explanation);
-
-        let updates = reply(&mut a, &mut p, &mut d, explanation());
         assert!(
-            matches!(&updates[..], [Update::Commit(f, r)] if *f == id && r.kind == RevisionKind::Generated)
+            matches!(&updates[1..], [Update::Commit(f, r)] if *f == id && r.kind == RevisionKind::Generated)
+        );
+        assert!(
+            p.sent.iter().all(|(_, r)| r.role != Role::Explanation),
+            "explaining is asked for separately"
         );
         assert!(a.job().is_none());
         let Some(Report::Generated { attempts, .. }) = a.report(id) else {
@@ -2046,42 +2258,157 @@ mod tests {
         assert_eq!(g.model.repository, "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF");
         assert_eq!(g.runtime.llama_cpp_release, "b12138");
         assert_eq!(g.settings.context_length, 8192);
-        assert_eq!(g.assumptions, ["amounts are numbers"]);
         assert_eq!(g.function_name, "order-totals");
         assert_eq!(g.attempts, 1);
-        let e = g.explanation.as_ref().unwrap();
-        assert_eq!(e.steps[0].lines.map(|l| l.start), Some(5));
+        assert!(g.explanation.is_none());
         // The stored report describes the code that is now the implementation.
         assert!(stored[0].freshness(&doc.basis()).is_current());
     }
 
-    /// Answers the running request with `code` and lets its validation fail, `n` times.
-    fn fail_with(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs, code: &str, n: u32) {
-        for _ in 0..n {
-            reply(a, p, d, json!({"code": code, "assumptions": []}));
-            validated(a, p, d, false);
-        }
+    fn sections_of(r: &GenerateRequest) -> Vec<(Placement, &str)> {
+        r.sections
+            .iter()
+            .map(|s| (s.placement, s.text.as_str()))
+            .collect()
     }
 
     #[test]
-    fn failing_candidates_are_followed_by_fresh_ones_before_any_repair() {
+    fn failing_code_is_analysed_then_fixed_in_the_same_conversation() {
         let (mut a, mut p, mut d, id) = setup();
         generate_code(&mut a, &mut p, &mut d, id, WRONG);
         let updates = validated(&mut a, &mut p, &mut d, false);
         assert!(!reports(&updates)[0].passed());
 
-        // The second candidate is the same generation request with a new seed and more variety.
+        // First the model is asked why the code failed, without writing code.
         let job = a.job().unwrap();
-        assert_eq!(
-            (job.phase, job.attempt()),
-            (Phase::Generating, Some((2, MAX_ATTEMPTS)))
+        assert_eq!(job.phase, Phase::Analyzing);
+        assert_eq!(job.attempt_kind(), Some(AttemptKind::Fix(1)));
+        assert_eq!(job.progress().as_deref(), Some("Attempt 1 (4 more at most)"));
+        let (first, ask) = (p.sent[0].1.clone(), p.sent[1].1.clone());
+        let (first, ask) = (&first, &ask);
+        assert_ne!(first.seed, ask.seed);
+        assert_eq!(ask.grammar, None);
+        assert_eq!(ask.max_output_tokens, Some(requests::ANALYSIS_TOKENS));
+        assert!(ask.tools.is_empty(), "no runtime, no tool");
+        // The first request is the opening of the conversation, then the answer and the reply.
+        assert_eq!(&ask.sections[..first.sections.len()], &first.sections[..]);
+        let rest = sections_of(ask)[first.sections.len()..].to_vec();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].0, Placement::Assistant);
+        assert!(
+            rest[0].1.contains("count))"),
+            "the model's own answer: {}",
+            rest[0].1
         );
-        let (first, second) = (&p.sent[0].1, &p.sent[1].1);
-        assert_ne!(first.seed, second.seed, "each candidate samples anew");
-        assert_eq!(first.temperature, None);
-        assert_eq!(second.temperature, Some(requests::SAMPLE_TEMPERATURE));
-        assert!(!p.last_text().contains("Your previous implementation"));
-        assert!(first.grammar.is_some() && second.grammar.is_some());
+        assert_eq!(rest[1].0, Placement::User);
+        for needle in [
+            "count))",
+            "Example 1 — failed",
+            "Expected: {1 2}",
+            "Actual: {1 3}",
+            "at [1]: expected 2 but got 3",
+            "Find out why Example 1 (input [{:customer 1 :amount 2}])",
+            "Do not write code yet",
+        ] {
+            assert!(rest[1].1.contains(needle), "missing {needle:?} in\n{}", rest[1].1);
+        }
+
+        // Then the fix, after the analysis, with the grammar for changed forms.
+        analysis(&mut a, &mut p, &mut d);
+        let fix = &p.sent.last().unwrap().1;
+        assert_eq!(fix.temperature, Some(requests::FIX_TEMPERATURE));
+        assert_eq!(fix.grammar, Some(crate::grammar::fix()));
+        let rest = sections_of(fix)[first.sections.len()..].to_vec();
+        assert_eq!(rest.len(), 4);
+        assert_eq!(rest[2], (Placement::Assistant, "count is used instead of a sum"));
+        assert!(rest[3].1.contains("only the top-level forms you change"));
+
+        // The answer brings only the changed function, which replaces the old one.
+        let body = "(->> orders\n       (group-by :customer)\n       (update-vals (fn [os] (reduce + (map :amount os)))))";
+        reply_text(&mut a, &mut p, &mut d, &fix_text(body));
+        assert_eq!(p.validations.last().unwrap().code, CODE);
+        let updates = validated(&mut a, &mut p, &mut d, true);
+        assert_eq!(reports(&updates)[0].attempt, Some(2));
+        reply(&mut a, &mut p, &mut d, explanation());
+        let Some(Report::Generated { attempts, notes }) = a.report(id) else {
+            panic!("{:?}", a.report(id))
+        };
+        let labels: Vec<String> = attempts.iter().map(Attempt::label).collect();
+        assert_eq!(labels, ["Generate", "Attempt 1"]);
+        assert!(
+            attempts[1]
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("The model changed order-totals.")),
+            "{attempts:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("passed after 1 fix.")),
+            "{notes:?}"
+        );
+        let doc = &d.0[&id];
+        assert_eq!(doc.implementation.as_ref().unwrap().source, CODE);
+        let g = doc.implementation.as_ref().unwrap().generation.clone().unwrap();
+        assert_eq!(g.attempts, 2);
+        assert_eq!(g.settings.temperature, requests::FIX_TEMPERATURE);
+        // All runs share the generation run.
+        assert_eq!(
+            attempts[0].report.as_ref().unwrap().run,
+            attempts[1].report.as_ref().unwrap().run
+        );
+    }
+
+    #[test]
+    fn the_conversation_keeps_every_turn_with_older_ones_droppable() {
+        let (mut a, mut p, mut d, id) = setup();
+        generate_code(&mut a, &mut p, &mut d, id, WRONG);
+        failed_with(&mut a, &mut p, &mut d, "3");
+        analysis(&mut a, &mut p, &mut d);
+        let one = fix_text("(update-vals (group-by :customer orders) (fn [os] (inc (count os))))");
+        reply_text(&mut a, &mut p, &mut d, &one);
+        failed_with(&mut a, &mut p, &mut d, "4");
+
+        let job = a.job().unwrap();
+        assert_eq!(job.attempt_kind(), Some(AttemptKind::Fix(2)));
+        let req = &p.sent.last().unwrap().1;
+        let opening = p.sent[0].1.sections.len();
+        let turns = &req.sections[opening..];
+        let placements: Vec<Placement> = turns.iter().map(|s| s.placement).collect();
+        use Placement::{Assistant, User};
+        assert_eq!(placements, [Assistant, User, Assistant, User, Assistant, User]);
+        // The model sees its own answers exactly as it gave them.
+        assert_eq!(turns[2].text, "count is used instead of a sum");
+        assert_eq!(turns[4].text, one);
+        assert!(turns[5].text.contains("(inc (count os))"));
+        assert!(turns[5].text.contains("expected 2 but got 4"));
+        assert!(matches!(
+            turns[0].priority,
+            Priority::Optional(requests::HISTORY_DROP_ORDER)
+        ));
+        assert_eq!(turns[5].priority, Priority::Required);
+    }
+
+    #[test]
+    fn a_stuck_conversation_starts_over_with_a_fresh_generation() {
+        let (mut a, mut p, mut d, id) = setup();
+        generate_code(&mut a, &mut p, &mut d, id, WRONG);
+        validated(&mut a, &mut p, &mut d, false);
+        analysis(&mut a, &mut p, &mut d);
+        // The fix changes nothing that matters: the code fails exactly as before.
+        reply_text(
+            &mut a,
+            &mut p,
+            &mut d,
+            &fix_text("(update-vals (group-by :customer orders) (fn [os] (count os)))"),
+        );
+        validated(&mut a, &mut p, &mut d, false);
+
+        let job = a.job().unwrap();
+        assert_eq!(job.phase, Phase::Generating);
+        assert_eq!(job.attempt_kind(), Some(AttemptKind::Restart));
+        let req = &p.sent.last().unwrap().1;
+        assert_eq!(req.temperature, Some(requests::RESTART_TEMPERATURE));
+        assert_eq!(req.sections, p.sent[0].1.sections, "the history is gone");
 
         reply(&mut a, &mut p, &mut d, json!({"code": CODE, "assumptions": []}));
         validated(&mut a, &mut p, &mut d, true);
@@ -2089,117 +2416,46 @@ mod tests {
         let Some(Report::Generated { attempts, notes }) = a.report(id) else {
             panic!("{:?}", a.report(id))
         };
-        assert_eq!(attempts.len(), 2);
+        let labels: Vec<String> = attempts.iter().map(Attempt::label).collect();
+        assert_eq!(labels, ["Generate", "Attempt 1", "Fresh start"]);
+        assert!(notes.iter().any(|n| n.contains("started over")), "{notes:?}");
         assert!(
-            notes.iter().any(|n| n.contains("Candidate 2 passed")),
+            notes.iter().any(|n| n.contains("after a fresh start")),
             "{notes:?}"
         );
-        let g = d.0[&id]
-            .implementation
-            .as_ref()
-            .unwrap()
-            .generation
-            .clone()
-            .unwrap();
-        assert_eq!(g.attempts, 2);
-        assert_eq!(g.settings.temperature, requests::SAMPLE_TEMPERATURE);
     }
 
     #[test]
-    fn a_failing_candidate_is_repaired_with_its_diagnostics_until_one_passes() {
+    fn an_unusable_fix_is_asked_for_again_from_the_same_point() {
         let (mut a, mut p, mut d, id) = setup();
-        let before = d.0[&id].clone();
         generate_code(&mut a, &mut p, &mut d, id, WRONG);
-        let updates = validated(&mut a, &mut p, &mut d, false);
-        assert!(!reports(&updates)[0].passed());
-        fail_with(&mut a, &mut p, &mut d, WRONG, SAMPLES - 1);
-
-        // The repair request carries the specification, the code, and expected and actual values.
-        assert_eq!(p.last().1, Role::Generation);
-        assert_eq!(a.job().unwrap().phase, Phase::Repairing);
-        let first_repair = SAMPLES + 1;
-        assert_eq!(a.job().unwrap().attempt(), Some((first_repair, MAX_ATTEMPTS)));
-        let text = p.last_text();
-        for needle in [
-            &format!("attempt {first_repair} of {MAX_ATTEMPTS}"),
-            "count))",
-            "Example 1 — failed",
-            "Expected: {1 2}",
-            "Actual: {1 3}",
-            "at [1]: expected 2 but got 3",
-            "Total amounts per customer",
-            "Input (EDN):\n[{:customer 1 :amount 2}]\nExpected output (EDN):\n{1 2}",
-        ] {
-            assert!(text.contains(needle), "missing {needle:?} in\n{text}");
-        }
-        assert_eq!(
-            p.sent.last().unwrap().1.temperature,
-            Some(requests::REPAIR_TEMPERATURE)
-        );
-
-        reply(&mut a, &mut p, &mut d, json!({"code": CODE, "assumptions": []}));
-        let updates = validated(&mut a, &mut p, &mut d, true);
-        assert_eq!(reports(&updates)[0].attempt, Some(first_repair));
-        reply(&mut a, &mut p, &mut d, explanation());
-        let Some(Report::Generated { attempts, notes }) = a.report(id) else {
-            panic!("{:?}", a.report(id))
-        };
-        assert_eq!(attempts.len(), first_repair as usize);
-        assert!(attempts.last().unwrap().passed());
-        assert!(attempts[..attempts.len() - 1].iter().all(|a| !a.passed()));
-        assert!(
-            notes.iter().any(|n| n.contains("passed after 1 repair")),
-            "{notes:?}"
-        );
-        let doc = &d.0[&id];
-        assert_eq!(doc.implementation.as_ref().unwrap().source, CODE);
-        assert_eq!(
-            doc.implementation
-                .as_ref()
-                .unwrap()
-                .generation
-                .as_ref()
-                .unwrap()
-                .attempts,
-            first_repair
-        );
-        // The repair changed only the code.
-        assert_eq!(doc.examples, before.examples);
-        assert_eq!(doc.tests, before.tests);
-        assert_eq!(doc.spec_fingerprint(), before.spec_fingerprint());
-        // All runs share the generation run.
-        assert_eq!(
-            attempts[0].report.as_ref().unwrap().run,
-            attempts.last().unwrap().report.as_ref().unwrap().run
-        );
+        validated(&mut a, &mut p, &mut d, false);
+        analysis(&mut a, &mut p, &mut d);
+        let before = p.sent.last().unwrap().1.sections.clone();
+        reply_text(&mut a, &mut p, &mut d, "no code here");
+        let job = a.job().unwrap();
+        assert_eq!(job.phase, Phase::Repairing);
+        assert_eq!(job.attempt_kind(), Some(AttemptKind::Fix(2)));
+        assert_eq!(p.sent.last().unwrap().1.sections, before);
+        assert_ne!(p.sent.last().unwrap().1.seed, p.sent[p.sent.len() - 2].1.seed);
     }
 
     #[test]
-    fn the_candidate_that_got_furthest_is_repaired() {
+    fn a_failed_analysis_still_leads_to_a_fix() {
         let (mut a, mut p, mut d, id) = setup();
-        // Unreadable, then loading but wrong, then structurally invalid.
-        generate_code(
-            &mut a,
-            &mut p,
-            &mut d,
-            id,
-            "(ns order-totals.core)\n(defn order-totals [x] (str \"x))",
-        );
-        reply(&mut a, &mut p, &mut d, json!({"code": WRONG, "assumptions": []}));
+        generate_code(&mut a, &mut p, &mut d, id, WRONG);
         validated(&mut a, &mut p, &mut d, false);
-        reply(
+        let (request, _) = p.last();
+        finish(
             &mut a,
             &mut p,
             &mut d,
-            json!({"code": "(ns order-totals.core)\n(defn order-totals [x] (slurp x))", "assumptions": []}),
+            request,
+            Err(GenerationError::ToolRounds(4)),
         );
         assert_eq!(a.job().unwrap().phase, Phase::Repairing);
-        let text = p.last_text();
-        assert!(
-            text.contains("count))"),
-            "the loading candidate is repaired:\n{text}"
-        );
-        assert!(!text.contains("slurp"));
+        let fix = sections_of(&p.sent.last().unwrap().1);
+        assert!(fix.contains(&(Placement::Assistant, "(no analysis)")));
     }
 
     #[test]
@@ -2207,40 +2463,33 @@ mod tests {
         let (mut a, mut p, mut d, id) = setup();
         generate_code(&mut a, &mut p, &mut d, id, WRONG);
         let mut stored = Vec::new();
+        let mut last = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
             assert_eq!(a.job().unwrap().attempt(), Some((attempt, MAX_ATTEMPTS)));
             stored.extend(
-                reports(&validated(&mut a, &mut p, &mut d, false))
+                reports(&failed_with(&mut a, &mut p, &mut d, &(2 + attempt).to_string()))
                     .into_iter()
                     .cloned(),
             );
             if attempt < MAX_ATTEMPTS {
-                reply(&mut a, &mut p, &mut d, json!({"code": WRONG, "assumptions": []}));
+                analysis(&mut a, &mut p, &mut d);
+                let body =
+                    format!("(update-vals (group-by :customer orders) (fn [os] (+ {attempt} (count os))))");
+                reply_text(&mut a, &mut p, &mut d, &fix_text(&body));
+                last = p.validations.last().unwrap().code.clone();
             }
         }
         assert!(a.job().is_none());
+        let fixes = MAX_ATTEMPTS - 1;
         assert_eq!(
             p.sent.len() as u32,
-            SAMPLES + MAX_REPAIRS,
-            "the candidates and the repairs"
-        );
-        let first_repair: String = p.sent[SAMPLES as usize]
-            .1
-            .sections
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(
-            first_repair.contains(&format!(
-                "Attempt {SAMPLES} failed in exactly the same way as attempt {}",
-                SAMPLES - 1
-            )),
-            "a stuck model is told so:\n{first_repair}"
+            1 + 2 * fixes,
+            "the generation, then an analysis and a fix per attempt"
         );
         assert_eq!(
             stored.len() as u32,
             MAX_ATTEMPTS,
-            "every candidate's report is stored"
+            "every attempt's report is stored"
         );
         let Some(Report::Unresolved {
             attempts,
@@ -2250,11 +2499,17 @@ mod tests {
         else {
             panic!("{:?}", a.report(id))
         };
-        assert_eq!(attempts.len() as u32, MAX_ATTEMPTS);
-        assert!(
-            attempts
-                .iter()
-                .all(|a| a.report.as_ref().is_some_and(|r| !r.passed()))
+        let labels: Vec<String> = attempts.iter().map(Attempt::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Generate",
+                "Attempt 1",
+                "Attempt 2",
+                "Attempt 3",
+                "Attempt 4",
+                "Attempt 5"
+            ]
         );
         assert!(notes.iter().any(|n| n.contains("No attempt passed")));
         assert!(
@@ -2266,7 +2521,7 @@ mod tests {
         assert!(best.is_some());
         let updates = a.accept_pending(d.0.get_mut(&id).unwrap()).unwrap();
         assert!(matches!(&updates[..], [Update::Commit(..)]));
-        assert_eq!(d.0[&id].implementation.as_ref().unwrap().source, WRONG);
+        assert_eq!(d.0[&id].implementation.as_ref().unwrap().source, last);
         let Some(Report::Generated { notes, .. }) = a.report(id) else {
             panic!()
         };
@@ -2274,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn structurally_invalid_code_is_a_failed_attempt_and_is_repaired() {
+    fn structurally_invalid_code_is_a_failed_attempt_and_is_fixed() {
         let (mut a, mut p, mut d, id) = setup();
         let slurp = "(ns order-totals.core)\n(defn order-totals [x] (slurp x))";
         let updates = generate_code(&mut a, &mut p, &mut d, id, slurp);
@@ -2287,32 +2542,34 @@ mod tests {
             .unwrap();
         assert_eq!(structure.status, CheckStatus::Forbidden);
         assert!(structure.diagnostics[0].contains("slurp is not allowed"));
-        for _ in 1..SAMPLES {
-            reply(&mut a, &mut p, &mut d, json!({"code": slurp, "assumptions": []}));
-        }
-        assert_eq!(a.job().unwrap().phase, Phase::Repairing);
-        assert!(p.last_text().contains("slurp is not allowed"));
+        assert_eq!(a.job().unwrap().phase, Phase::Analyzing);
+        let text = p.last_text();
+        assert!(text.contains("slurp is not allowed"));
+        assert!(
+            text.contains("Find out why the check \"Structure and dependencies\" failed"),
+            "{text}"
+        );
         assert!(d.0[&id].implementation.is_none());
     }
 
     #[test]
-    fn steps_quoted_with_the_threaded_value_are_found_in_the_pipeline() {
-        let code =
-            "(ns a)\n(defn f [orders]\n  (->> orders\n       (group-by :customer)\n       (into [])))\n";
-        let mut spec = doc();
-        spec.steps = vec![Step::new("group"), Step::new("collect")];
-        let quoted = [
-            (1, "(group-by :customer orders)".to_owned()),
-            (2, "(into [] x)".to_owned()),
-        ];
-        let lines = step_lines(&spec, code, &quoted).unwrap();
-        assert_eq!(lines[0].1.as_ref().unwrap().start, 4);
-        assert_eq!(lines[1].1.as_ref().unwrap().start, 5);
-        assert!(
-            step_lines(&spec, code, &[(1, "(map inc xs)".to_owned())]).unwrap()[0]
-                .1
-                .is_err()
+    fn unreadable_code_is_fixed_with_a_complete_namespace() {
+        let (mut a, mut p, mut d, id) = setup();
+        generate_code(
+            &mut a,
+            &mut p,
+            &mut d,
+            id,
+            "(ns order-totals.core)\n(defn order-totals [x] (str \"x))",
         );
+        analysis(&mut a, &mut p, &mut d);
+        assert!(
+            p.last_text().contains("the complete namespace"),
+            "{}",
+            p.last_text()
+        );
+        reply_text(&mut a, &mut p, &mut d, &format!("```clojure\n{CODE}```"));
+        assert_eq!(p.validations.last().unwrap().code, CODE);
     }
 
     #[test]
@@ -2679,6 +2936,33 @@ mod tests {
     }
 
     #[test]
+    fn generated_code_records_the_prompt_as_sent() {
+        let (mut a, mut p, mut d, id) = setup();
+        a.generate(&d.0[&id], model(), false, &mut p);
+        let (req, role) = p.last();
+        let sent = p.sent.last().unwrap().1.clone();
+        let mut g = answer(role, json!({"code": CODE, "assumptions": []}), vec![]);
+        g.plan.included = (0..=sent.sections.len()).collect();
+        finish(&mut a, &mut p, &mut d, req, Ok(g));
+        validated(&mut a, &mut p, &mut d, true);
+        reply(&mut a, &mut p, &mut d, explanation());
+        let prompt = &d.0[&id]
+            .implementation
+            .as_ref()
+            .unwrap()
+            .generation
+            .as_ref()
+            .unwrap()
+            .prompt;
+        assert_eq!(*prompt, requests::prompt_messages(&sent, None));
+        assert_eq!(
+            prompt.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            ["system", "user"]
+        );
+        assert!(prompt[1].content.contains(&d.0[&id].description));
+    }
+
+    #[test]
     fn a_reasoning_model_cut_off_while_thinking_is_asked_again_with_more_room() {
         let (mut a, mut p, mut d, id) = setup();
         a.interpret(&d.0[&id], &mut p);
@@ -2735,10 +3019,58 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_explanation_keeps_the_code() {
+    fn explaining_generated_code_gets_the_specification_and_the_code_and_stores_steps_and_assumptions() {
         let (mut a, mut p, mut d, id) = setup();
         generate_code(&mut a, &mut p, &mut d, id, CODE);
         validated(&mut a, &mut p, &mut d, true);
+        a.explain(&d.0[&id], &mut p);
+        let (_, request) = p.sent.last().unwrap().clone();
+        assert_eq!(request.role, Role::Explanation);
+        let text: Vec<&str> = request.sections.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.iter().any(|t| t.contains(&d.0[&id].description)));
+        assert!(text.iter().any(|t| t.starts_with("Example 1")));
+        assert!(text.iter().any(|t| t.contains(CODE.trim_end())));
+        let updates = reply(&mut a, &mut p, &mut d, explanation());
+        assert_eq!(updates, [Update::Edited(id)]);
+        assert!(matches!(a.report(id), Some(Report::Explained { .. })));
+        let g = d.0[&id]
+            .implementation
+            .as_ref()
+            .unwrap()
+            .generation
+            .clone()
+            .unwrap();
+        let e = g.explanation.unwrap();
+        assert_eq!(e.steps[0].lines.map(|l| l.start), Some(5));
+        assert_eq!(e.assumptions, ["amounts are numbers"]);
+    }
+
+    #[test]
+    fn only_unedited_generated_code_can_be_explained() {
+        let (mut a, mut p, mut d, id) = setup();
+        a.explain(&d.0[&id], &mut p);
+        assert!(matches!(a.report(id), Some(Report::Blocked(_))));
+        assert!(p.sent.is_empty());
+        generate_code(&mut a, &mut p, &mut d, id, CODE);
+        validated(&mut a, &mut p, &mut d, true);
+        let doc = d.0.get_mut(&id).unwrap();
+        doc.implementation
+            .as_mut()
+            .unwrap()
+            .source
+            .push_str("(def x 1)\n");
+        let sent = p.sent.len();
+        a.explain(&d.0[&id], &mut p);
+        assert!(matches!(a.report(id), Some(Report::Blocked(_))));
+        assert_eq!(p.sent.len(), sent);
+    }
+
+    #[test]
+    fn a_failed_explanation_keeps_the_code_unexplained() {
+        let (mut a, mut p, mut d, id) = setup();
+        generate_code(&mut a, &mut p, &mut d, id, CODE);
+        validated(&mut a, &mut p, &mut d, true);
+        a.explain(&d.0[&id], &mut p);
         let (req, _) = p.last();
         let updates = finish(
             &mut a,
@@ -2747,28 +3079,34 @@ mod tests {
             req,
             Err(GenerationError::Timeout(Duration::from_secs(1))),
         );
-        assert_eq!(updates.len(), 1);
-        let g = d.0[&id]
-            .implementation
-            .as_ref()
-            .unwrap()
-            .generation
-            .clone()
-            .unwrap();
-        assert!(g.explanation.is_none());
+        assert!(updates.is_empty());
+        assert!(matches!(a.report(id), Some(Report::Failed { .. })));
+        let i = d.0[&id].implementation.as_ref().unwrap();
+        assert_eq!(i.source, CODE);
+        assert!(i.generation.as_ref().unwrap().explanation.is_none());
     }
 
     #[test]
-    fn an_unstructured_explanation_keeps_the_checked_code() {
+    fn code_changed_while_being_explained_gets_no_explanation() {
         let (mut a, mut p, mut d, id) = setup();
         generate_code(&mut a, &mut p, &mut d, id, CODE);
         validated(&mut a, &mut p, &mut d, true);
-        let (req, role) = p.last();
-        let mut g = answer(role, json!({}), vec![]);
-        g.value = None;
-        let updates = finish(&mut a, &mut p, &mut d, req, Ok(g));
-        assert!(matches!(&updates[..], [Update::Commit(..)]));
-        assert_eq!(d.0[&id].implementation.as_ref().unwrap().source, CODE);
+        a.explain(&d.0[&id], &mut p);
+        d.0.get_mut(&id).unwrap().implementation.as_mut().unwrap().source = WRONG.into();
+        let updates = reply(&mut a, &mut p, &mut d, explanation());
+        assert!(updates.is_empty());
+        assert!(matches!(a.report(id), Some(Report::Failed { .. })));
+        assert!(
+            d.0[&id]
+                .implementation
+                .as_ref()
+                .unwrap()
+                .generation
+                .as_ref()
+                .unwrap()
+                .explanation
+                .is_none()
+        );
     }
 
     #[test]

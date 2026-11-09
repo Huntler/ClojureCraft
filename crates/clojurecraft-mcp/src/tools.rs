@@ -651,8 +651,9 @@ pub fn catalogue() -> Value {
         tool(
             "generate",
             "Let ClojureCraft write the code: it plans, looks up documentation, generates, validates \
-             against examples, accepted tests, and the contract; it tries up to three fresh candidates, \
-             then repairs the best one up to three times (background; then call status with wait_seconds). Give function_ids to generate several: \
+             against examples, accepted tests, and the contract; failing code is fixed in up to five attempts of one \
+             conversation, where the model first finds the cause by evaluating expressions in the sandbox \
+             (background; then call status with wait_seconds). Give function_ids to generate several: \
              jobs run one after another, and a job for a busy model is queued, not refused. mode=fix \
              repairs the current code from its failing checks (run_tests first).",
             json!({

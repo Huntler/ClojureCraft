@@ -16,6 +16,7 @@
 //!   tests, contract) and its report;
 //! - [`edge_cases`]: proposing edge-case tests from the specification, reviewing them, and
 //!   fixing code that fails accepted cases;
+//! - [`dataset`]: a fine-tuning dataset of generation prompts and validated code;
 //! - [`export`]: a Clojure project (sources, `clojure.test` files, `deps.edn`) made from saved
 //!   functions;
 //! - [`diff`]: line differences for reviewing replacement code;
@@ -30,10 +31,13 @@ pub mod answers;
 pub mod assistant;
 pub mod candidate;
 pub mod cleanup;
+pub mod dataset;
 pub mod delimiters;
 pub mod deps;
 pub mod diff;
 pub mod edge_cases;
+pub mod edits;
+pub mod eval_tool;
 pub mod export;
 pub mod grammar;
 pub mod idioms;

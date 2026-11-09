@@ -102,6 +102,18 @@ impl GenerateRequest {
     }
 }
 
+/// The sections a request is planned from: the role's instructions, then the request's own.
+/// [`PromptPlan::included`] indexes into this list.
+pub fn planned_sections(role: Role, sections: Vec<Section>) -> Vec<Section> {
+    let mut out = vec![Section::required(
+        "Instructions",
+        Placement::System,
+        role.instructions(),
+    )];
+    out.extend(sections);
+    out
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Generation {
     pub role: Role,
@@ -513,12 +525,7 @@ impl Worker {
         };
         let specs = tools.specs();
 
-        let mut sections = vec![Section::required(
-            "Instructions",
-            Placement::System,
-            req.role.instructions(),
-        )];
-        sections.extend(req.sections);
+        let sections = planned_sections(req.role, req.sections);
         let plan = context::plan(
             &sections,
             &mut Counter {
@@ -536,6 +543,9 @@ impl Worker {
         let mut tool_calls = Vec::new();
         let mut rounds = 0u32;
         let turn = loop {
+            // After the last allowed tool round the model is asked without tools, so it answers
+            // with what it found instead of losing it all to the limit.
+            let last_round = !tools.is_empty() && rounds >= tools.limits.max_rounds;
             let request = ChatRequest {
                 messages: messages.clone(),
                 max_tokens: reserved,
@@ -543,7 +553,7 @@ impl Worker {
                 top_p: Some(profile.top_p),
                 response_schema: req.schema.clone(),
                 grammar: req.grammar.clone(),
-                tools: specs.clone(),
+                tools: if last_round { Vec::new() } else { specs.clone() },
                 seed: req.seed,
             };
             let mut forward = |event: StreamEvent| {
@@ -555,10 +565,10 @@ impl Worker {
             if turn.tool_calls.is_empty() || tools.is_empty() {
                 break turn;
             }
-            rounds += 1;
-            if rounds > tools.limits.max_rounds {
+            if last_round {
                 return Err(GenerationError::ToolRounds(tools.limits.max_rounds));
             }
+            rounds += 1;
             messages.push(Message::assistant(turn.content.clone(), turn.tool_calls.clone()));
             for (i, call) in turn.tool_calls.iter().enumerate() {
                 let outcome = if i >= tools.limits.max_calls_per_round {

@@ -524,6 +524,41 @@ fn endless_tool_calling_is_bounded() {
     );
     let id = h.service.generate(req);
     assert_eq!(h.finished(id).1, Err(GenerationError::ToolRounds(2)));
+    let state = h.engine.state();
+    assert_eq!(state.requests.len(), 3);
+    assert!(
+        state.requests[2].tools.is_empty(),
+        "the last request offers no tools"
+    );
+}
+
+#[test]
+fn after_the_last_tool_round_the_model_answers_with_what_it_found() {
+    let engine = MockEngine::default();
+    for i in 0..2 {
+        engine.reply(MockReply::ToolCalls(vec![call(
+            &format!("c{i}"),
+            "lookup_symbol",
+            r#"{"symbol":"map"}"#,
+        )]));
+    }
+    engine.reply(MockReply::text("map applies f to each element"));
+    let h = Harness::new(engine);
+    h.ready();
+    let mut req = ask("x");
+    req.tools = ToolSet::new(
+        vec![Arc::new(Lookup {
+            calls: Arc::default(),
+        })],
+        ToolLimits {
+            max_rounds: 2,
+            ..ToolLimits::default()
+        },
+    );
+    let id = h.service.generate(req);
+    let g = h.finished(id).1.unwrap();
+    assert_eq!(g.text, "map applies f to each element");
+    assert_eq!(g.tool_calls.len(), 2);
 }
 
 #[test]

@@ -10,9 +10,11 @@ const FIXED: &str = "(ns order-totals.core)\n\n(defn order-totals [orders]\n  (i
 /// Generates `CODE`, lets it pass, and applies it.
 fn generated(a: &mut Assistant, p: &mut FakePorts, d: &mut Docs, id: FunctionId) {
     generate_code(a, p, d, id, CODE);
-    validated(a, p, d, true);
-    let updates = reply(a, p, d, explanation());
-    assert!(matches!(&updates[..], [Update::Commit(..)]));
+    let updates = validated(a, p, d, true);
+    assert!(matches!(
+        &updates[..],
+        [Update::Validated(..), Update::Commit(..)]
+    ));
 }
 
 fn report_of(doc: &FunctionDocument, checks: Vec<Check>) -> ValidationReport {
@@ -189,16 +191,16 @@ fn a_fix_repairs_the_current_code_with_every_accepted_case_and_waits_for_review(
     a.fix_failing(&d.0[&id], model(), false, &failing, &mut p);
     let job = a.job().unwrap();
     assert!(job.fixing());
-    assert_eq!(job.phase, Phase::Repairing);
+    assert_eq!(job.phase, Phase::Analyzing);
     assert_eq!(
         job.attempt(),
-        Some((1, 1 + MAX_REPAIRS)),
-        "a fix writes no fresh candidates"
+        Some((1, MAX_FIXES)),
+        "a fix starts with a fix, not a generation"
     );
+    assert_eq!(job.attempt_kind(), Some(AttemptKind::Fix(1)));
     let text = p.last_text();
     for needle in [
-        "attempt 1 of 4",
-        "Your previous implementation",
+        "Find out why Test no orders",
         "update-vals",
         "Test no orders — failed",
         "Expected: {}",
@@ -209,6 +211,7 @@ fn a_fix_repairs_the_current_code_with_every_accepted_case_and_waits_for_review(
         assert!(text.contains(needle), "missing {needle:?} in\n{text}");
     }
 
+    reply_text(&mut a, &mut p, &mut d, "the empty case returns nil");
     reply(&mut a, &mut p, &mut d, json!({"code": FIXED, "assumptions": []}));
     // The candidate runs against the example and the accepted case.
     let req = p.validations.last().unwrap();
@@ -246,7 +249,10 @@ fn a_fix_that_never_passes_changes_nothing_and_never_weakens_the_cases() {
     let before = d.0[&id].clone();
 
     a.fix_failing(&d.0[&id], model(), false, &failing, &mut p);
-    for _ in 1..=1 + MAX_REPAIRS {
+    for _ in 1..=MAX_FIXES {
+        if a.job().unwrap().phase == Phase::Analyzing {
+            reply_text(&mut a, &mut p, &mut d, "the empty case returns nil");
+        }
         reply(&mut a, &mut p, &mut d, json!({"code": WRONG, "assumptions": []}));
         // Every attempt is checked against the accepted case with its original expectation.
         let req = p.validations.last().unwrap();
@@ -257,7 +263,7 @@ fn a_fix_that_never_passes_changes_nothing_and_never_weakens_the_cases() {
     let Some(Report::Unresolved { attempts, best, .. }) = a.report(id) else {
         panic!("{:?}", a.report(id))
     };
-    assert_eq!(attempts.len(), 1 + MAX_REPAIRS as usize);
+    assert_eq!(attempts.len(), MAX_FIXES as usize);
     assert!(best.as_ref().is_some_and(|b| b.fix));
     assert_eq!(d.0[&id], before, "nothing was applied or changed");
     assert!(d.0[&id].test(case_id).unwrap().is_active());

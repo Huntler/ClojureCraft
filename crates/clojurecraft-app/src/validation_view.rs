@@ -198,7 +198,7 @@ pub fn attempts(ui: &mut Ui, doc: &FunctionDocument, attempts: &[Attempt], salt:
             None if a.code.is_none() => ("no usable code".to_owned(), theme::WARN),
             None => ("not checked".to_owned(), theme::WARN),
         };
-        egui::CollapsingHeader::new(RichText::new(format!("Attempt {}: {text}", a.number)).color(color))
+        egui::CollapsingHeader::new(RichText::new(format!("{}: {text}", a.label())).color(color))
             .id_salt(("attempt", salt, doc.id, a.number))
             .show(ui, |ui| {
                 if let Some(n) = &a.note {

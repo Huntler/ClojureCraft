@@ -20,6 +20,8 @@ use clojurecraft_workflow::assistant::{Assistant, Job, JobKind, Pending, Report}
 #[derive(Clone, Debug, PartialEq)]
 pub enum PanelAction {
     Generate,
+    /// Explain the current generated code.
+    Explain,
     Cancel,
     AcceptPending,
     DiscardPending,
@@ -76,7 +78,7 @@ fn preview(raw: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-fn running(ui: &mut Ui, doc: &FunctionDocument, job: &Job, actions: &mut Option<PanelAction>) {
+pub fn running(ui: &mut Ui, doc: &FunctionDocument, job: &Job, actions: &mut Option<PanelAction>) {
     ui.ctx().request_repaint_after(Duration::from_millis(250));
     boxed(ui, theme::LINE_STRONG, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -84,11 +86,12 @@ fn running(ui: &mut Ui, doc: &FunctionDocument, job: &Job, actions: &mut Option<
             if job.fixing() {
                 ui.label(RichText::new("Fixing failing cases:").color(theme::WARN));
             }
-            match job.attempt() {
-                Some((n, max))
-                    if n > 1 || job.phase == clojurecraft_workflow::assistant::Phase::Validating =>
+            match job.progress() {
+                Some(progress)
+                    if job.attempt().is_some_and(|(n, _)| n > 1)
+                        || job.phase == clojurecraft_workflow::assistant::Phase::Validating =>
                 {
-                    ui.label(format!("{}… (attempt {n} of {max})", job.phase.label()));
+                    ui.label(format!("{}… ({progress})", job.phase.label()));
                 }
                 _ => {
                     ui.label(format!("{}…", job.phase.label()));
@@ -201,7 +204,7 @@ fn pending(ui: &mut Ui, doc: &FunctionDocument, p: &Pending, actions: &mut Optio
     });
 }
 
-fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mut Option<PanelAction>) {
+pub fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mut Option<PanelAction>) {
     match report {
         Report::Generated { notes: n, attempts } => {
             if !n.is_empty() || attempts.len() > 1 {
@@ -307,6 +310,11 @@ fn report(ui: &mut Ui, doc: &FunctionDocument, report: &Report, actions: &mut Op
         Report::Cancelled => muted(ui, "Cancelled."),
         // Shown in the specification editor.
         Report::Interpreted { .. } | Report::ContractProposed { .. } | Report::TestsProposed { .. } => {}
+        Report::Explained { notes: n } => {
+            if !n.is_empty() {
+                boxed(ui, theme::LINE, |ui| notes(ui, n));
+            }
+        }
     }
 }
 
@@ -357,7 +365,10 @@ pub fn panel(
     match job {
         Some(job) => running(ui, doc, job, &mut action),
         None => {
-            if let Some(r) = assistant.report(doc.id) {
+            if let Some(r) = assistant
+                .report(doc.id)
+                .filter(|r| !crate::explain_view::is_explanation_report(r))
+            {
                 report(ui, doc, r, &mut action);
             }
         }
@@ -439,36 +450,6 @@ fn implementation(
 
 fn generation_details(ui: &mut Ui, g: &GenerationRecord) {
     ui.add_space(8.0);
-    if let Some(e) = &g.explanation
-        && !e.summary.is_empty()
-    {
-        ui.label(RichText::new("How it works").strong());
-        ui.label(&e.summary);
-        ui.add_space(6.0);
-    }
-    if !g.assumptions.is_empty() {
-        ui.label(RichText::new("Assumptions the model made").strong());
-        for a in &g.assumptions {
-            ui.label(format!("• {a}"));
-        }
-        muted(
-            ui,
-            "Answer them as questions or add them to the specification if they matter.",
-        );
-        ui.add_space(6.0);
-    }
-    if let Some(e) = &g.explanation
-        && !e.symbols.is_empty()
-    {
-        ui.label(RichText::new("Standard-library functions used").strong());
-        for s in &e.symbols {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&s.symbol).monospace().color(theme::syntax::KEYWORD));
-                ui.label(&s.purpose);
-            });
-        }
-        ui.add_space(6.0);
-    }
     ui.collapsing("Provenance", |ui| {
         muted(
             ui,

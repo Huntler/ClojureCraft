@@ -3,10 +3,12 @@
 
 mod app;
 mod contract_view;
+mod dataset_view;
 mod edge_cases_view;
 mod editor;
 mod edn_view;
 mod execution;
+mod explain_view;
 mod generation_view;
 mod implementation;
 mod inference;

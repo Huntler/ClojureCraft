@@ -301,6 +301,7 @@ mod tests {
                 requires: vec![],
                 assumptions: vec![],
                 omitted_context: vec![],
+                prompt: Vec::new(),
                 explanation: None,
             }),
         }

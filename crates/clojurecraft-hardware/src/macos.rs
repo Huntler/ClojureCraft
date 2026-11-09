@@ -14,6 +14,12 @@ fn sysctl(name: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// `iogpu.wired_limit_mb` when set (0 means the default).
+pub(crate) fn wired_limit() -> Option<u64> {
+    let mb: u64 = sysctl("iogpu.wired_limit_mb")?.parse().ok()?;
+    (mb > 0).then(|| mb * 1024 * 1024)
+}
+
 pub(crate) fn probe(report: &mut HardwareReport) {
     report.total_ram_bytes = sysctl("hw.memsize").and_then(|s| s.parse().ok());
     if report.total_ram_bytes.is_none() {

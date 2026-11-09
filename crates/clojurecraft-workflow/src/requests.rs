@@ -3,8 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use clojurecraft_domain::{ClarificationStatus, FunctionDocument, Step};
-use clojurecraft_inference::{GenerateRequest, Placement, Role, Section};
+use clojurecraft_domain::{ClarificationStatus, FunctionDocument, PromptMessage, Step};
+use clojurecraft_inference::{GenerateRequest, Placement, Role, Section, ToolSet};
 
 use crate::answers::{self, InterpretationAnswer};
 use crate::deps;
@@ -12,8 +12,11 @@ use crate::grammar;
 use crate::naming;
 use crate::spec;
 
-/// Drop order of retrieved documentation in a generation request.
-pub const DOCUMENTATION_DROP_ORDER: u32 = 1;
+/// Drop order of retrieved documentation in a generation request: left out first.
+pub const DOCUMENTATION_DROP_ORDER: u32 = 3;
+/// Drop order of the earlier turns of a fix conversation, oldest first, after the documentation
+/// and before the idioms.
+pub const HISTORY_DROP_ORDER: u32 = 2;
 
 /// The namespace and function the generated code should define.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,114 +232,209 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
          except static methods of Math, Long, Integer, Double, Character, and Boolean.\n\
          - Prefer clear, idiomatic clojure.core functions. Return eager collections (vectors, maps, \
          sets) unless the examples show a sequence.\n\
-         Answer in exactly this format and nothing else:\n\
-         PLAN: <at most six short lines, no code and no backticks: trace example 1 by hand. Take one element of its \
-         input (one line of text, one map, or one item) and quote each part of it next to the output \
-         value it becomes, for example 'id=7' -> :id 7, noting conversions (text to number; integer \
-         or decimal). Say how the other examples differ (missing parts, empty input), then name the \
-         core functions you will use.>\n\
-         ```clojure\n\
-         <the complete source, following the plan>\n\
-         ```\n\
-         {steps}ASSUMPTIONS:\n\
-         - <a decision you made where the specification is silent; at most four, or none>",
+         Answer with only the complete source in a ```clojure code block, nothing before or after it.",
         version = input.clojure_version,
-        steps = if numbered_steps(input.doc).is_empty() {
-            ""
-        } else {
-            "STEPS:\n\
-             STEP <n>: <for each numbered transformation step, the code from the source that carries \
-             it out, copied exactly: one expression or one stage of a pipeline, on one line>\n"
-        },
     )
 }
 
-pub fn generation_request(input: GenerationInput<'_>) -> GenerateRequest {
-    let mut sections = spec::specification_sections(input.doc);
+/// The opening message of a generation: the task, the specification, idioms, and
+/// documentation.
+fn generation_sections(input: &GenerationInput<'_>) -> Vec<Section> {
+    let mut sections = vec![task(generation_task(input))];
+    sections.extend(spec::specification_sections(input.doc));
     sections.extend(crate::idioms::section(input.doc));
     sections.extend(input.documentation.clone());
-    let mut sections_all = vec![task(generation_task(&input))];
-    sections_all.extend(sections);
-    let mut r = GenerateRequest::new(Role::Generation, sections_all);
+    sections
+}
+
+pub fn generation_request(input: GenerationInput<'_>) -> GenerateRequest {
+    let mut r = GenerateRequest::new(Role::Generation, generation_sections(&input));
     r.seed = Some(input.seed);
-    r.grammar = Some(grammar::generation(numbered_steps(input.doc).len()));
+    r.grammar = Some(grammar::generation());
     r
 }
 
-/// Sampling temperature of repairs: higher than a first generation, because a model that sees
+/// The messages `request` is sent as, keeping the planned sections in `included` (all when
+/// `None`).
+pub fn prompt_messages(request: &GenerateRequest, included: Option<&[usize]>) -> Vec<PromptMessage> {
+    let sections = clojurecraft_inference::planned_sections(request.role, request.sections.clone());
+    let kept: Vec<&Section> = match included {
+        Some(indices) => indices.iter().filter_map(|i| sections.get(*i)).collect(),
+        None => sections.iter().collect(),
+    };
+    clojurecraft_inference::context::messages(&kept)
+        .into_iter()
+        .map(|m| PromptMessage {
+            role: m.role,
+            content: m.content,
+        })
+        .collect()
+}
+
+/// Sampling temperature of a fix: a little above a first generation, because a model that sees
 /// its own failing code tends to return it nearly unchanged.
-pub const REPAIR_TEMPERATURE: f32 = 0.5;
+pub const FIX_TEMPERATURE: f32 = 0.4;
 
-/// Sampling temperature of further candidates for the same generation request: high enough that
-/// a different seed gives a different approach, not the first candidate again.
-pub const SAMPLE_TEMPERATURE: f32 = 0.6;
+/// Sampling temperature of a fresh start after a conversation got stuck: high enough that a
+/// different seed gives a different approach.
+pub const RESTART_TEMPERATURE: f32 = 0.6;
 
-/// Prompt label of the code a repair starts from.
-pub const PREVIOUS_CODE_LABEL: &str = "Previous code";
-/// Prompt label of the failed checks a repair must fix.
-pub const CHECK_RESULTS_LABEL: &str = "Check results";
+/// Answer budget of an analysis: a few short lines, plus tool calls.
+pub const ANALYSIS_TOKENS: u32 = 700;
 
-/// A request to fix code that failed automatic validation. The specification, the code, and the
-/// failures are required sections; documentation stays optional.
-pub fn repair_request(
-    input: GenerationInput<'_>,
+/// One exchange of a fix conversation: the model's answer exactly as it was given, the reply
+/// with the checked code and its failures, the model's analysis of the cause, and the request
+/// to fix the code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Turn {
+    pub answer: String,
+    pub feedback: String,
+    /// The analysis with the evaluations the model made; `None` while it is being written.
+    pub analysis: Option<String>,
+    pub fix: String,
+}
+
+/// The answer a fix conversation starts from when the user asks to fix the current code: the
+/// code as if the model had written it, so every fix continues the same conversation shape.
+pub fn existing_code_answer(code: &str) -> String {
+    format!("```clojure\n{}\n```", code.trim_end())
+}
+
+/// What a fix should start from: the first failing call, or the check that failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// A failing example or test: its label and input.
+    Call { label: String, input: String },
+    /// Another failing check, such as "the lint check".
+    Check(String),
+}
+
+/// The reply to an answer whose code failed its checks (the code that ran, the failures, and
+/// the request to find the cause before writing code), and the request to fix the code that
+/// follows the analysis. `readable` is false when the code could not be read, so the fix must
+/// be the complete namespace; `tools` says whether the model can evaluate expressions.
+pub fn feedback(
     code: &str,
     failures: &str,
-    attempt: u32,
-    attempts: u32,
-    // The attempt being repaired and an earlier one that failed in exactly the same way.
-    repeated: Option<(u32, u32)>,
-) -> GenerateRequest {
-    let mut sections = spec::specification_sections(input.doc);
-    sections.push(Section::required(
-        PREVIOUS_CODE_LABEL,
-        Placement::User,
-        format!("Your previous implementation:\n{}", code.trim_end()),
-    ));
-    sections.push(Section::required(
-        CHECK_RESULTS_LABEL,
-        Placement::User,
-        format!(
-            "The previous implementation was run in a sandbox on every example and accepted test. \
-             These checks failed (examples and tests are named as in the specification):\n{failures}"
+    focus: Option<&Focus>,
+    readable: bool,
+    tools: bool,
+) -> (String, String) {
+    let (why, analysis) = match focus {
+        Some(Focus::Call { label, input }) => {
+            let input: String = if input.chars().count() > 300 {
+                format!("{} …", input.chars().take(300).collect::<String>())
+            } else {
+                input.clone()
+            };
+            (
+                format!(
+                    "Find out why {label} (input {}) did not pass: follow that input through the code, \
+                     using the values recorded above, to the first expression whose value is wrong.",
+                    input.trim()
+                ),
+                "quote the part of the input whose output is wrong, name the expression that turned \
+                 it into the wrong value and the value it produced, and say what it must produce \
+                 instead; then name the change",
+            )
+        }
+        Some(Focus::Check(check)) => (
+            format!("Find out why {check} failed."),
+            "quote the reported problem and its line, say what in the code causes it, and name the \
+             change",
         ),
-    ));
-    sections.extend(crate::idioms::section(input.doc));
-    sections.extend(input.documentation.clone());
-    let repeated = repeated.map_or_else(String::new, |(this, n)| {
+        None => (
+            "Find out why the checks failed.".to_owned(),
+            "quote the reported problem, say what in the code causes it, and name the change",
+        ),
+    };
+    let tools = if tools {
         format!(
-            " Attempt {this} failed in exactly the same way as attempt {n}, so small adjustments are not \
-             enough: re-read the examples and expected outputs, and implement the transformation with a \
-             different approach."
+            " You can check what an expression returns with the {} tool, for example a helper \
+             called with a value recorded above; check before you conclude.",
+            crate::eval_tool::NAME
         )
-    });
-    let text = format!(
-        "This is attempt {attempt} of {attempts}.{repeated} The previous implementation, shown below, failed \
-         automatic checks. Fix it so that every check passes. The examples, accepted tests, contract, \
-         and answers are fixed requirements: change the code, never what it must return. Keep what \
-         already works and change only what the failures require; if the approach cannot work, \
-         rewrite it. Compare the expected and actual values carefully: vectors, lists, and sequences \
-         with the same elements in order are equal, but an integer never equals a floating-point \
-         number (1 is not 1.0). A failing check may list the values after each transformation step \
-         and the values of locals, recorded while that call ran: find the first step whose value is \
-         not what the step should produce for that input, and fix the code of that step.\n\n{}",
-        generation_task(&input)
+    } else {
+        String::new()
+    };
+    let feedback = format!(
+        "That code was run in a sandbox on every example and accepted test. This is the code that \
+         ran, after automatic cleanup; line numbers refer to it:\n```clojure\n{code}\n```\n\n\
+         These checks failed (examples and tests are named as in the specification):\n{failures}\n\n\
+         {why}{tools} Do not write code yet. Answer with your analysis only, in at most six short \
+         lines: {analysis}.",
+        code = code.trim_end(),
     );
-    let mut all = vec![task(text)];
-    all.extend(sections);
-    let mut r = GenerateRequest::new(Role::Generation, all);
+    let code_part = if readable {
+        "<only the top-level forms you change or add, each complete: (defn- name …), (defn name …), \
+         or (def name …). Forms you leave out stay as they are. Add the (ns …) form only to change \
+         the requires.>"
+    } else {
+        "<the complete namespace, starting with (ns …), because the code above could not be read>"
+    };
+    let fix = format!(
+        "Now fix the code as your analysis says. The examples, accepted tests, contract, and answers \
+         are fixed requirements: change the code, never what it must return. An integer never \
+         equals a floating-point number (1 is not 1.0).\n\
+         Answer in exactly this format and nothing else:\n```clojure\n{code_part}\n```"
+    );
+    (feedback, fix)
+}
+
+/// The conversation after the opening message: each earlier answer and the reply to it, and,
+/// once written, the analysis and the request to fix. Only the last exchange is required;
+/// earlier ones are left out, oldest first, when the context is short.
+fn conversation(input: &GenerationInput<'_>, turns: &[Turn]) -> Vec<Section> {
+    let mut sections = generation_sections(input);
+    let last = turns.len().saturating_sub(1);
+    for (i, t) in turns.iter().enumerate() {
+        let n = i + 1;
+        let mut parts = vec![
+            (format!("Answer {n}"), Placement::Assistant, t.answer.clone()),
+            (format!("Reply {n}"), Placement::User, t.feedback.clone()),
+        ];
+        if let Some(a) = &t.analysis {
+            let a = if a.trim().is_empty() {
+                "(no analysis)"
+            } else {
+                a.as_str()
+            };
+            parts.push((format!("Analysis {n}"), Placement::Assistant, a.to_owned()));
+            parts.push((format!("Fix request {n}"), Placement::User, t.fix.clone()));
+        }
+        for (label, placement, text) in parts {
+            sections.push(if i == last {
+                Section::required(&label, placement, text)
+            } else {
+                Section::optional(&label, HISTORY_DROP_ORDER, text).with_placement(placement)
+            });
+        }
+    }
+    sections
+}
+
+/// Asks the model why the last answer's code failed; `tools` lets it evaluate expressions.
+pub fn analysis_request(input: GenerationInput<'_>, turns: &[Turn], tools: ToolSet) -> GenerateRequest {
+    let mut r = GenerateRequest::new(Role::Generation, conversation(&input, turns));
     r.seed = Some(input.seed);
-    r.temperature = Some(REPAIR_TEMPERATURE);
-    r.grammar = Some(grammar::generation(numbered_steps(input.doc).len()));
+    r.temperature = Some(FIX_TEMPERATURE);
+    r.max_output_tokens = Some(ANALYSIS_TOKENS);
+    r.tools = tools;
+    r
+}
+
+/// Asks for the fix the analysis named, as changed forms.
+pub fn fix_request(input: GenerationInput<'_>, turns: &[Turn]) -> GenerateRequest {
+    let mut r = GenerateRequest::new(Role::Generation, conversation(&input, turns));
+    r.seed = Some(input.seed);
+    r.temperature = Some(FIX_TEMPERATURE);
+    r.grammar = Some(grammar::fix());
     r
 }
 
 pub fn explanation_request(doc: &FunctionDocument, code: &str) -> GenerateRequest {
     let steps = numbered_steps(doc);
-    let mut sections: Vec<Section> = spec::specification_sections(doc)
-        .into_iter()
-        .filter(|s| matches!(s.label.as_str(), "Description" | "Transformation steps"))
-        .collect();
+    let mut sections = spec::specification_sections(doc);
     sections.push(Section::required(
         "Code",
         Placement::User,
@@ -356,8 +454,9 @@ pub fn explanation_request(doc: &FunctionDocument, code: &str) -> GenerateReques
         "Explain the implementation below to an engineer who reads Clojure but may not know its \
          standard library. In \"summary\", describe in at most four sentences how it works. {step_task} \
          Keep each step's explanation to one or two sentences and quote only the lines that implement \
-         it. In \"symbols\", list at most eight standard-library functions and macros used and what \
-         each does here. Answer with JSON only."
+         it. In \"assumptions\", list at most four decisions the code makes where the specification \
+         is silent, or none. In \"symbols\", list at most eight standard-library functions and macros \
+         used and what each does here. Answer with JSON only."
     );
     let mut r = request(
         Role::Explanation,
@@ -419,10 +518,7 @@ mod tests {
             r.schema.is_none(),
             "answers are plain text constrained by the grammar"
         );
-        assert_eq!(
-            r.grammar,
-            Some(crate::grammar::generation(numbered_steps(&d).len()))
-        );
+        assert_eq!(r.grammar, Some(crate::grammar::generation()));
         let t = all_text(&r);
         for needle in [
             "Clojure 1.12.6",
@@ -457,51 +553,110 @@ mod tests {
     }
 
     #[test]
-    fn repair_requests_carry_code_failures_and_the_whole_specification() {
+    fn a_fix_continues_the_conversation_after_an_analysis() {
         let d = doc();
         let names = Names::for_document(&d, |_| false);
         let allowed = BTreeSet::new();
-        let r = repair_request(
-            GenerationInput {
-                doc: &d,
-                names: &names,
-                allowed: &allowed,
-                clojure_version: "1.12.6",
-                documentation: Some(Section::optional(
-                    "Clojure documentation",
-                    DOCUMENTATION_DROP_ORDER,
-                    "[excerpt 1]",
-                )),
-                seed: 9,
+        let input = || GenerationInput {
+            doc: &d,
+            names: &names,
+            allowed: &allowed,
+            clojure_version: "1.12.6",
+            documentation: Some(Section::optional(
+                "Clojure documentation",
+                DOCUMENTATION_DROP_ORDER,
+                "[excerpt 1]",
+            )),
+            seed: 9,
+        };
+        let focus = Focus::Call {
+            label: "Example 1".into(),
+            input: "[]".into(),
+        };
+        let (feedback1, fix1) = feedback(
+            "(ns order-totals.core)\n(defn order-totals [x] x)",
+            "Example 1 — failed",
+            Some(&focus),
+            true,
+            true,
+        );
+        let (feedback2, fix2) = feedback(
+            "(ns order-totals.core)\n(defn order-totals [x] {})",
+            "Example 2 — failed",
+            None,
+            true,
+            false,
+        );
+        let mut turns = vec![
+            Turn {
+                answer: "PLAN: a\n```clojure\n(ns order-totals.core)\n(defn order-totals [x] x)\n```".into(),
+                feedback: feedback1,
+                analysis: Some("x is returned unchanged".into()),
+                fix: fix1,
             },
-            "(ns order-totals.core)\n(defn order-totals [x] x)\n",
-            "Example 1 — failed\n  Expected: {}\n  Actual: []",
-            3,
-            4,
-            Some((2, 1)),
-        );
-        assert_eq!((r.role, r.seed), (Role::Generation, Some(9)));
-        assert_eq!(r.temperature, Some(REPAIR_TEMPERATURE));
+            Turn {
+                answer: "```clojure\n(defn order-totals [x] {})\n```".into(),
+                feedback: feedback2,
+                analysis: None,
+                fix: fix2,
+            },
+        ];
+        // First the analysis: the conversation ends with the reply, without a grammar.
+        let a = analysis_request(input(), &turns, ToolSet::default());
+        assert_eq!(a.grammar, None);
+        assert_eq!(a.max_output_tokens, Some(ANALYSIS_TOKENS));
+        let opening = generation_request(input()).sections;
         assert_eq!(
-            r.grammar,
-            Some(crate::grammar::generation(numbered_steps(&d).len()))
+            &a.sections[..opening.len()],
+            &opening[..],
+            "the cached opening is reused"
         );
-        let t = all_text(&r);
+        let rest = &a.sections[opening.len()..];
+        let placements: Vec<Placement> = rest.iter().map(|s| s.placement).collect();
+        use Placement::{Assistant, User};
+        assert_eq!(placements, [Assistant, User, Assistant, User, Assistant, User]);
+        assert!(matches!(
+            rest[0].priority,
+            clojurecraft_inference::Priority::Optional(HISTORY_DROP_ORDER)
+        ));
+        assert_eq!(rest[5].priority, clojurecraft_inference::Priority::Required);
+        let last = &rest[5].text;
         for needle in [
-            "attempt 3 of 4",
-            "Attempt 2 failed in exactly the same way as attempt 1",
-            "never what it must return",
-            "(defn order-totals [x] x)",
-            "Actual: []",
-            "Sum amounts per customer",
-            "(ns order-totals.core)",
+            "(defn order-totals [x] {})",
+            "Example 2 — failed",
+            "Do not write code yet",
         ] {
-            assert!(t.contains(needle), "missing {needle:?}");
+            assert!(last.contains(needle), "missing {needle:?} in {last}");
         }
-        for label in [PREVIOUS_CODE_LABEL, CHECK_RESULTS_LABEL, "Example 1"] {
-            let s = r.sections.iter().find(|s| s.label == label).unwrap();
-            assert_eq!(s.priority, clojurecraft_inference::Priority::Required, "{label}");
-        }
+        assert!(!last.contains("clojure_eval"), "no tool, no hint");
+        assert!(rest[1].text.contains("Find out why Example 1 (input [])"));
+        assert!(rest[1].text.contains("clojure_eval"));
+        assert!(rest[3].text.contains("Now fix the code"));
+
+        // Then the fix: the analysis and the request for changed forms, with the grammar.
+        turns[1].analysis = Some("returns an empty map".into());
+        let f = fix_request(input(), &turns);
+        assert_eq!((f.seed, f.temperature), (Some(9), Some(FIX_TEMPERATURE)));
+        assert_eq!(f.grammar, Some(crate::grammar::fix()));
+        let rest = &f.sections[opening.len()..];
+        assert_eq!(rest.len(), 8);
+        assert_eq!(rest[6].text, "returns an empty map");
+        assert!(rest[7].text.contains("only the top-level forms you change"));
+    }
+
+    #[test]
+    fn unreadable_code_asks_for_the_complete_namespace() {
+        let (f, fix) = feedback(
+            "(ns a",
+            "Parse — failed",
+            Some(&Focus::Check("the parse check".into())),
+            false,
+            false,
+        );
+        assert!(fix.contains("the complete namespace"));
+        assert!(f.contains("Find out why the parse check failed."));
+        assert!(f.contains("quote the reported problem and its line"));
+        assert!(!f.contains("part of the input"));
     }
 
     #[test]

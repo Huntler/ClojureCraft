@@ -25,7 +25,7 @@ macros, multi-function namespaces. Write those yourself.
 | `update_function` | Change fields. `steps` and `examples` replace the whole list. `contract: null` removes the contract. |
 | `generate_test_cases` | Background job: the model proposes edge cases (`source`: `examples` or `specification`). |
 | `review_test_cases` | `actions` (accept/reject/reopen/remove/edit by case id) and `add` (your own cases, accepted by default). All or nothing. |
-| `generate` | Background job: write, validate, and repair up to 3 times. `function_ids` instead of `function_id` generates several; jobs for a busy model are **queued** and run one after another. `mode: "fix"` repairs the current code from its failing checks. |
+| `generate` | Background job: write and validate ("Generate"), then fix in up to 5 attempts ("Attempt 1" …) that continue one conversation: the model analyses the failure, may evaluate expressions in the sandbox, and sends only the changed forms. `function_ids` instead of `function_id` generates several; jobs for a busy model are **queued** and run one after another. `mode: "fix"` repairs the current code from its failing checks. |
 | `run_tests` | Background: check the current code against examples and accepted tests. |
 | `status` | Progress, the last job's outcome, check results with failures, and a `next` hint. Pass `wait_seconds` (≤ 300) to wait for background work (queued jobs included) instead of polling. With `function_ids`: one short line per function (`passed`, `first_failure`, `last_job`). Failures are compact (first of each kind; long values replaced by a `difference` such as `at [0 :total]: expected 5 but got 4`); `verbose: true` shows all values. |
 | `result` | Final code with `namespace`, `function`, `passes_all_checks`, and any code waiting for acceptance. |
@@ -84,8 +84,9 @@ All EDN values (`input`, `expected`, keys, defaults) are **strings**: `"[{:id 1 
   aggregation, or the parsing of **one** token format (`"3@10"` → `{:sets 3 :reps 10}`) on the
   first job. It fails on parsers that split a line into several differently formatted fields. Generate one
   function per field format and compose them (and the line splitting) in your own glue code.
-- In `status`, an attempt that failed exactly like an earlier one shows `same_failure_as`
-  instead of repeating the failure.
+- In `status`, attempts are labelled "Generate", "Attempt n", or "Fresh start" (the conversation
+  got stuck and started over). An attempt that failed exactly like the one before shows
+  `same_failure_as` instead of repeating the failure.
 - **Budget rule:** after 2 failed `generate` jobs on one function, simplify or split its
   specification. After 3, write the code yourself and send it with `submit_code` (keep the
   `namespace` and `function` from `result`), then fix it from the `status` failures. Do not keep

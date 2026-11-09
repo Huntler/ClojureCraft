@@ -4,19 +4,14 @@
 //! when every line break and quote has to be escaped inside a JSON string:
 //!
 //! ````text
-//! PLAN: how example 1's input becomes its output, then the functions to use
 //! ```clojure
 //! (ns …)
 //! (defn …)
 //! ```
-//! STEPS:
-//! STEP 1: (the code that carries out step 1)
-//! ASSUMPTIONS:
-//! - a decision the model made
 //! ````
 //!
-//! The `STEPS:` section exists only when the specification has steps, with at most one line per
-//! step. The grammar describes the code as Clojure reads it: lists, vectors, and maps must close
+//! Nothing else is part of the answer; the steps and assumptions are asked for separately, in an
+//! explanation of the code. The grammar describes the code as Clojure reads it: lists, vectors, and maps must close
 //! with the matching delimiter and string literals must end. The code starts with `(ns …)`, and
 //! every later top-level form is a `defn`, `defn-`, `def`, or `declare` list, so a definition can
 //! never lose its opening parenthesis and no example calls are left at the top level. Comments are
@@ -32,13 +27,15 @@
 //!
 //! The answer is turned into the generation answer's JSON shape by
 //! [`crate::answers::generation_from_text`] and validated as before.
+//!
+//! A fix in a conversation about failing code ([`fix`]) follows the model's analysis and is only
+//! a code block with the top-level forms that change, optionally led by the `ns` form; they are
+//! merged into the previous code by [`crate::edits::apply`].
 
 /// Grammar rules shared by every generation answer; `root` is added by [`generation`].
-const RULES: &str = r#"plan ::= [^`\x00]{0,1000}
-lchar ::= [^`\n\x00]
-assumptions ::= ( "\n- " lchar{1,200} ){0,4}
-
-top ::= sp "(ns " seq ")" sp ( "(" ( "defn-" | "defn" | "def" | "declare" ) sp1 seq ")" sp )+
+const RULES: &str = r#"top ::= sp "(ns " seq ")" sp defs
+edits ::= sp ( "(ns " seq ")" sp )? defs
+defs ::= ( "(" ( "defn-" | "defn" | "def" | "declare" ) sp1 seq ")" sp )+
 seq ::= sp rest
 rest ::= ( coll seq | cstr seq | atom after )?
 after ::= ( sp1 rest | coll seq | cstr seq )?
@@ -53,20 +50,14 @@ tchar ::= [^()\[\]{}"\\;,` \t\n\r\x00]
 chr ::= "\\" ( [a-zA-Z0-9]+ | [^a-zA-Z0-9 \t\n\r\x00] )
 "#;
 
-/// The generation grammar for a specification with `steps` transformation steps: at most one
-/// step line per step, and no step section without steps, so the model does not spend its answer
-/// budget quoting its code a second time.
-pub fn generation(steps: usize) -> String {
-    let step_section = match steps {
-        0 => String::new(),
-        n => format!(
-            " \"\\nSTEPS:\" ( \"\\nSTEP \" [1-9] [0-9]? \": \" lchar{{1,200}} ){{0,{}}}",
-            n.min(20)
-        ),
-    };
-    format!(
-        "root ::= \"PLAN: \" plan \"```clojure\\n\" top \"```\"{step_section} \"\\nASSUMPTIONS:\" assumptions\n{RULES}"
-    )
+/// The generation grammar: the complete source in a code block.
+pub fn generation() -> String {
+    format!("root ::= \"```clojure\\n\" top \"```\"\n{RULES}")
+}
+
+/// The grammar of a fix: the changed forms in a code block.
+pub fn fix() -> String {
+    format!("root ::= \"```clojure\\n\" edits \"```\"\n{RULES}")
 }
 
 #[cfg(test)]
@@ -77,7 +68,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::generation;
+    use super::{fix, generation};
 
     #[derive(Clone, Debug)]
     enum Item {
@@ -296,10 +287,7 @@ mod tests {
     }
 
     fn accepts(code: &str) -> bool {
-        let answer = format!(
-            "PLAN: sum the values\n```clojure\n{code}\n```\nSTEPS:\nSTEP 1: (inc x)\nASSUMPTIONS:\n- the input is a vector"
-        );
-        matches(&generation(2), &answer)
+        matches(&generation(), &format!("```clojure\n{code}\n```"))
     }
 
     #[test]
@@ -337,28 +325,25 @@ mod tests {
     }
 
     #[test]
-    fn the_sections_around_the_code_are_fixed_in_shape() {
-        let ok = "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:";
-        assert!(matches(&generation(0), ok));
+    fn the_answer_is_only_the_code_block() {
+        let g = generation();
+        assert!(matches(&g, "```clojure\n(ns a)\n(def x 1)\n```"));
+        assert!(!matches(&g, "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```"));
+        assert!(!matches(&g, "```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:"));
+        assert!(!matches(&g, "```clojure\n```"));
+    }
+
+    #[test]
+    fn a_fix_is_whole_changed_forms() {
+        let g = fix();
+        assert!(matches(&g, "```clojure\n(defn- w [t] (parse-long t))\n```"));
         assert!(matches(
-            &generation(0),
-            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:\n- one\n- two"
+            &g,
+            "```clojure\n(ns a (:require [clojure.set :as set]))\n(defn f [x] x)\n```"
         ));
-        assert!(!matches(&generation(0), "PLAN: p\n```clojure\n(ns a)\n```"));
-        assert!(!matches(&generation(0), "PLAN: p\n```clojure\n```\nASSUMPTIONS:"));
-        assert!(!matches(
-            &generation(0),
-            "PLAN: uses `x`\n```clojure\n(ns a)\n(def x 1)\n```\nASSUMPTIONS:"
-        ));
-        assert!(!matches(
-            &generation(0),
-            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: x\nASSUMPTIONS:"
-        ));
-        let one_step = "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: (inc x)\nASSUMPTIONS:";
-        assert!(matches(&generation(1), one_step));
-        assert!(!matches(
-            &generation(1),
-            "PLAN: p\n```clojure\n(ns a)\n(def x 1)\n```\nSTEPS:\nSTEP 1: a\nSTEP 2: b\nASSUMPTIONS:"
-        ));
+        assert!(!matches(&g, "```clojure\n(ns a)\n```"));
+        assert!(!matches(&g, "```clojure\n(parse-long t)\n```"));
+        assert!(!matches(&g, "```clojure\n(defn- w [t] (parse-long t)\n```"));
+        assert!(!matches(&g, "ANALYSIS: a\n```clojure\n(defn- w [t] t)\n```"));
     }
 }

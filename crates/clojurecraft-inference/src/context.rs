@@ -14,14 +14,17 @@ use crate::protocol::Message;
 pub enum Placement {
     /// Part of the system message (instructions).
     System,
-    /// Part of the user message (the task and its data).
+    /// Part of a user message (the task and its data).
     User,
+    /// An earlier answer of the model, for a request that continues a conversation.
+    Assistant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     Required,
-    /// Left out when space runs short; higher values are left out first.
+    /// Left out when space runs short; higher values are left out first, and among equal
+    /// values earlier sections first (older turns of a conversation before newer ones).
     Optional(u32),
 }
 
@@ -51,24 +54,46 @@ impl Section {
             text: text.into(),
         }
     }
+    pub fn with_placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
+        self
+    }
 }
 
-/// Joins sections into a system message (if any) and one user message.
+/// Joins sections into a system message (if any), then user and assistant messages in order:
+/// consecutive sections of the same placement form one message.
 pub fn messages(sections: &[&Section]) -> Vec<Message> {
-    let join = |p: Placement| {
+    let texts = |p: Placement| {
         sections
             .iter()
-            .filter(|s| s.placement == p && !s.text.trim().is_empty())
+            .filter(move |s| s.placement == p && !s.text.trim().is_empty())
             .map(|s| s.text.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n\n")
     };
     let mut out = Vec::new();
-    let system = join(Placement::System);
+    let system = texts(Placement::System).collect::<Vec<_>>().join("\n\n");
     if !system.is_empty() {
         out.push(Message::system(system));
     }
-    out.push(Message::user(join(Placement::User)));
+    let mut turns: Vec<(Placement, Vec<&str>)> = Vec::new();
+    for s in sections
+        .iter()
+        .filter(|s| s.placement != Placement::System && !s.text.trim().is_empty())
+    {
+        match turns.last_mut() {
+            Some((p, parts)) if *p == s.placement => parts.push(s.text.trim_end()),
+            _ => turns.push((s.placement, vec![s.text.trim_end()])),
+        }
+    }
+    if turns.first().is_none_or(|(p, _)| *p != Placement::User) {
+        turns.insert(0, (Placement::User, Vec::new()));
+    }
+    for (p, parts) in turns {
+        let text = parts.join("\n\n");
+        out.push(match p {
+            Placement::Assistant => Message::assistant(text, Vec::new()),
+            _ => Message::user(text),
+        });
+    }
     out
 }
 
@@ -136,16 +161,30 @@ pub fn plan(
             .copied()
             .filter(|i| sections[*i].priority != Priority::Required)
             .collect();
-        // Highest drop order first; among equals, later sections first.
-        droppable.sort_by_key(|i| (std::cmp::Reverse(sections[*i].priority), std::cmp::Reverse(*i)));
+        // Highest drop order first; among equals, earlier sections first.
+        droppable.sort_by_key(|i| (std::cmp::Reverse(sections[*i].priority), *i));
         for i in droppable {
             if tokens <= available {
                 break;
             }
-            let n = counter.section(&sections[i].text)?;
-            tokens = tokens.saturating_sub(n);
-            included.retain(|j| *j != i);
-            omitted.push((sections[i].label.clone(), n));
+            if !included.contains(&i) {
+                continue;
+            }
+            // An earlier answer leaves together with the message that replied to it.
+            let mut unit = vec![i];
+            if sections[i].placement == Placement::Assistant
+                && sections
+                    .get(i + 1)
+                    .is_some_and(|next| next.priority == sections[i].priority)
+            {
+                unit.push(i + 1);
+            }
+            for k in unit {
+                let n = counter.section(&sections[k].text)?;
+                tokens = tokens.saturating_sub(n);
+                included.retain(|j| *j != k);
+                omitted.push((sections[k].label.clone(), n));
+            }
         }
         if !omitted.is_empty() {
             // Recount what is actually sent; joining text changes counts slightly.
@@ -268,6 +307,40 @@ mod tests {
             panic!()
         };
         assert!(!remedies.iter().any(|r| matches!(r, Remedy::LargerContext(_))));
+    }
+
+    #[test]
+    fn equal_drop_orders_leave_out_earlier_sections_first() {
+        let s = vec![
+            Section::required("Task", Placement::User, "t".repeat(10)),
+            Section::optional("Turn 1", 2, "a".repeat(20)).with_placement(Placement::Assistant),
+            Section::optional("Feedback 1", 2, "f".repeat(20)),
+            Section::required("Turn 2", Placement::Assistant, "b".repeat(20)),
+            Section::required("Feedback 2", Placement::User, "g".repeat(20)),
+        ];
+        let p = plan(&s, &mut Chars, 150, 60, None).unwrap();
+        assert_eq!(
+            p.omitted,
+            vec![("Turn 1".to_owned(), 20), ("Feedback 1".to_owned(), 20)]
+        );
+    }
+
+    #[test]
+    fn a_conversation_alternates_user_and_assistant_messages() {
+        let s = [
+            Section::required("Instructions", Placement::System, "sys"),
+            Section::required("Task", Placement::User, "task"),
+            Section::required("Spec", Placement::User, "spec"),
+            Section::required("Answer", Placement::Assistant, "code"),
+            Section::required("Feedback", Placement::User, "failed"),
+        ];
+        let refs: Vec<&Section> = s.iter().collect();
+        let m = messages(&refs);
+        let roles: Vec<&str> = m.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(m[1].content, "task\n\nspec");
+        assert_eq!(m[2].content, "code");
+        assert_eq!(m[3].content, "failed");
     }
 
     #[test]

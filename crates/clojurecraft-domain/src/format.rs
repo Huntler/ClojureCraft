@@ -24,7 +24,8 @@ impl RecordKind {
             // 2: clarifications, interpretation, a whole-value type in contract shapes, and the
             // generated code's namespace, requirements, assumptions, and explanation.
             // 3: the implementation accepted for edge-case testing.
-            Self::Document => 3,
+            // 4: the generation prompt and the explanation's assumptions.
+            Self::Document => 4,
             // 2: the generation run, the checked source, and the comparison settings.
             Self::ValidationReport => 2,
             // 2: revisions recording an accepted implementation.
@@ -102,6 +103,9 @@ fn upgrade(kind: RecordKind, from: u32, value: serde_json::Value) -> Result<serd
         (RecordKind::ValidationReport, 1) => Ok(value),
         // Format 3 documents add an optional accepted implementation, absent in older ones.
         (RecordKind::Document, 2) => Ok(value),
+        // Format 4 documents add the generation prompt and the explanation's assumptions, empty
+        // when absent.
+        (RecordKind::Document, 3) => Ok(value),
         // Format 2 revision reasons add a kind; every format 1 reason is still valid.
         (RecordKind::RevisionReason, 1) => Ok(value),
         _ => Err(FormatError::Unknown {
@@ -120,11 +124,11 @@ mod tests {
     fn newer_formats_are_refused() {
         let doc = FunctionDocument::new("f");
         let json = encode(&doc).unwrap();
-        let back: FunctionDocument = decode(RecordKind::Document, 3, &json).unwrap();
+        let back: FunctionDocument = decode(RecordKind::Document, 4, &json).unwrap();
         assert_eq!(back, doc);
-        let err = decode::<FunctionDocument>(RecordKind::Document, 4, &json).unwrap_err();
-        assert!(matches!(err, FormatError::TooNew { found: 4, .. }), "{err}");
-        assert!(decode::<FunctionDocument>(RecordKind::Document, 3, "{").is_err());
+        let err = decode::<FunctionDocument>(RecordKind::Document, 5, &json).unwrap_err();
+        assert!(matches!(err, FormatError::TooNew { found: 5, .. }), "{err}");
+        assert!(decode::<FunctionDocument>(RecordKind::Document, 4, "{").is_err());
     }
 
     /// A document as format 1 wrote it: no clarifications, interpretation, shape types, or
