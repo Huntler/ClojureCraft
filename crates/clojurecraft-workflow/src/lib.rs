@@ -24,6 +24,8 @@
 //!   the upstream run, cycle and contract checks, recording the snapshot);
 //! - [`intermediate`]: executed intermediate values of transformation steps, observed with an
 //!   instrumented copy of the code;
+//! - [`project`]: functions inside a project's namespace files: the fragment the model edits,
+//!   and the whole file it is checked in;
 //! - [`assistant`]: the sequence of requests for interpreting, proposing a contract, and
 //!   generating, reaching inference and documentation only through [`assistant::Ports`].
 
@@ -46,6 +48,7 @@ pub mod intermediate;
 pub mod locals;
 pub mod locate;
 pub mod naming;
+pub mod project;
 pub mod references;
 pub mod requests;
 pub mod spec;

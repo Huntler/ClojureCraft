@@ -42,8 +42,21 @@ pub fn is_supported(namespace: &str) -> bool {
     namespace == CORE || supported().contains(namespace)
 }
 
-/// Namespaces this function may require besides `clojure.core`.
+/// Namespaces this function may require besides `clojure.core`. A project function may also use
+/// every namespace its file requires.
 pub fn allowed(doc: &FunctionDocument) -> BTreeSet<String> {
+    let mut allowed = contract_allowed(doc);
+    if let Some(p) = &doc.project {
+        allowed.extend(
+            crate::project::file_requires(&p.file)
+                .into_iter()
+                .filter(|n| n != CORE),
+        );
+    }
+    allowed
+}
+
+fn contract_allowed(doc: &FunctionDocument) -> BTreeSet<String> {
     let supported = supported();
     match &doc.contract {
         Some(c) if c.status == ContractStatus::Accepted => c

@@ -567,6 +567,7 @@ fn run_build(
         jars,
         sandbox_helper: helper,
         work_dir: env.dirs.root().join("harness"),
+        project_classpath: Vec::new(),
     };
     let mut progress = |p: BuildProgress| emit(KnowledgeEvent::Stage(Stage::Build(p)));
     let as_failure = |e: BuildError| match e {

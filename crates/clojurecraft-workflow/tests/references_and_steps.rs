@@ -38,6 +38,7 @@ fn runtime() -> Option<ClojureRuntime> {
         jars,
         sandbox_helper: helper,
         work_dir: std::env::temp_dir().join(format!("clojurecraft-references-test-{}", std::process::id())),
+        project_classpath: Vec::new(),
     })
 }
 

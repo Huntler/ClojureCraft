@@ -74,6 +74,8 @@ pub struct Expectations<'a> {
     pub function: &'a str,
     /// Namespaces besides `clojure.core` this function may require.
     pub allowed: &'a BTreeSet<String>,
+    /// How many arguments the public function takes.
+    pub arguments: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -416,7 +418,10 @@ impl Checker<'_> {
                 return;
             }
         };
-        if !deps::is_supported(&lib) {
+        // A project namespace may use whatever its file requires; only the standard library's
+        // requirements are held to the usual rules.
+        let project_lib = !deps::is_supported(&lib) && self.allowed.contains(&lib);
+        if !deps::is_supported(&lib) && !project_lib {
             self.problem(
                 ProblemKind::Unsupported,
                 format!("{lib} is not available to generated functions"),
@@ -439,6 +444,7 @@ impl Checker<'_> {
                     }
                 }
                 (Some(":refer"), Some(names)) if names.vector().is_some() => {}
+                _ if project_lib => {}
                 (Some(":refer"), _) => self.problem(
                     ProblemKind::Forbidden,
                     ":refer :all is not allowed; use an alias or a vector of names",
@@ -494,8 +500,9 @@ impl Checker<'_> {
         Some((name.to_owned(), public_fn, form.clone()))
     }
 
-    /// Whether some arity of `(defn name doc? attrs? …)` takes exactly one argument.
-    fn takes_one_argument(defn: &Form) -> bool {
+    /// Whether some arity of `(defn name doc? attrs? …)` takes exactly `n` arguments.
+    fn takes_arguments(defn: &Form, n: u32) -> bool {
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
         let items = defn.list().unwrap_or_default();
         let mut rest = items.get(2..).unwrap_or_default();
         while let Some(first) = rest.first() {
@@ -516,7 +523,7 @@ impl Checker<'_> {
         let accepts = |params: &[Form]| {
             let required = params.iter().take_while(|p| p.symbol() != Some("&")).count();
             let variadic = required < params.len();
-            required == 1 || (required == 0 && variadic)
+            required == n || (variadic && required <= n)
         };
         match rest.first() {
             Some(f) if f.vector().is_some() => accepts(f.vector().unwrap_or_default()),
@@ -594,7 +601,7 @@ impl Checker<'_> {
             if policy.denied_core.contains(name) {
                 self.problem(ProblemKind::Forbidden, format!("{sym} is not allowed"), at);
             }
-        } else if !deps::is_supported(&target) {
+        } else if !deps::is_supported(&target) && !self.allowed.contains(&target) {
             self.problem(
                 ProblemKind::Unsupported,
                 format!("{ns} is not available to generated functions ({sym})"),
@@ -647,12 +654,12 @@ pub fn check(source: &str, expect: &Expectations<'_>) -> CodeStructure {
             None,
         ),
         [(name, form)] => {
-            if !Checker::takes_one_argument(form) {
-                c.problem(
-                    ProblemKind::Structure,
-                    format!("{name} must accept exactly one argument, the input value"),
-                    Some(form.span().start),
-                );
+            if !Checker::takes_arguments(form, expect.arguments) {
+                let message = match expect.arguments {
+                    1 => format!("{name} must accept exactly one argument, the input value"),
+                    n => format!("{name} must accept exactly {n} arguments"),
+                };
+                c.problem(ProblemKind::Structure, message, Some(form.span().start));
             }
             if name != expect.function {
                 c.out.warnings.push(format!(
@@ -694,12 +701,69 @@ mod tests {
                 namespace: "totals.core",
                 function: "totals",
                 allowed: &allowed,
+                arguments: 1,
             },
         )
     }
 
     fn messages(s: &CodeStructure) -> Vec<String> {
         s.problems.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn the_expected_number_of_arguments_is_checked() {
+        let allowed = allowed();
+        let with = |src: &str, arguments| {
+            check(
+                src,
+                &Expectations {
+                    namespace: "totals.core",
+                    function: "totals",
+                    allowed: &allowed,
+                    arguments,
+                },
+            )
+        };
+        assert!(
+            with("(ns totals.core)\n(defn totals [a b] a)", 2)
+                .problems
+                .is_empty()
+        );
+        assert!(
+            with("(ns totals.core)\n(defn totals [a & more] a)", 3)
+                .problems
+                .is_empty()
+        );
+        assert_eq!(
+            messages(&with("(ns totals.core)\n(defn totals [a] a)", 2)),
+            ["line 2: totals must accept exactly 2 arguments"]
+        );
+        assert!(
+            with("(ns totals.core)\n(defn totals [] 1)", 0)
+                .problems
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_project_namespace_may_use_what_its_file_requires() {
+        let allowed = BTreeSet::from(["shop.util".to_owned(), "clojure.string".to_owned()]);
+        let s = check(
+            "(ns shop.orders\n  (:require [shop.util :as util :refer :all]\n            [clojure.string :as str]))\n             (defn totals [x] (util/clean (str/trim x)))",
+            &Expectations {
+                namespace: "shop.orders",
+                function: "totals",
+                allowed: &allowed,
+                arguments: 1,
+            },
+        );
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        assert!(s.needs_approval.is_empty());
+        let s = run("(ns totals.core (:require [shop.util :as util]))\n(defn totals [x] (util/clean x))");
+        assert!(
+            !s.problems.is_empty(),
+            "outside a project, other namespaces stay unsupported"
+        );
     }
 
     #[test]

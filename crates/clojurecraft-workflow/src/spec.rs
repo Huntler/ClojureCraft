@@ -364,6 +364,17 @@ pub fn specification_sections(doc: &FunctionDocument) -> Vec<Section> {
             }
         ),
     ));
+    let arguments = doc.arguments();
+    if arguments != 1 {
+        out.push(Section::required(
+            "Arguments",
+            Placement::User,
+            format!(
+                "The function takes {arguments} arguments. Every example and test input is a vector of \
+                 the arguments in order: input [a b] means the call (f a b)."
+            ),
+        ));
+    }
     let steps: Vec<String> = doc
         .steps
         .iter()
@@ -404,8 +415,13 @@ pub fn specification_sections(doc: &FunctionDocument) -> Vec<Section> {
             &label,
             Placement::User,
             format!(
-                "{label}. The function is called with the input and must return the expected output.\n\
+                "{label}. The function is called with the {} and must return the expected output.\n\
                  Input (EDN):\n{}\nExpected output (EDN):\n{}",
+                if arguments == 1 {
+                    "input"
+                } else {
+                    "elements of the input as its arguments"
+                },
                 input.trim(),
                 example.expected.as_str().trim()
             ),

@@ -405,3 +405,31 @@ fn whole_value_types_change_the_accepted_contract_fingerprint() {
     doc.contract.as_mut().unwrap().output.value_type = ValueType::Map;
     assert_ne!(doc.spec_fingerprint(), before);
 }
+
+#[test]
+fn the_argument_count_is_part_of_the_specification_and_one_keeps_old_fingerprints() {
+    let mut doc = sample();
+    let before = doc.spec_fingerprint();
+    doc.project = Some(ProjectBinding {
+        namespace: "shop.orders".into(),
+        function: "totals".into(),
+        helpers: Vec::new(),
+        arguments: 1,
+        file: "(ns shop.orders)".into(),
+    });
+    assert_eq!(doc.spec_fingerprint(), before);
+    doc.project.as_mut().expect("bound").arguments = 2;
+    assert_ne!(doc.spec_fingerprint(), before);
+}
+
+#[test]
+fn drafts_without_a_project_binding_still_read() {
+    let doc = sample();
+    let json = serde_json::to_string(&doc).expect("serializes");
+    assert!(!json.contains("project"));
+    let back: FunctionDocument = serde_json::from_str(&json).expect("reads");
+    assert_eq!(back, doc);
+    let bound: ProjectBinding =
+        serde_json::from_str(r#"{"namespace":"a","function":"f"}"#).expect("defaults apply");
+    assert_eq!(bound.arguments, 1);
+}

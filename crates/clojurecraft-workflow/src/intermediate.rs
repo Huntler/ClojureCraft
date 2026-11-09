@@ -590,6 +590,7 @@ pub fn plan(doc: &FunctionDocument) -> Result<InspectionPlan, String> {
             namespace: &names.namespace,
             function: &names.function,
             allowed: &allowed,
+            arguments: names.arguments,
         },
     );
     let Some(function) = checked.function.clone().filter(|_| checked.problems.is_empty()) else {
@@ -609,6 +610,8 @@ pub fn plan(doc: &FunctionDocument) -> Result<InspectionPlan, String> {
     request.call_timeout = CALL_TIMEOUT;
     request.max_elements = MAX_ELEMENTS;
     request.probe_code = Some(instrumentation.code.clone());
+    request.spread = doc.arguments() != 1;
+    crate::project::prepare(doc, &mut request)?;
     Ok(InspectionPlan {
         instrumentation,
         examples: examples

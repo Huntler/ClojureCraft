@@ -17,6 +17,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 clojurecraft-runtime.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

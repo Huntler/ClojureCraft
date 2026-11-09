@@ -99,14 +99,31 @@ pub fn show(ui: &mut Ui, open: &mut OpenDocument, cx: &mut EditorContext<'_>) ->
     let mut changed = false;
     let status = open.status();
     changed |= header(ui, open, &status, cx);
-    if let Some(namespace) = &open.doc.namespace {
-        ui.label(
-            RichText::new(format!(
-                "Namespace {namespace}: the name above is its main function"
-            ))
-            .small()
-            .color(theme::MUTED),
-        );
+    if let Some(p) = &mut open.doc.project {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{}/{}", p.namespace, p.function))
+                    .monospace()
+                    .small()
+                    .color(theme::MUTED),
+            )
+            .on_hover_text(
+                "The function's namespace and name in the project; the name above is only shown here.",
+            );
+            ui.add_space(12.0);
+            ui.label(RichText::new("Arguments").small().color(theme::MUTED));
+            changed |= ui
+                .add(egui::DragValue::new(&mut p.arguments).range(0..=8))
+                .on_hover_text("How many arguments the function takes")
+                .changed();
+        });
+        if p.arguments != 1 {
+            ui.label(
+                RichText::new("Each example input is a vector of the arguments, such as [order 0.2].")
+                    .small()
+                    .color(theme::MUTED),
+            );
+        }
     }
     save_problem(ui, &status, cx);
     ui.add_space(14.0);

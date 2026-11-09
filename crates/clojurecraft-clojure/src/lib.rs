@@ -43,6 +43,9 @@ pub struct ClojureRuntime {
     pub sandbox_helper: PathBuf,
     /// Directory for the materialized harness script.
     pub work_dir: PathBuf,
+    /// The open project's classpath (source directories and dependency jars), readable and on
+    /// the classpath only for requests in project mode.
+    pub project_classpath: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,6 +235,20 @@ pub struct EvalRequest {
     /// Run the instrumented copy only for calls that failed (threw, returned a wrong value, or
     /// broke the output contract).
     pub probe_failing_only: bool,
+    /// Each input is a vector of arguments the function is applied to.
+    pub spread: bool,
+    /// `code` is a whole project namespace file (see [`ProjectEval`]).
+    pub project: Option<ProjectEval>,
+}
+
+/// A namespace file of a project, checked only where the function was written: the rest of the
+/// file is the user's own code and is loaded as it is, with the project's classpath.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectEval {
+    /// The top-level definitions the static checks and lint apply to.
+    pub checked: Vec<String>,
+    /// Namespaces the file requires; the checked definitions may use them.
+    pub namespaces: Vec<String>,
 }
 
 impl EvalRequest {
@@ -250,6 +267,8 @@ impl EvalRequest {
             output_chars: None,
             probe_code: None,
             probe_failing_only: false,
+            spread: false,
+            project: None,
         }
     }
 
@@ -275,6 +294,17 @@ impl EvalRequest {
             if self.probe_failing_only {
                 extra.push_str(" :probe-failing-only true");
             }
+        }
+        if self.spread {
+            extra.push_str(" :spread true");
+        }
+        if let Some(p) = &self.project {
+            let list = |items: &[String]| items.iter().map(|i| edn_string(i)).collect::<Vec<_>>().join(" ");
+            extra.push_str(&format!(
+                " :project {{:checked [{}] :namespaces [{}]}}",
+                list(&p.checked),
+                list(&p.namespaces)
+            ));
         }
         format!(
             "{{:code {} :fn {} :calls [{}] :checks {} :lint {}{contract} :equality {{:float-tolerance {:e} :unordered {}}} :call-ms {} :max-elements {}{extra}}}",
@@ -543,11 +573,14 @@ impl ClojureRuntime {
         Ok(path)
     }
 
-    fn policy(&self, harness: &Path, limits: &Limits) -> Policy {
+    fn policy(&self, harness: &Path, limits: &Limits, project: bool) -> Policy {
         let mut exec = Policy::system_library_dirs();
         exec.push(self.java_home.clone());
         let mut read = Policy::system_read_files();
         read.extend(self.jars.iter().cloned());
+        if project {
+            read.extend(self.project_classpath.iter().filter(|p| p.exists()).cloned());
+        }
         read.push(harness.to_owned());
         Policy {
             read,
@@ -558,9 +591,16 @@ impl ClojureRuntime {
         }
     }
 
-    fn jvm_args(&self, harness: &Path, limits: &Limits) -> Vec<String> {
+    fn jvm_args(&self, harness: &Path, limits: &Limits, project: bool) -> Vec<String> {
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let cp: Vec<String> = self.jars.iter().map(|j| j.display().to_string()).collect();
+        // The runtime's own Clojure comes first, so a project's Clojure jar never replaces it.
+        let extra = if project { &self.project_classpath[..] } else { &[] };
+        let cp: Vec<String> = self
+            .jars
+            .iter()
+            .chain(extra)
+            .map(|j| j.display().to_string())
+            .collect();
         vec![
             format!("-Xmx{}m", limits.heap_mb),
             "-Xss8m".into(),
@@ -593,7 +633,8 @@ impl ClojureRuntime {
         limits: &Limits,
     ) -> Result<ScriptOutcome, EvalError> {
         let script = self.script_path(stem, source)?;
-        let (status, stdout, stderr, elapsed) = self.run_sandboxed(&script, stdin, limits, None, |_| true)?;
+        let (status, stdout, stderr, elapsed) =
+            self.run_sandboxed(&script, stdin, limits, None, false, |_| true)?;
         Ok(ScriptOutcome {
             status,
             stdout,
@@ -608,13 +649,14 @@ impl ClojureRuntime {
         stdin: &[u8],
         limits: &Limits,
         cancel: Option<Arc<AtomicBool>>,
+        project: bool,
         completed: impl Fn(&str) -> bool,
     ) -> Result<(EvalStatus, String, String, Duration), EvalError> {
         let outcome: Outcome = run(&RunRequest {
             helper: self.sandbox_helper.clone(),
-            policy: self.policy(script, limits),
+            policy: self.policy(script, limits, project),
             program: self.java.clone(),
-            args: self.jvm_args(script, limits),
+            args: self.jvm_args(script, limits, project),
             env: vec![("LANG".into(), "C.UTF-8".into())],
             stdin: stdin.to_vec(),
             wall_timeout: limits.wall,
@@ -645,11 +687,17 @@ impl ClojureRuntime {
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<EvalOutcome, EvalError> {
         let harness = self.script_path("harness", HARNESS_SOURCE)?;
-        let (status, stdout, stderr, elapsed) =
-            self.run_sandboxed(&harness, req.to_edn().as_bytes(), limits, cancel, |out| {
+        let (status, stdout, stderr, elapsed) = self.run_sandboxed(
+            &harness,
+            req.to_edn().as_bytes(),
+            limits,
+            cancel,
+            req.project.is_some(),
+            |out| {
                 out.lines()
                     .any(|l| l == r#"{"event":"done"}"# || l == r#"{"event":"halted"}"#)
-            })?;
+            },
+        )?;
         Ok(EvalOutcome {
             status,
             report: HarnessReport::parse(&stdout),
@@ -696,6 +744,22 @@ mod tests {
         assert_eq!(
             r.to_edn(),
             r#"{:code "(ns a)" :fn "f" :calls [{:input "{:a 1}" :expected "\"s\""} {:input "2"}] :checks true :lint true :contract {:output {:type :map :keys [{:key ":total" :required true :type :integer :nil :disallowed}]}} :equality {:float-tolerance 1e-9 :unordered false} :call-ms 5000 :max-elements 1000000}"#
+        );
+    }
+
+    #[test]
+    fn project_requests_carry_their_checked_names_and_namespaces() {
+        let mut r = EvalRequest::new("(ns a)", "f", vec![]);
+        r.spread = true;
+        r.project = Some(ProjectEval {
+            checked: vec!["f".into(), "g".into()],
+            namespaces: vec!["shop.util".into()],
+        });
+        assert!(
+            r.to_edn()
+                .ends_with(r#":spread true :project {:checked ["f" "g"] :namespaces ["shop.util"]}}"#),
+            "{}",
+            r.to_edn()
         );
     }
 

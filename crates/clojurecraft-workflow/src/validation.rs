@@ -72,6 +72,8 @@ pub struct Plan {
     pub locals: Option<Locals>,
     /// The steps whose values the instrumented copy records (see [`crate::intermediate`]).
     pub steps: Option<StepProbes>,
+    /// For a project function: where `source`'s lines are in the namespace file that runs.
+    pub lines: Option<crate::project::LineMap>,
 }
 
 impl Plan {
@@ -202,14 +204,16 @@ pub fn plan_with_steps(
     step_lines: Option<StepLines>,
 ) -> Plan {
     let allowed = deps::allowed(doc);
-    let structure = structure::check(
+    let mut structure = structure::check(
         source,
         &Expectations {
             namespace: &names.namespace,
             function: &names.function,
             allowed: &allowed,
+            arguments: names.arguments,
         },
     );
+    let mut lines = None;
     let calls = planned_calls(doc);
     let output_rules = output_rules(doc);
     let equality = equality(doc);
@@ -232,6 +236,7 @@ pub fn plan_with_steps(
             r.equality = equality;
             r.call_timeout = CALL_TIMEOUT;
             r.max_elements = MAX_ELEMENTS;
+            r.spread = doc.arguments() != 1;
             let mut insertions = Vec::new();
             if let Some(lines) = step_lines.filter(|l| l.iter().any(|(_, r)| r.is_ok()))
                 && let Ok((targets, plans, ins)) = intermediate::step_probes(source, &lines)
@@ -258,7 +263,20 @@ pub fn plan_with_steps(
                 r.probe_code = Some(insert::apply(source, &insertions));
                 r.probe_failing_only = true;
             }
-            Some(r)
+            match crate::project::prepare(doc, &mut r) {
+                Ok(map) => {
+                    lines = map;
+                    Some(r)
+                }
+                Err(message) => {
+                    structure.problems.push(crate::Problem {
+                        kind: ProblemKind::Structure,
+                        message,
+                        line: None,
+                    });
+                    None
+                }
+            }
         }
         _ => None,
     };
@@ -271,6 +289,7 @@ pub fn plan_with_steps(
         request,
         locals,
         steps,
+        lines,
     }
 }
 
@@ -489,8 +508,46 @@ pub fn report(plan: &Plan, cx: ReportContext<'_>) -> ValidationReport {
     }
 }
 
+/// `outcome` with the namespace file's line numbers turned into the fragment's. A position
+/// outside the fragment is named in the message instead.
+fn to_fragment_lines(outcome: &EvalOutcome, map: &crate::project::LineMap) -> EvalOutcome {
+    let mut o = outcome.clone();
+    let fix = |e: &mut clojurecraft_clojure::HarnessError| {
+        if let Some(line) = e.line {
+            e.line = map.to_fragment(line);
+            if e.line.is_none() {
+                e.message = format!(
+                    "{} (line {line} of the namespace file, outside this function)",
+                    e.message
+                );
+            }
+        }
+        e.lines = e.lines.iter().filter_map(|l| map.to_fragment(*l)).collect();
+    };
+    let r = &mut o.report;
+    for stage in [&mut r.read, &mut r.check, &mut r.load] {
+        if let Some(Err(e)) = stage {
+            fix(e);
+        }
+    }
+    for result in &mut r.results {
+        if let Some(e) = &mut result.error {
+            fix(e);
+        }
+    }
+    for finding in r.lint.iter_mut().flatten() {
+        finding.line = finding.line.and_then(|l| map.to_fragment(l));
+    }
+    o
+}
+
 /// The checks of a validation, in the order of the sequence.
 fn checks(plan: &Plan, outcome: Result<&EvalOutcome, &str>) -> Vec<Check> {
+    let remapped = match (&plan.lines, outcome) {
+        (Some(map), Ok(o)) => Some(to_fragment_lines(o, map)),
+        _ => None,
+    };
+    let outcome = remapped.as_ref().map_or(outcome, Ok);
     let mut out = Vec::new();
     // Every check after the first one that stopped the sequence is skipped, with the reason.
     let mut stopped: Option<String> = None;
@@ -910,6 +967,7 @@ mod tests {
         Names {
             namespace: "totals.core".into(),
             function: "totals".into(),
+            arguments: 1,
         }
     }
 

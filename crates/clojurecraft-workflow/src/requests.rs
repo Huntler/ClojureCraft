@@ -23,18 +23,27 @@ pub const HISTORY_DROP_ORDER: u32 = 2;
 pub struct Names {
     pub namespace: String,
     pub function: String,
+    /// How many arguments the function takes.
+    pub arguments: u32,
 }
 
 impl Names {
-    /// `is_core` reports whether a symbol names a `clojure.core` var. A project namespace set on
-    /// the document is used as is.
+    /// `is_core` reports whether a symbol names a `clojure.core` var. A project function keeps
+    /// the namespace and symbol it has in its file.
     pub fn for_document(doc: &FunctionDocument, is_core: impl Fn(&str) -> bool) -> Self {
+        if let Some(p) = &doc.project {
+            return Self {
+                namespace: p.namespace.clone(),
+                function: p.function.clone(),
+                arguments: p.arguments,
+            };
+        }
         let function = naming::function_symbol(&doc.name, is_core);
-        let namespace = match doc.namespace.as_deref().map(str::trim) {
-            Some(ns) if !ns.is_empty() => ns.to_owned(),
-            _ => naming::namespace_for(&function),
-        };
-        Self { namespace, function }
+        Self {
+            namespace: naming::namespace_for(&function),
+            function,
+            arguments: 1,
+        }
     }
 }
 
@@ -217,15 +226,46 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
             namespace_list(&others)
         )
     };
-    let Names { namespace, function } = input.names;
+    let Names {
+        namespace,
+        function,
+        arguments,
+    } = input.names;
+    let (start, project) = match &input.doc.project {
+        Some(p) => (
+            format!(
+                "- Start with this ns declaration, adding a requirement only if you need one:\n{}\n",
+                crate::project::empty_fragment(p)
+            ),
+            format!(
+                "- The function belongs to the existing namespace {namespace}; its other definitions are \
+                 listed under \"Namespace\". Call them by name where useful, but do not define or change \
+                 them: write only {function} and the private helpers it needs, with names the namespace \
+                 does not use yet.\n"
+            ),
+        ),
+        None => (
+            format!(
+                "- Start with (ns {namespace}) and require namespaces only in its :require clause, as \
+                 [namespace :as alias].\n"
+            ),
+            String::new(),
+        ),
+    };
+    let signature = match *arguments {
+        1 => format!("({function} [input] …), taking one argument: the input value of an example"),
+        n => format!(
+            "({function} [{}] …), taking {n} arguments: the elements of an example's input vector",
+            (1..=n).map(|i| format!("arg{i}")).collect::<Vec<_>>().join(" ")
+        ),
+    };
     format!(
         "Write a Clojure {version} namespace implementing the transformation specified below.\n\
          Rules:\n\
-         - Start with (ns {namespace}) and require namespaces only in its :require clause, as \
-         [namespace :as alias].\n\
-         - Define exactly one public function, ({function} [input] …), taking one argument: the input \
-         value of an example. It must return the expected output of every example and accepted test, \
-         and follow the steps, the contract, and the user's answers.\n\
+         {start}\
+         - Define exactly one public function, {signature}. It must return the expected output of every \
+         example and accepted test, and follow the steps, the contract, and the user's answers.\n\
+         {project}\
          - Define helpers with defn-. Top-level forms other than defn, defn-, def, and declare are \
          not allowed. Write no comments and no example calls.\n\
          - Use {allowed}.{others}\n\
@@ -243,6 +283,19 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
 /// documentation.
 fn generation_sections(input: &GenerationInput<'_>) -> Vec<Section> {
     let mut sections = vec![task(generation_task(input))];
+    if let Some(p) = &input.doc.project {
+        let context = crate::project::context(p);
+        if !context.is_empty() {
+            sections.push(Section::required(
+                "Namespace",
+                Placement::User,
+                format!(
+                    "The other definitions of {}, which you may call but must not change:\n{context}",
+                    p.namespace
+                ),
+            ));
+        }
+    }
     sections.extend(spec::specification_sections(input.doc));
     sections.extend(crate::idioms::section(input.doc));
     sections.extend(input.documentation.clone());
@@ -497,14 +550,65 @@ mod tests {
     }
 
     #[test]
-    fn a_project_namespace_names_the_generated_namespace() {
+    fn a_project_function_keeps_its_namespace_and_symbol() {
         let mut d = doc();
-        d.namespace = Some("shop.orders.totals".into());
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "shop.orders".into(),
+            function: "valid-order?".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: String::new(),
+        });
         let names = Names::for_document(&d, |_| false);
-        assert_eq!(names.namespace, "shop.orders.totals");
-        assert_eq!(names.function, "order-totals");
-        d.namespace = Some("  ".into());
-        assert_eq!(Names::for_document(&d, |_| false).namespace, "order-totals.core");
+        assert_eq!(names.namespace, "shop.orders");
+        assert_eq!(names.function, "valid-order?");
+    }
+
+    #[test]
+    fn a_project_function_is_generated_against_its_namespace() {
+        let mut d = doc();
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "shop.orders".into(),
+            function: "price".into(),
+            helpers: Vec::new(),
+            arguments: 2,
+            file: "(ns shop.orders (:require [shop.util :as util]))\n\n\
+                   (defn label \"Names an order.\" [order] (util/clean (:name order)))\n"
+                .into(),
+        });
+        let names = Names::for_document(&d, |_| false);
+        let allowed = deps::allowed(&d);
+        assert!(allowed.contains("shop.util"));
+        let r = generation_request(GenerationInput {
+            doc: &d,
+            names: &names,
+            allowed: &allowed,
+            clojure_version: "1.12.6",
+            documentation: None,
+            seed: 1,
+        });
+        let text = all_text(&r);
+        assert!(
+            text.contains("(ns shop.orders\n  (:require [shop.util :as util]))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(price [arg1 arg2] …), taking 2 arguments"),
+            "{text}"
+        );
+        assert!(
+            text.contains("write only price and the private helpers"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(defn label [order])\n  ;; Names an order."),
+            "{text}"
+        );
+        assert!(text.contains("The function takes 2 arguments."), "{text}");
+        assert!(
+            text.contains("called with the elements of the input as its arguments"),
+            "{text}"
+        );
     }
 
     #[test]

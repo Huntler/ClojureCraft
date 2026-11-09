@@ -26,6 +26,7 @@ impl Candidate {
                 namespace: &names.namespace,
                 function: &names.function,
                 allowed,
+                arguments: names.arguments,
             },
         );
         Self {
@@ -135,6 +136,7 @@ mod tests {
         Names {
             namespace: "f.core".into(),
             function: "f".into(),
+            arguments: 1,
         }
     }
 

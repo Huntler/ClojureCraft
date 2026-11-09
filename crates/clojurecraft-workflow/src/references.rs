@@ -149,6 +149,7 @@ pub fn names_for(doc: &FunctionDocument) -> Names {
         Some(g) if !g.namespace.is_empty() && !g.function_name.is_empty() => Names {
             namespace: g.namespace.clone(),
             function: g.function_name.clone(),
+            arguments: doc.arguments(),
         },
         _ => Names::for_document(doc, |_| false),
     }
@@ -349,6 +350,7 @@ pub fn plan(
             namespace: &names.namespace,
             function: &names.function,
             allowed: &allowed,
+            arguments: names.arguments,
         },
     );
     let Some(function) = structure
@@ -379,6 +381,8 @@ pub fn plan(
     request.call_timeout = CALL_TIMEOUT;
     request.max_elements = MAX_ELEMENTS;
     request.output_chars = Some(MAX_SNAPSHOT_CHARS);
+    request.spread = up.arguments() != 1;
+    crate::project::prepare(up, &mut request).map_err(|e| ReferenceError::InvalidUpstreamCode(vec![e]))?;
     Ok(UpstreamPlan {
         example,
         source: source.clone(),

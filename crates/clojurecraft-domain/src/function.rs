@@ -51,10 +51,41 @@ pub struct FunctionDocument {
     /// compared with it instead of replacing it silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted: Option<crate::review::AcceptedCode>,
-    /// The project namespace the function's code lives in; `None` outside a project, where the
-    /// namespace is derived from the name.
+    /// Where the function lives in a Clojure project; `None` for a library function, whose
+    /// namespace is derived from its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
+    pub project: Option<ProjectBinding>,
+}
+
+/// A function defined in a namespace file of a project. Its implementation is a namespace that
+/// holds only the function and its own helpers; the rest of the file stays as it is and is
+/// loaded with it when the function is checked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectBinding {
+    pub namespace: String,
+    /// The function's symbol in the file.
+    pub function: String,
+    /// Private functions that belong to this function and are rewritten with it.
+    #[serde(default)]
+    pub helpers: Vec<String>,
+    /// How many arguments the function takes. With any number but one, each example input is a
+    /// vector of the arguments.
+    #[serde(default = "one_argument")]
+    pub arguments: u32,
+    /// The namespace's source file as last read: the code around the function.
+    #[serde(default)]
+    pub file: String,
+}
+
+fn one_argument() -> u32 {
+    1
+}
+
+impl ProjectBinding {
+    /// Whether example inputs are argument vectors.
+    pub fn spreads_arguments(&self) -> bool {
+        self.arguments != 1
+    }
 }
 
 impl FunctionDocument {
@@ -72,8 +103,13 @@ impl FunctionDocument {
             tests: Vec::new(),
             benchmarks: Vec::new(),
             accepted: None,
-            namespace: None,
+            project: None,
         }
+    }
+
+    /// How many arguments the function takes: one outside a project.
+    pub fn arguments(&self) -> u32 {
+        self.project.as_ref().map_or(1, |p| p.arguments)
     }
 
     pub fn example(&self, id: ExampleId) -> Option<&Example> {

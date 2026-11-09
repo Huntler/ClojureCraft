@@ -9,7 +9,12 @@
 ;;    :call-ms 5000 :max-elements 1000000
 ;;    :output-chars 4000000                              ; optional: print results unbounded up to this length
 ;;    :probe-code "<source with probes>"                ; optional: record intermediate values
-;;    :probe-failing-only true}                          ; optional: instrumented runs only of failing calls
+;;    :probe-failing-only true                           ; optional: instrumented runs only of failing calls
+;;    :spread true                                       ; optional: each input is a vector of arguments
+;;    :project {:checked ["f" "helper"] :namespaces ["my.util"]}}
+;;                                                       ; optional: :code is a whole project namespace file;
+;;                                                       ; only the :checked definitions are statically
+;;                                                       ; checked and linted, and they may use :namespaces
 ;; and writes one JSON object per line to stdout as it goes:
 ;;   read, check, lint, load       the stages before any call
 ;;   start {index}                 a call begins (so a process that dies mid-call is attributable)
@@ -48,6 +53,9 @@
 (def allowed-classes '#{Math StrictMath Long Integer Double Character Boolean})
 
 (def allowed-top-level '#{defn defn- def declare})
+
+;; Namespaces checked code may refer to; a project file adds the namespaces it requires.
+(def ^:dynamic *usable-namespaces* allowed-namespaces)
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Output
@@ -123,7 +131,7 @@
       :else
       (let [target (get aliases (symbol ns-part) (symbol ns-part))]
         (cond
-          (not (contains? allowed-namespaces target))
+          (not (contains? *usable-namespaces* target))
           (violation (str "namespace or class " ns-part " is not allowed") sym)
 
           (and (= target 'clojure.core) (contains? denied-core (symbol name-part)))
@@ -175,6 +183,44 @@
       (when-not (and (seq? f) (contains? allowed-top-level (first f)))
         (violation "only defn, defn-, def and declare are allowed at top level" f))
       (check-body aliases f))
+    (second (first forms))))
+
+(defn- project-aliases
+  "Validates a project file's ns form and returns {alias namespace}, whatever it requires."
+  [form]
+  (when-not (and (seq? form) (= 'ns (first form)) (symbol? (second form)))
+    (violation "the first form must be an ns declaration" form))
+  (let [options (fn [opts] (try (apply hash-map opts) (catch Throwable _ {})))
+        add (fn [acc lib opts]
+              (let [a (or (:as opts) (:as-alias opts))]
+                (cond-> acc (symbol? a) (assoc a lib))))]
+    (reduce
+     (fn [aliases clause]
+       (if (and (seq? clause) (= :require (first clause)))
+         (reduce (fn [acc spec]
+                   (cond
+                     (vector? spec) (add acc (first spec) (options (rest spec)))
+                     (seq? spec) (let [[prefix & specs] spec]
+                                   (reduce (fn [acc s]
+                                             (let [[lib & opts] (if (vector? s) s [s])]
+                                               (add acc (symbol (str prefix "." lib)) (options opts))))
+                                           acc specs))
+                     :else acc))
+                 aliases (rest clause))
+         aliases))
+     {} (drop 2 form))))
+
+(defn check-project-forms
+  "Checks only the definitions named in :checked; the rest of the file is the user's own code."
+  [forms {:keys [checked namespaces]}]
+  (let [aliases (project-aliases (first forms))
+        checked (set (map symbol checked))]
+    (binding [*usable-namespaces* (into allowed-namespaces (map symbol namespaces))]
+      (doseq [f (rest forms)
+              :when (and (seq? f) (contains? checked (second f)))]
+        (when-not (contains? allowed-top-level (first f))
+          (violation "only defn, defn-, def and declare are allowed at top level" f))
+        (check-body aliases f)))
     (second (first forms))))
 
 (defn- error-map [phase ^Throwable t]
@@ -385,9 +431,58 @@
       (vector? (first more)) (list (first more))
       (every? seq? more) (seq (map first (filter #(vector? (first %)) more))))))
 
+(declare lint-project lint-fresh)
+
 (defn lint
-  "Findings for the forms after `ns`, analysed in namespace `ns-obj` before any of them is evaluated."
-  [ns-obj forms]
+  "Findings for the forms after `ns`, analysed in namespace `ns-obj` before any of them is evaluated.
+  With `only` (a set of names), only the definitions named are analysed."
+  ([ns-obj forms] (lint ns-obj forms nil))
+  ([ns-obj forms only]
+   (if only
+     (lint-project ns-obj forms only)
+     (lint-fresh ns-obj forms))))
+
+(defn- defined-names
+  "The vars a top-level form defines, as far as that can be told without evaluating it."
+  [f]
+  (when (and (seq? f) (symbol? (first f)) (symbol? (second f)))
+    (let [[head n & more] f]
+      (cond
+        (contains? '#{defrecord deftype} head) [(symbol (str "->" n)) (symbol (str "map->" n))]
+        (= 'defprotocol head) (keep #(when (and (seq? %) (symbol? (first %))) (first %)) more)
+        (= 'declare head) (filter symbol? (rest f))
+        (.startsWith (name head) "def") [n]))))
+
+(defn- lint-project
+  "Lints only the definitions named in `only`, with every name the file defines resolvable."
+  [ns-obj forms only]
+  (let [ctx {:ns ns-obj :findings (atom []) :used-vars (atom #{})}
+        mine (filter #(and (seq? %) (contains? only (second %))) forms)]
+    (doseq [f forms
+            n (defined-names f)]
+      (try
+        (let [v (intern ns-obj (with-meta n {}))]
+          (when (contains? '#{defn defn-} (first f))
+            (alter-meta! v assoc :arglists (declared-arglists f))))
+        (catch Throwable _ nil)))
+    (doseq [f mine]
+      (try
+        (analyze f {} ctx (line-of f nil))
+        (catch Throwable t
+          (finding! ctx :warning (line-of f nil)
+                    (str "this form could not be fully analysed: " (.getMessage t))))))
+    (doseq [f mine
+            :when (= 'defn- (first f))
+            :let [v (get (ns-interns ns-obj) (second f))]
+            :when (and v (not (contains? @(:used-vars ctx) v)))]
+      ;; A helper may also be used by code outside the checked definitions.
+      (when-not (some #(and (seq? %) (not (contains? only (second %)))
+                            (some (fn [x] (= x (second f))) (flatten (seq %))))
+                      forms)
+        (finding! ctx :warning (line-of f nil) (str "private function " (second f) " is never used"))))
+    @(:findings ctx)))
+
+(defn- lint-fresh [ns-obj forms]
   (let [ctx {:ns ns-obj :findings (atom []) :used-vars (atom #{})}
         private (atom [])]
     ;; Make every top-level name resolvable, with its declared parameters for arity checks.
@@ -664,6 +759,11 @@
     (.join t (long ms))
     (if (realized? result) @result ::timeout)))
 
+(defn- invoke
+  "Calls f with the input, or with the input's elements as arguments."
+  [f input spread]
+  (if spread (apply f input) (f input)))
+
 (defn- call-once [f {:keys [input expected]} {:keys [call-ms max-elements equality contract] :as opts}]
   (let [sw (StringWriter.)
         out (bounded-writer sw max-captured-chars)
@@ -674,7 +774,7 @@
         run (in-thread
              (fn []
                (let [in (edn/read-string input)
-                     v (binding [*out* out] (f in))]
+                     v (binding [*out* out] (invoke f in (:spread opts)))]
                  ;; Lazy results are realized inside the time limit, so their errors and cost
                  ;; belong to this call.
                  (realize! v (long-array [max-elements]) 0)
@@ -882,7 +982,7 @@
           (reset! probe-state {})
           (let [run (in-thread
                      (fn []
-                       (let [v ((:fn setup) (edn/read-string (:input call)))]
+                       (let [v (invoke (:fn setup) (edn/read-string (:input call)) (:spread opts))]
                          (realize! v (long-array [max-elements]) 0)
                          v))
                      call-ms)
@@ -905,13 +1005,17 @@
 (defn run-request [{code :code fname :fn calls :calls checks :checks lint? :lint :as request}]
   (let [opts (merge {:call-ms 5000 :max-elements 1000000
                      :equality {:float-tolerance 1e-9 :unordered false}}
-                    (select-keys request [:call-ms :max-elements :equality :contract :output-chars]))
+                    (select-keys request [:call-ms :max-elements :equality :contract :output-chars :spread]))
+        project (:project request)
         forms (try (read-all code)
                    (catch Throwable t (emit (assoc (error-map :read t) :event "read" :ok false)) nil))]
     (when forms
       (emit {:event "read" :ok true :forms (count forms)})
       (when-let [ns-sym (try
-                          (let [n (if checks (check-forms forms) (second (first forms)))]
+                          (let [n (cond
+                                    (not checks) (second (first forms))
+                                    project (check-project-forms forms project)
+                                    :else (check-forms forms))]
                             (when checks (emit {:event "check" :ok true}))
                             n)
                           (catch Throwable t
@@ -923,12 +1027,14 @@
                          (eval (first forms))
                          (when lint?
                            (emit {:event "lint"
-                                  :findings (try (lint (the-ns ns-sym) (rest forms))
+                                  :findings (try (lint (the-ns ns-sym) (rest forms)
+                                                       (when project (set (map symbol (:checked project)))))
                                                  (catch Throwable t
                                                    [{:level :warning :message (str "lint could not run: " (.getMessage t))}]))})))
                        (binding [*ns* (create-ns 'clojurecraft.scratch)]
                          (refer-clojure)
                          (doseq [form forms] (eval form)))
+
                        (let [v (ns-resolve (the-ns ns-sym) (symbol fname))]
                          (if (and v (fn? @v))
                            (do (emit {:event "load" :ok true}) @v)

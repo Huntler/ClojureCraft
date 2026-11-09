@@ -474,6 +474,7 @@ fn clojure_runtime() -> Result<ClojureRuntime> {
         jars,
         sandbox_helper: helper,
         work_dir: dirs.root().join("harness"),
+        project_classpath: Vec::new(),
     })
 }
 

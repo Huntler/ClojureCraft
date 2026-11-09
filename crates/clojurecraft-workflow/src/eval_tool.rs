@@ -22,15 +22,18 @@ pub struct EvalTool {
     runtime: ClojureRuntime,
     /// The code the expression is evaluated with.
     code: String,
+    /// A project function's document: the expression then runs in its whole namespace file.
+    project: Option<clojurecraft_domain::FunctionDocument>,
 }
 
 impl EvalTool {
     /// The tool set of an analysis: this tool, a few calls per turn, a sandbox-sized time limit.
-    pub fn set(runtime: ClojureRuntime, code: &str) -> ToolSet {
+    pub fn set(runtime: ClojureRuntime, code: &str, doc: &clojurecraft_domain::FunctionDocument) -> ToolSet {
         ToolSet::new(
             vec![Arc::new(Self {
                 runtime,
                 code: code.to_owned(),
+                project: doc.project.is_some().then(|| doc.clone()),
             })],
             ToolLimits {
                 max_rounds: 4,
@@ -86,6 +89,9 @@ impl Tool for EvalTool {
         request.lint = false;
         request.call_timeout = Duration::from_secs(3);
         request.output_chars = Some(RESULT_CHARS);
+        if let Some(doc) = &self.project {
+            crate::project::prepare(doc, &mut request)?;
+        }
         // A cancelled request abandons the call (see `ToolSet::execute`); the sandbox's own
         // limits end the process.
         let outcome = self

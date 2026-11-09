@@ -54,6 +54,8 @@ pub struct ExecutionState {
     pub finished: Vec<(u64, Execution)>,
     pub install: InstallState,
     install_cancel: Option<Cancel>,
+    /// The open project's classpath, used by checks of project functions.
+    pub project_classpath: Vec<PathBuf>,
 }
 
 fn sandbox_helper() -> Option<PathBuf> {
@@ -108,6 +110,7 @@ impl ExecutionState {
             finished: Vec::new(),
             install: InstallState::Idle,
             install_cancel: None,
+            project_classpath: Vec::new(),
         }
     }
 
@@ -150,6 +153,7 @@ impl ExecutionState {
             jars,
             sandbox_helper: helper,
             work_dir: dirs.root().join("harness"),
+            project_classpath: self.project_classpath.clone(),
         })
     }
 

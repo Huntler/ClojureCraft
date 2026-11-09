@@ -66,6 +66,7 @@ pub fn names(doc: &FunctionDocument) -> Names {
         Some(g) if !g.namespace.is_empty() && !g.function_name.is_empty() => Names {
             namespace: g.namespace.clone(),
             function: g.function_name.clone(),
+            arguments: doc.arguments(),
         },
         _ => Names::for_document(doc, |_| false),
     };
@@ -79,11 +80,13 @@ pub fn names(doc: &FunctionDocument) -> Names {
             namespace: &recorded.namespace,
             function: &recorded.function,
             allowed: &allowed,
+            arguments: recorded.arguments,
         },
     );
     Names {
         namespace: found.namespace.unwrap_or(recorded.namespace),
         function: found.function.unwrap_or(recorded.function),
+        arguments: recorded.arguments,
     }
 }
 

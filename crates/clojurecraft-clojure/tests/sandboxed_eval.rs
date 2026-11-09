@@ -38,6 +38,7 @@ fn runtime() -> Option<ClojureRuntime> {
         jars,
         sandbox_helper: helper,
         work_dir,
+        project_classpath: Vec::new(),
     })
 }
 
@@ -586,4 +587,105 @@ fn api_documentation_comes_from_the_installed_clojure() {
             .iter()
             .any(|e| e["ns"] == "clojure.core" && e["name"] == "spread")
     );
+}
+
+/// A project with `shop/util.clj` on its classpath.
+fn project_runtime(rt: &ClojureRuntime) -> (ClojureRuntime, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("shop")).expect("dirs");
+    std::fs::write(
+        src.join("shop/util.clj"),
+        "(ns shop.util)\n(defn clean [s] (.trim ^String s))\n(def registry (atom {}))\n",
+    )
+    .expect("write");
+    let mut rt = rt.clone();
+    rt.project_classpath = vec![src.canonicalize().expect("canonical")];
+    (rt, dir)
+}
+
+const PROJECT_FILE: &str = "\
+(ns shop.orders
+  (:require [shop.util :as util]
+            [clojure.string :as str])
+  (:import (java.util UUID)))
+
+(def counter (atom 0))
+
+(defn- log! [x] (swap! counter inc) (println \"seen\" x) x)
+
+(defn- discount-of [order] (get order :discount 0))
+
+(defn price [order tax]
+  (-> (:amount order) (- (discount-of order)) (* (+ 1 tax))))
+
+(defn label [order]
+  (log! (str/upper-case (util/clean (:name order)))))
+";
+
+#[test]
+fn a_project_file_loads_with_its_classpath_and_checks_only_the_function() {
+    let Some(rt) = runtime() else { return };
+    let (rt, _dir) = project_runtime(&rt);
+    let mut req = EvalRequest::new(
+        PROJECT_FILE,
+        "price",
+        vec![call("[{:amount 100 :discount 10} 0.5]", Some("135.0"))],
+    );
+    req.spread = true;
+    req.project = Some(clojurecraft_clojure::ProjectEval {
+        checked: vec!["discount-of".into(), "price".into()],
+        namespaces: vec!["shop.util".into(), "clojure.string".into()],
+    });
+    let out = run(&rt, &req, Limits::default());
+    assert_eq!(out.report.check, Some(Ok(())), "{out:?}");
+    assert_eq!(out.report.load, Some(Ok(())), "{out:?}");
+    assert_eq!(out.report.lint, Some(Vec::new()), "{out:?}");
+    assert_eq!(out.report.results[0].matches, Some(true), "{out:?}");
+
+    // A function using another project namespace through its alias.
+    req.function = "label".into();
+    req.spread = false;
+    req.calls = vec![call("{:name \"  ann \"}", Some("\"ANN\""))];
+    req.project = Some(clojurecraft_clojure::ProjectEval {
+        checked: vec!["label".into()],
+        namespaces: vec!["shop.util".into(), "clojure.string".into()],
+    });
+    let out = run(&rt, &req, Limits::default());
+    assert_eq!(out.report.load, Some(Ok(())), "{out:?}");
+    assert_eq!(out.report.results[0].matches, Some(true), "{out:?}");
+}
+
+#[test]
+fn checked_project_definitions_stay_pure() {
+    let Some(rt) = runtime() else { return };
+    let (rt, _dir) = project_runtime(&rt);
+    let code = format!("{PROJECT_FILE}\n(defn sneaky [path] (slurp path))\n");
+    let mut req = EvalRequest::new(code, "sneaky", vec![call("\"/etc/hosts\"", None)]);
+    req.project = Some(clojurecraft_clojure::ProjectEval {
+        checked: vec!["sneaky".into()],
+        namespaces: vec!["shop.util".into(), "clojure.string".into()],
+    });
+    let out = run(&rt, &req, Limits::default());
+    let Some(Err(e)) = &out.report.check else {
+        panic!("{out:?}")
+    };
+    assert!(e.message.contains("slurp"), "{e:?}");
+}
+
+#[test]
+fn project_lint_reports_only_the_checked_definitions() {
+    let Some(rt) = runtime() else { return };
+    let (rt, _dir) = project_runtime(&rt);
+    let code = format!("{PROJECT_FILE}\n(defn broken [x] (let [unused 1] x))\n");
+    let mut req = EvalRequest::new(code, "broken", vec![call("1", Some("1"))]);
+    req.project = Some(clojurecraft_clojure::ProjectEval {
+        checked: vec!["broken".into()],
+        namespaces: vec!["shop.util".into(), "clojure.string".into()],
+    });
+    let out = run(&rt, &req, Limits::default());
+    let findings = out.report.lint.clone().expect("linted");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].message.contains("unused"), "{findings:?}");
+    assert_eq!(findings[0].line, Some(18));
 }

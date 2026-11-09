@@ -115,6 +115,13 @@ struct SpecProjection<'a> {
     /// Omitted when empty, so specifications without answers keep their earlier fingerprint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     clarifications: Vec<(&'a str, &'a str)>,
+    /// Omitted for one argument, so earlier fingerprints stay valid.
+    #[serde(skip_serializing_if = "is_one")]
+    arguments: u32,
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 #[derive(Serialize)]
@@ -175,6 +182,7 @@ impl FunctionDocument {
                 .answered_clarifications()
                 .map(|c| (c.question.as_str(), c.answer.as_str()))
                 .collect(),
+            arguments: self.arguments(),
         };
         Fingerprint::of("clojurecraft/spec/v1", &projection)
     }

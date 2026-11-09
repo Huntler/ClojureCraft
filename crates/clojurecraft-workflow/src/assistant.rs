@@ -1527,7 +1527,7 @@ impl Assistant {
             return;
         };
         let tools = match (ports.runtime(), &g.base) {
-            (Some(rt), Some(code)) => crate::eval_tool::EvalTool::set(rt, code),
+            (Some(rt), Some(code)) => crate::eval_tool::EvalTool::set(rt, code, &g.spec),
             _ => clojurecraft_inference::ToolSet::default(),
         };
         let request = requests::analysis_request(g.input(), &g.turns, tools);
@@ -1868,6 +1868,7 @@ fn current_names(doc: &FunctionDocument) -> Option<Names> {
         return Some(Names {
             namespace: g.namespace.clone(),
             function: g.function_name.clone(),
+            arguments: doc.arguments(),
         });
     }
     let allowed = deps::allowed(doc);
@@ -1877,11 +1878,13 @@ fn current_names(doc: &FunctionDocument) -> Option<Names> {
             namespace: "",
             function: "",
             allowed: &allowed,
+            arguments: doc.arguments(),
         },
     );
     Some(Names {
         namespace: s.namespace?,
         function: s.function?,
+        arguments: doc.arguments(),
     })
 }
 
