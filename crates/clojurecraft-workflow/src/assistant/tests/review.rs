@@ -96,15 +96,47 @@ fn proposed_edge_cases_are_added_for_review_without_changing_results() {
         ]}),
     );
     assert_eq!(updates, [Update::Edited(id)]);
+    // The current code runs on the cases, expecting the defined outputs.
+    assert_eq!(a.job().unwrap().phase, Phase::Comparing);
+    let run = p.validations.last().unwrap();
+    assert_eq!(run.calls[0].expected.as_deref(), Some("{}"));
+    assert_eq!(run.calls[1].expected, None);
+    let out = "{\"event\":\"load\",\"ok\":true}\n\
+               {\"event\":\"result\",\"index\":0,\"status\":\"ok\",\"actual\":\"nil\",\"match\":false}\n\
+               {\"event\":\"result\",\"index\":1,\"status\":\"ok\",\"actual\":\"{1 0}\"}\n";
+    let e = Execution {
+        outcome: Ok(EvalOutcome {
+            status: EvalStatus::Completed,
+            report: HarnessReport::parse(out),
+            stderr: String::new(),
+            elapsed: Duration::from_millis(1),
+        }),
+        environment: env(),
+    };
+    let updates = a.on_validated(p.validations.len() as u64, e, &mut d, &mut p);
+    assert_eq!(updates, [Update::Edited(id)]);
     assert!(a.job().is_none());
-    assert!(matches!(
-        a.report(id),
-        Some(Report::TestsProposed {
-            added: 2,
-            ambiguous: 1,
-            ..
-        })
-    ));
+    let Some(Report::TestsProposed {
+        added: 2,
+        ambiguous: 1,
+        notes,
+    }) = a.report(id)
+    else {
+        panic!("{:?}", a.report(id))
+    };
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("disagrees with 1 proposed case (no orders)")),
+        "{notes:?}"
+    );
+    let tests = &d.0[&id].tests;
+    assert!(
+        tests[0]
+            .notes
+            .ends_with("The current code returns nil, not the expected output.")
+    );
+    assert!(tests[1].notes.ends_with("The current code returns {1 0}."));
     let doc = &d.0[&id];
     assert_eq!(doc.tests.len(), 2);
     assert!(
@@ -161,6 +193,7 @@ fn regenerated_code_never_silently_replaces_the_accepted_version() {
     assert!(crate::replaces_silently(&d.0[&id]));
     generate_code(&mut a, &mut p, &mut d, id, FIXED);
     validated(&mut a, &mut p, &mut d, true);
+    compared_alike(&mut a, &mut p, &mut d);
     let updates = reply(&mut a, &mut p, &mut d, explanation());
     assert!(updates.is_empty(), "{updates:?}");
     let Some(Report::Pending(pending)) = a.report(id) else {
@@ -218,6 +251,7 @@ fn a_fix_repairs_the_current_code_with_every_accepted_case_and_waits_for_review(
     assert_eq!(req.calls.len(), 2);
     assert_eq!(req.calls[1].expected.as_deref(), Some("{}"));
     validated(&mut a, &mut p, &mut d, true);
+    compared_alike(&mut a, &mut p, &mut d);
     let updates = reply(&mut a, &mut p, &mut d, explanation());
     assert!(updates.is_empty(), "a fix is never applied without review");
     let Some(Report::Pending(pending)) = a.report(id) else {

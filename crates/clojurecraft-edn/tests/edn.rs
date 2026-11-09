@@ -121,6 +121,8 @@ fn scalar_errors_are_specific() {
         ("#inst \"yesterday\"", "RFC 3339"),
         ("#uuid \"nope\"", "#uuid"),
         ("#money 12", "unknown tag `#money`"),
+        ("#time/duration 30", "ISO-8601 string"),
+        ("#throws \"IllegalArgumentException\"", "exception class name"),
         ("a//b", "single `/`"),
         (":", "keyword name"),
         ("#_", "followed by the value"),
@@ -129,6 +131,27 @@ fn scalar_errors_are_specific() {
         let e = errors(src);
         assert!(e.iter().any(|(m, _)| m.contains(needle)), "{src}: {e:?}");
     }
+}
+
+#[test]
+fn java_time_tags_are_values() {
+    for src in [
+        "#time/duration \"PT30M\"",
+        "[#time/date \"2024-02-29\" #time/date-time \"2024-02-29T10:15\" #time/time \"10:15\"]",
+    ] {
+        assert!(errors(src).is_empty(), "{src}: {:?}", errors(src));
+    }
+}
+
+#[test]
+fn an_expected_exception_is_read_from_a_throws_tag() {
+    assert!(errors("#throws IllegalArgumentException").is_empty());
+    assert_eq!(
+        clojurecraft_edn::expected_throws(" #throws clojure.lang.ExceptionInfo "),
+        Some("clojure.lang.ExceptionInfo".to_owned())
+    );
+    assert_eq!(clojurecraft_edn::expected_throws("[#throws X]"), None);
+    assert_eq!(clojurecraft_edn::expected_throws("1"), None);
 }
 
 #[test]

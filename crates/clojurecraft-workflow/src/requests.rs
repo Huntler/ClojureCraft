@@ -17,6 +17,9 @@ pub const DOCUMENTATION_DROP_ORDER: u32 = 3;
 /// Drop order of the earlier turns of a fix conversation, oldest first, after the documentation
 /// and before the idioms.
 pub const HISTORY_DROP_ORDER: u32 = 2;
+/// Drop order of project definitions: after the documentation, before the earlier turns of a
+/// fix conversation (which come later in the prompt).
+pub const PROJECT_CODE_DROP_ORDER: u32 = 2;
 
 /// The namespace and function the generated code should define.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +170,13 @@ pub fn planning_request(doc: &FunctionDocument) -> Option<GenerateRequest> {
 }
 
 pub fn contract_request(doc: &FunctionDocument) -> GenerateRequest {
+    let arguments = match doc.arguments() {
+        1 => String::new(),
+        n => format!(
+            " The input is the vector of the function's {n} arguments in order; describe each \
+             argument by its position in the input description."
+        ),
+    };
     let text = format!(
         "Propose a contract for the transformation below: the input and output value types; for maps \
          (or collections of maps) their keys, whether each is required, its value type, and what nil \
@@ -174,7 +184,7 @@ pub fn contract_request(doc: &FunctionDocument) -> GenerateRequest {
          \"disallowed\", or \"unspecified\"); and the output order. Write keys as EDN, for example \
          :customer-id. Derive everything from the specification and the examples; where they do not \
          decide something, use \"unspecified\" or \"any\" instead of inventing a requirement. The user \
-         reviews the proposal before it applies. Answer with JSON only. {PART_NAMES}"
+         reviews the proposal before it applies.{arguments} Answer with JSON only. {PART_NAMES}"
     );
     request(
         Role::Interpretation,
@@ -192,6 +202,8 @@ pub struct GenerationInput<'a> {
     pub clojure_version: &'a str,
     /// Retrieved reference material, optional in the context policy.
     pub documentation: Option<Section>,
+    /// Definitions of the project that may be reused, optional like the documentation.
+    pub project_code: Option<Section>,
     pub seed: u64,
 }
 
@@ -208,10 +220,23 @@ fn namespace_list(names: &BTreeSet<String>) -> String {
 
 /// The task text of a generation request.
 pub fn generation_task(input: &GenerationInput<'_>) -> String {
-    let allowed = if input.allowed.is_empty() {
+    // Project namespaces are offered with the project code found for the task, not listed here.
+    let listed: BTreeSet<String> = match &input.doc.project {
+        Some(p) => {
+            let requires = crate::project::file_requires(&p.file);
+            input
+                .allowed
+                .iter()
+                .filter(|n| !p.usable.contains(*n) || requires.contains(*n))
+                .cloned()
+                .collect()
+        }
+        None => input.allowed.clone(),
+    };
+    let allowed = if listed.is_empty() {
         "clojure.core only".to_owned()
     } else {
-        format!("clojure.core and {}", namespace_list(input.allowed))
+        format!("clojure.core and {}", namespace_list(&listed))
     };
     let others: BTreeSet<String> = deps::supported()
         .into_iter()
@@ -239,8 +264,8 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
             ),
             format!(
                 "- The function belongs to the existing namespace {namespace}; its other definitions are \
-                 listed under \"Namespace\". Call them instead of writing the same logic again, but do \
-                 not define or change them: write only {function} and the private helpers it needs, with \
+                 listed under \"Namespace\". Call them instead of writing the same logic again, and \
+                 refer to a def by its name, never by its value, but do not define or change them: write only {function} and the private helpers it needs, with \
                  names the namespace does not use yet.\n"
             ),
         ),
@@ -265,7 +290,7 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
         ),
     };
     format!(
-        "Write a Clojure {version} namespace implementing the transformation specified below.\n\
+        "{opening}\n\
          Rules:\n\
          {start}\
          - Define exactly one public function, {signature}{period} It must return the expected output of \
@@ -274,13 +299,36 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
          - Define helpers with defn-. Top-level forms other than defn, defn-, def, and declare are \
          not allowed. {comments}\n\
          - Use {allowed}.{others}\n\
-         - The function must be pure: no I/O, printing, randomness, time, atoms, futures, agents, or \
-         dynamic vars; no eval, read-string, resolve, or other dynamic evaluation; no Java interop \
-         except static methods of Math, Long, Integer, Double, Character, and Boolean.\n\
+         - Keep the function free of side effects: no I/O, printing, atoms, futures, agents, or \
+         dynamic vars; no eval, read-string, resolve, or other dynamic evaluation. Avoid randomness \
+         and the current time unless the specification asks for them.\n\
+         - Java interop is allowed where Clojure has no equivalent (for example java.time): import \
+         classes in the ns declaration's :import clause, as (:import [java.time Instant Duration]), \
+         or write them fully qualified. Call a method of an object as (.method obj arg), for example \
+         (.plus d other), and a static method as (Class/method arg), for example (Duration/ofSeconds 5).\n\
          - Prefer clear, idiomatic clojure.core functions. Return eager collections (vectors, maps, \
          sets) unless the examples show a sequence.\n\
-         Answer with only the complete source in a ```clojure code block, nothing before or after it.",
-        version = input.clojure_version,
+         {closing}",
+        opening = match &input.doc.project {
+            Some(p) => format!(
+                "Write one function of the existing Clojure {} namespace {}, implementing the \
+                 transformation specified below.",
+                input.clojure_version, p.namespace
+            ),
+            None => format!(
+                "Write a Clojure {} namespace implementing the transformation specified below.",
+                input.clojure_version
+            ),
+        },
+        closing = if input.doc.project.is_some() {
+            format!(
+                "Answer with only the ns declaration, the private helpers you add, and {function} in a \
+                 ```clojure code block, nothing before or after it; the rest of the namespace stays as it is."
+            )
+        } else {
+            "Answer with only the complete source in a ```clojure code block, nothing before or after it."
+                .to_owned()
+        },
         period = if existing.is_some() { "" } else { "." },
         comments = if existing.is_some() {
             "Write no comments other than that docstring, and no example calls."
@@ -295,18 +343,20 @@ pub fn generation_task(input: &GenerationInput<'_>) -> String {
 fn generation_sections(input: &GenerationInput<'_>) -> Vec<Section> {
     let mut sections = vec![task(generation_task(input))];
     if let Some(p) = &input.doc.project {
-        let context = crate::project::context(p);
+        let context = crate::project::reference(p);
         if !context.is_empty() {
             sections.push(Section::required(
                 "Namespace",
                 Placement::User,
                 format!(
-                    "The other definitions of {}, which you may call but must not change:\n{context}",
+                    "{} already defines these; call them by name (a def too, instead of copying its \
+                     value), but do not write them in your answer:\n{context}",
                     p.namespace
                 ),
             ));
         }
     }
+    sections.extend(input.project_code.clone());
     sections.extend(spec::specification_sections(input.doc));
     sections.extend(crate::idioms::section(input.doc));
     sections.extend(input.documentation.clone());
@@ -423,11 +473,20 @@ pub fn feedback(
     } else {
         String::new()
     };
+    let hints: String = hints(code, failures)
+        .iter()
+        .map(|h| format!("Hint: {h}\n"))
+        .collect();
+    let hints = if hints.is_empty() {
+        hints
+    } else {
+        format!("{hints}\n")
+    };
     let feedback = format!(
         "That code was run in a sandbox on every example and accepted test. This is the code that \
          ran, after automatic cleanup; line numbers refer to it:\n```clojure\n{code}\n```\n\n\
          These checks failed (examples and tests are named as in the specification):\n{failures}\n\n\
-         {why}{tools} Do not write code yet. Answer with your analysis only, in at most six short \
+         {hints}{why}{tools} Do not write code yet. Answer with your analysis only, in at most six short \
          lines: {analysis}.",
         code = code.trim_end(),
     );
@@ -445,6 +504,88 @@ pub fn feedback(
          Answer in exactly this format and nothing else:\n```clojure\n{code_part}\n```"
     );
     (feedback, fix)
+}
+
+/// What a small model tends to misread in some errors, stated once: the usual cause of a known
+/// compiler or JVM message, when the code shows it.
+fn hints(code: &str, failures: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // `(Duration/plus a b)`: an instance method called like a static one.
+    let mut rest = failures;
+    while let Some(at) = rest.find("No matching method ") {
+        rest = &rest[at + "No matching method ".len()..];
+        let method: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+        let Some(class_at) = rest.find("for class ") else {
+            break;
+        };
+        let class: String = rest[class_at + "for class ".len()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$'))
+            .collect();
+        let short = class.rsplit('.').next().unwrap_or_default();
+        let called = format!("({short}/{method} ");
+        if short.is_empty() || method.is_empty() || !code.contains(&called) {
+            continue;
+        }
+        let hint = format!(
+            "({short}/{method} …) calls a static method of {short}, and there is none with these \
+             arguments. If {method} is a method of a {short} object, write (.{method} d …) with the \
+             object first, for example (.{method} d other); otherwise {short} has no {method}."
+        );
+        if !out.contains(&hint) {
+            out.push(hint);
+        }
+    }
+    // `(max d1 d2)` on java.time values and the like.
+    if let Some(class) = cast_class(failures, "java.lang.Number") {
+        out.push(format!(
+            "+, -, *, max, min, <, and > take numbers only, and a {class} is not one: compare such \
+             values with (compare a b), for example (if (pos? (compare a b)) a b), and combine them \
+             with their own methods, such as (.plus a b)."
+        ));
+    }
+    // `(-> n dec + 2)`, `((:x m))`: a value in call position.
+    if let Some(class) = cast_class(failures, "clojure.lang.IFn") {
+        out.push(format!(
+            "A {class} value was called as a function: look for parentheses around a value, or a \
+             threading step that is not a call, such as (-> n inc + 2) instead of (-> n inc (+ 2))."
+        ));
+    }
+    // A local with the name of a function hides it.
+    let marker = "because \"";
+    if failures.contains("clojure.lang.IFn.invoke")
+        && let Some(at) = failures.find(marker)
+    {
+        let local: String = failures[at + marker.len()..]
+            .chars()
+            .take_while(|c| *c != '"')
+            .collect::<String>()
+            .replace('_', "-");
+        let defined = [format!("(defn- {local} "), format!("(defn {local} ")]
+            .iter()
+            .any(|d| code.contains(d.as_str()));
+        if defined {
+            out.push(format!(
+                "A local named {local} hides the function {local}, so calling it calls the local's \
+                 value: give the local another name."
+            ));
+        }
+    }
+    if failures.contains("Too many arguments to if") {
+        out.push(
+            "if takes a test, a then-branch, and at most one else-branch; for more branches use cond.".into(),
+        );
+    }
+    out
+}
+
+/// The simple name of the class a value of which could not be cast to `target`, from a JVM
+/// ClassCastException message.
+fn cast_class(failures: &str, target: &str) -> Option<String> {
+    let end = failures.find(&format!("cannot be cast to class {target}"))?;
+    let start = failures[..end].rfind("class ")? + "class ".len();
+    let class = failures[start..end].trim();
+    Some(class.rsplit('.').next().unwrap_or(class).to_owned())
 }
 
 /// The conversation after the opening message: each earlier answer and the reply to it, and,
@@ -569,6 +710,7 @@ mod tests {
             helpers: Vec::new(),
             arguments: 1,
             file: String::new(),
+            usable: Vec::new(),
         });
         let names = Names::for_document(&d, |_| false);
         assert_eq!(names.namespace, "shop.orders");
@@ -586,6 +728,7 @@ mod tests {
             file: "(ns shop.orders (:require [shop.util :as util]))\n\n\
                    (defn label \"Names an order.\" [order] (util/clean (:name order)))\n"
                 .into(),
+            usable: Vec::new(),
         });
         let names = Names::for_document(&d, |_| false);
         let allowed = deps::allowed(&d);
@@ -596,6 +739,7 @@ mod tests {
             allowed: &allowed,
             clojure_version: "1.12.6",
             documentation: None,
+            project_code: None,
             seed: 1,
         });
         let text = all_text(&r);
@@ -612,10 +756,16 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("(defn label [order])\n  ;; Names an order."),
+            text.contains(
+                "- label (function of [order]): Names an order. Defined as \
+                 `(defn label \"Names an order.\" [order] (util/clean (:name order)))`"
+            ),
             "{text}"
         );
         assert!(text.contains("The function takes 2 arguments."), "{text}");
+        assert!(text.contains("do not write them in your answer"), "{text}");
+        assert!(text.contains("Write one function of the existing Clojure"));
+        assert!(text.contains("Answer with only the ns declaration, the private helpers you add, and price"));
         assert!(
             text.contains("called with the elements of the input as its arguments"),
             "{text}"
@@ -632,6 +782,7 @@ mod tests {
             arguments: 1,
             file: "(ns shop.orders)\n\n(defn label\n  \"Names an order.\"\n  [order]\n  (:name order))\n"
                 .into(),
+            usable: Vec::new(),
         });
         let names = Names::for_document(&d, |_| false);
         let r = generation_request(GenerationInput {
@@ -640,6 +791,7 @@ mod tests {
             allowed: &deps::allowed(&d),
             clojure_version: "1.12.6",
             documentation: None,
+            project_code: None,
             seed: 1,
         });
         let text = all_text(&r);
@@ -649,6 +801,36 @@ mod tests {
         );
         assert!(!text.contains("[input]"), "{text}");
         assert!(!text.contains("Write no comments."), "{text}");
+    }
+
+    #[test]
+    fn usable_project_namespaces_are_allowed_but_not_listed_in_the_task() {
+        let mut d = doc();
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "shop.orders".into(),
+            function: "label".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: "(ns shop.orders (:require [clojure.string :as str]))\n".into(),
+            usable: vec!["shop.util".into(), "xlib.ids".into()],
+        });
+        let names = Names::for_document(&d, |_| false);
+        let allowed = deps::allowed(&d);
+        assert!(allowed.contains("shop.util") && allowed.contains("xlib.ids"));
+        let text = generation_task(&GenerationInput {
+            doc: &d,
+            names: &names,
+            allowed: &allowed,
+            clojure_version: "1.12.6",
+            documentation: None,
+            project_code: None,
+            seed: 1,
+        });
+        assert!(
+            !text.contains("shop.util") && !text.contains("xlib.ids"),
+            "{text}"
+        );
+        assert!(text.contains("clojure.string"), "{text}");
     }
 
     #[test]
@@ -667,6 +849,7 @@ mod tests {
             allowed: &allowed,
             clojure_version: "1.12.6",
             documentation: Some(docs),
+            project_code: None,
             seed: 7,
         });
         assert_eq!(r.role, Role::Generation);
@@ -689,9 +872,12 @@ mod tests {
             "Example 1",
             "Q: Ties?\nA: by id",
             "[excerpt 1]",
+            "Java interop is allowed",
+            ":import clause",
         ] {
             assert!(t.contains(needle), "missing {needle:?}");
         }
+        assert!(!t.contains("no Java interop"), "{t}");
         let docs = r
             .sections
             .iter()
@@ -724,6 +910,7 @@ mod tests {
                 DOCUMENTATION_DROP_ORDER,
                 "[excerpt 1]",
             )),
+            project_code: None,
             seed: 9,
         };
         let focus = Focus::Call {
@@ -814,6 +1001,80 @@ mod tests {
         assert!(f.contains("Find out why the parse check failed."));
         assert!(f.contains("quote the reported problem and its line"));
         assert!(!f.contains("part of the input"));
+    }
+
+    #[test]
+    fn known_errors_come_with_a_hint() {
+        let code = "(ns a (:import [java.time Duration]))\n\
+                    (defn f [d e] (if (pos? (Duration/compareTo d e)) d e))";
+        let failures = "Load — error\n  line 2: IllegalArgumentException: No matching method compareTo \
+                        found taking 2 args for class java.time.Duration";
+        let (text, _) = feedback(code, failures, None, true, false);
+        assert!(
+            text.contains("(Duration/compareTo …) calls a static method"),
+            "{text}"
+        );
+        assert!(text.contains("(.compareTo d …)"), "{text}");
+        let (text, _) = feedback(
+            "(ns a)\n(defn f [x] (if x 1 2 3))",
+            "line 2: RuntimeException: Too many arguments to if",
+            None,
+            true,
+            false,
+        );
+        assert!(text.contains("use cond"), "{text}");
+        let (text, _) = feedback(
+            "(ns a)\n(defn f [a b] (max a b))",
+            "line 2: ClassCastException: class java.time.Duration cannot be cast to class \
+             java.lang.Number (java.time.Duration and java.lang.Number are in module java.base)",
+            None,
+            true,
+            false,
+        );
+        assert!(text.contains("a Duration is not one"), "{text}");
+        let (text, _) = feedback(
+            "(ns a)\n(defn f [n] (-> n dec + 2))",
+            "ClassCastException: class java.lang.Long cannot be cast to class clojure.lang.IFn (x)",
+            None,
+            true,
+            false,
+        );
+        assert!(text.contains("A Long value was called as a function"), "{text}");
+        let (text, _) = feedback(
+            "(ns a)\n(defn- max-delay [m] 1)\n(defn f [ms] (reduce (fn [max-delay m] (max-delay m)) nil ms))",
+            "NullPointerException: Cannot invoke \"clojure.lang.IFn.invoke(Object)\" because \"max_delay\" is null",
+            None,
+            true,
+            false,
+        );
+        assert!(
+            text.contains("A local named max-delay hides the function max-delay"),
+            "{text}"
+        );
+        let (plain, _) = feedback(
+            "(ns a)\n(defn f [x] x)",
+            "example 1: expected 1 but got 2",
+            None,
+            true,
+            false,
+        );
+        assert!(!plain.contains("Hint"), "{plain}");
+    }
+
+    #[test]
+    fn a_contract_for_several_arguments_describes_them_by_position_not_as_keys() {
+        let mut d = doc();
+        assert!(!all_text(&contract_request(&d)).contains("arguments"));
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "shop.orders".into(),
+            function: "price".into(),
+            helpers: Vec::new(),
+            arguments: 2,
+            file: "(ns shop.orders)\n".into(),
+            usable: Vec::new(),
+        });
+        let text = all_text(&contract_request(&d));
+        assert!(text.contains("vector of the function's 2 arguments"), "{text}");
     }
 
     #[test]

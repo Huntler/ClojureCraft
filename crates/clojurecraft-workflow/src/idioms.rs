@@ -65,6 +65,19 @@ const IDIOMS: &[(&[&str], &str)] = &[
          Iterate a grouped map with (for [[k ms] grouped] …); each entry is a [key values] pair.",
     ),
     (
+        &[
+            "second",
+            "first element",
+            "last element",
+            "part after",
+            "part before",
+            "nth",
+        ],
+        "Pick an element without a bounds check: (first xs), (second xs), (last xs), and \
+         (nth xs i nil) all return nil when the element is missing, so (when (> (count xs) 1) \
+         (nth xs 1)) is just (second xs).",
+    ),
+    (
         &["count", "how often", "occurrence", "frequency"],
         "Count occurrences: (frequencies xs) => {value count}.",
     ),
@@ -94,6 +107,16 @@ const IDIOMS: &[(&[&str], &str)] = &[
 /// The suffix idiom, also chosen by a number with a unit such as "5kg" in the steps or examples.
 const SUFFIX: usize = 5;
 
+/// For java.time values, chosen by their words or by time literals in the examples.
+const TIME: (&[&str], &str) = (
+    &["duration", "instant", "timestamp", "java.time"],
+    "java.time values are not numbers: max, min, +, -, <, and > throw on them. The later or \
+     longer of two: (if (pos? (compare a b)) a b); of many: \
+     (reduce (fn [a b] (if (pos? (compare a b)) a b)) Duration/ZERO ds). Add two Durations: \
+     (.plus a b); sum: (reduce (fn [a b] (.plus ^Duration a ^Duration b)) Duration/ZERO ds). Make \
+     one: (Duration/ofSeconds n), (Duration/ofMinutes n); shift an Instant: (.plus t d).",
+);
+
 /// Whether `text` has a digit directly followed by a letter, as in "5kg" or "800g".
 fn number_with_unit(text: &str) -> bool {
     text.as_bytes()
@@ -114,12 +137,24 @@ pub fn section(doc: &FunctionDocument) -> Option<Section> {
             ExampleInput::Direct { value } => number_with_unit(value.as_str()),
             ExampleInput::FunctionOutput { .. } => false,
         });
-    let chosen: Vec<&str> = IDIOMS
+    let mut chosen: Vec<&str> = IDIOMS
         .iter()
         .enumerate()
         .filter(|(i, (words, _))| words.iter().any(|w| text.contains(w)) || (*i == SUFFIX && units))
         .map(|(_, (_, idiom))| *idiom)
         .collect();
+    let time_literals = doc.examples.iter().any(|e| {
+        let input = match &e.input {
+            ExampleInput::Direct { value } => value.as_str(),
+            ExampleInput::FunctionOutput { .. } => "",
+        };
+        [input, e.expected.as_str()]
+            .iter()
+            .any(|v| v.contains("#time/") || v.contains("#inst"))
+    });
+    if time_literals || TIME.0.iter().any(|w| text.contains(w)) {
+        chosen.push(TIME.1);
+    }
     if chosen.is_empty() {
         return None;
     }
@@ -139,6 +174,20 @@ mod tests {
     use clojurecraft_domain::Step;
 
     use super::*;
+
+    #[test]
+    fn time_literals_in_the_examples_choose_the_java_time_idiom() {
+        let mut d = FunctionDocument::new("warmup");
+        d.description = "The longest wait of all models.".into();
+        assert!(section(&d).is_none());
+        d.examples = vec![clojurecraft_domain::Example::direct(
+            "",
+            clojurecraft_domain::Edn::new("[]"),
+            clojurecraft_domain::Edn::new("#time/duration \"PT0S\""),
+        )];
+        let s = section(&d).unwrap();
+        assert!(s.text.contains("(if (pos? (compare a b)) a b)"), "{}", s.text);
+    }
 
     #[test]
     fn idioms_are_chosen_by_the_specification_wording() {

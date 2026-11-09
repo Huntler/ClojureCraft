@@ -150,6 +150,18 @@ pub fn parse(src: &str) -> Parsed {
     p.out
 }
 
+/// The exception class an expected value names when it is `#throws Class`: the call is expected
+/// to throw rather than return.
+pub fn expected_throws(src: &str) -> Option<String> {
+    let parsed = parse_value(src);
+    match parsed.values.first().map(|v| &v.kind) {
+        Some(NodeKind::Tagged { tag, value }) if tag == "throws" && !parsed.has_errors() => {
+            Some(value.text(src).to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Parses text that must hold exactly one value (an example input or expected output). An empty
 /// text has no value and no diagnostics; more than one value is an error.
 pub fn parse_value(src: &str) -> Parsed {
@@ -477,9 +489,28 @@ impl Parser<'_> {
                     "`#uuid` needs a string such as \"3b2a9f30-6f0e-4bd8-9e64-0c6f1c1b4a52\"",
                 ),
             },
+            // java.time values, as the evaluation harness prints and reads them.
+            "time/duration" | "time/date" | "time/date-time" | "time/time" => match &value.kind {
+                NodeKind::String(_) => {}
+                _ => self.error(
+                    value.span.clone(),
+                    format!("`#{tag}` needs an ISO-8601 string, for example #time/duration \"PT30M\""),
+                ),
+            },
+            // An expected outcome: the call throws an exception of this class.
+            "throws" => match &value.kind {
+                NodeKind::Symbol => {}
+                _ => self.error(
+                    value.span.clone(),
+                    "`#throws` needs an exception class name, for example #throws IllegalArgumentException",
+                ),
+            },
             _ => self.error(
                 tag_span.clone(),
-                format!("unknown tag `#{tag}`: only `#inst` and `#uuid` can be read"),
+                format!(
+                    "unknown tag `#{tag}`: only `#inst`, `#uuid`, `#time/duration`, `#time/date`, \
+                     `#time/date-time`, `#time/time`, and `#throws` can be read"
+                ),
             ),
         }
         Some(Node {

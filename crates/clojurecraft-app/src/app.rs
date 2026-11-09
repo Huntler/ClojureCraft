@@ -51,6 +51,8 @@ mod review_actions;
 
 /// Toasts stay this long after the pointer or keyboard focus last left them.
 const TOAST_LIFETIME: Duration = Duration::from_secs(12);
+/// Quiet time after a project file was written before its code is indexed again.
+const REINDEX_DELAY: Duration = Duration::from_secs(3);
 /// The centre column never gets narrower than this; side columns give way first.
 const MIN_CENTER_WIDTH: f32 = 440.0;
 const STORAGE_LAST_FUNCTION: &str = "last-function";
@@ -143,6 +145,8 @@ pub struct ClojureCraftApp {
     quiet_open: HashSet<FunctionId>,
     /// The open Clojure project; the sidebar shows its namespaces instead of the library.
     project: Option<Project>,
+    /// When to index the project again after its files were written.
+    reindex_at: Option<Instant>,
     /// What is selected in the project tree.
     project_selection: Selection,
     /// The project's classpath while its dependencies are being resolved.
@@ -218,6 +222,7 @@ impl ClojureCraftApp {
             mcp_queue: mcp_actions::Queue::default(),
             quiet_open: HashSet::new(),
             project: None,
+            reindex_at: None,
             project_selection: Selection::default(),
             classpath: None,
             project_dialog: None,
@@ -866,6 +871,7 @@ impl ClojureCraftApp {
     }
 
     fn close_project(&mut self) {
+        self.knowledge.unload_project();
         self.project = None;
         self.project_selection = Selection::default();
         self.classpath = None;
@@ -888,6 +894,42 @@ impl ClojureCraftApp {
             Err(e) => self.toast_error(format!(
                 "The project's dependencies could not be resolved ({e}); checks only see its own sources."
             )),
+        }
+        self.index_project();
+    }
+
+    /// Indexes the open project's code with the classpath known so far.
+    fn index_project(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let (root, sources) = (project.root().to_owned(), project.source_dirs());
+        let classpath = self.execution.project_classpath.clone();
+        self.knowledge.index_project(&root, sources, classpath);
+    }
+
+    /// Gives the open project a newly built index's namespace graph, which decides what its
+    /// functions may require, and updates the open functions.
+    fn take_project_index(&mut self, ctx: &egui::Context) {
+        if let Some(at) = self.reindex_at {
+            let now = Instant::now();
+            if now < at {
+                ctx.request_repaint_after(at - now);
+            } else if self.classpath.is_none() {
+                self.reindex_at = None;
+                self.index_project();
+            }
+        }
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        let Some(graph) = self.knowledge.take_project_graph(project.root()) else {
+            return;
+        };
+        project.set_graph(graph);
+        let open: Vec<FunctionId> = self.docs.keys().copied().collect();
+        for id in open {
+            self.sync_project_document(id);
         }
     }
 
@@ -982,6 +1024,7 @@ impl ClojureCraftApp {
             .project
             .as_ref()
             .map(|p| (p.namespace.clone(), p.file.clone()));
+        let after_file = after.as_ref().map(|(_, f)| f.clone());
         let mut refreshed = Vec::new();
         if let Some((namespace, file)) = after
             && before.as_ref() != Some(&file)
@@ -996,8 +1039,11 @@ impl ClojureCraftApp {
         if let Err(e) = result {
             self.toast_error(e);
         }
-        for other in refreshed {
+        for other in refreshed.iter().copied() {
             self.submit(other, false);
+        }
+        if before.as_ref() != after_file.as_ref() {
+            self.reindex_at = Some(Instant::now() + REINDEX_DELAY);
         }
     }
 
@@ -1137,12 +1183,50 @@ impl ClojureCraftApp {
                 }
             });
         });
-        let status = if self.classpath.is_some() {
-            "Namespaces and functions · resolving dependencies…"
+        let (status, hover) = if self.classpath.is_some() {
+            (
+                "Namespaces and functions · resolving dependencies…".to_owned(),
+                String::new(),
+            )
+        } else if self.knowledge.indexing(project.root()) {
+            (
+                "Namespaces and functions · indexing code…".to_owned(),
+                String::new(),
+            )
         } else {
-            "Namespaces and functions"
+            match &self.knowledge.project_index {
+                Some(Ok(i)) => (
+                    format!("Namespaces and functions · {} definitions indexed", i.chunks),
+                    format!(
+                        "The model looks up existing code to reuse: {} definitions of the project and \
+                         {} dependency namespaces, {} of them not callable from generated code (side \
+                         effects). Search: {}.{}",
+                        i.chunks,
+                        i.libraries,
+                        i.restricted,
+                        if i.semantic {
+                            "words and meaning"
+                        } else {
+                            "words only (no embedding model)"
+                        },
+                        if i.unreadable.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Unreadable files: {}.", i.unreadable.join(", "))
+                        }
+                    ),
+                ),
+                Some(Err(e)) => (
+                    "Namespaces and functions · code not indexed".to_owned(),
+                    format!("Indexing the project failed: {e}"),
+                ),
+                None => ("Namespaces and functions".to_owned(), String::new()),
+            }
         };
-        ui.label(RichText::new(status).small().color(theme::MUTED));
+        let r = ui.label(RichText::new(status).small().color(theme::MUTED));
+        if !hover.is_empty() {
+            r.on_hover_text(hover);
+        }
         ui.add_space(6.0);
         let action = project_view::tree(ui, project, &self.project_selection);
         match action {
@@ -1719,12 +1803,19 @@ fn list_item(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
 }
 
 impl eframe::App for ClojureCraftApp {
+    /// Everything that does not draw: also run while the window is hidden, minimized, or covered,
+    /// so jobs, MCP requests, and saving go on without it.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_events();
+        self.poll_picker(ctx);
+        self.poll_classpath();
+        self.take_project_index(ctx);
+        self.review_frame();
+        self.save_project(ctx, false);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_events();
-        self.poll_picker(&ctx);
-        self.poll_classpath();
-        self.review_frame();
         self.handle_close(&ctx);
         self.shortcuts(&ctx);
 
@@ -1843,6 +1934,7 @@ impl eframe::App for ClojureCraftApp {
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(20.0))
             .show(ui, |ui| self.center(ui));
 
+        // Edits made in this pass are saved now rather than in the next pass's logic.
         self.save_project(&ctx, false);
         self.toasts(&ctx);
         self.dialog(&ctx);

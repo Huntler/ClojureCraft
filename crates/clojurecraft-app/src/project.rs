@@ -160,6 +160,8 @@ pub struct Project {
     files: BTreeMap<String, SourceFile>,
     /// Since when `config` holds changes not yet written.
     dirty_since: Option<Instant>,
+    /// Indexed namespaces and the ones each requires, once the project is indexed.
+    graph: Option<BTreeMap<String, std::collections::BTreeSet<String>>>,
 }
 
 impl Project {
@@ -211,6 +213,7 @@ impl Project {
             config,
             files,
             dirty_since: None,
+            graph: None,
         };
         if changed {
             project.save()?;
@@ -245,6 +248,14 @@ impl Project {
 
     fn spec(&self, namespace: &str, function: &str) -> Option<&FunctionSpec> {
         self.config.namespaces.get(namespace)?.functions.get(function)
+    }
+
+    /// Every function with its namespace and symbol, by namespace.
+    pub fn specs(&self) -> impl Iterator<Item = (&str, &str, &FunctionSpec)> {
+        self.config
+            .namespaces
+            .iter()
+            .flat_map(|(ns, c)| c.functions.iter().map(move |(f, s)| (ns.as_str(), f.as_str(), s)))
     }
 
     /// The namespace and symbol of a project function.
@@ -310,7 +321,22 @@ impl Project {
             helpers: spec.helpers.clone(),
             arguments: spec.arguments,
             file: self.content(namespace),
+            usable: self.usable(namespace),
         }
+    }
+
+    /// The namespaces a function of `namespace` may require, from the project index; empty
+    /// until the project is indexed.
+    fn usable(&self, namespace: &str) -> Vec<String> {
+        self.graph
+            .as_ref()
+            .map(|g| clojurecraft_workflow::project_index::usable(g, namespace))
+            .unwrap_or_default()
+    }
+
+    /// Takes the namespace graph of a finished project index.
+    pub fn set_graph(&mut self, graph: BTreeMap<String, std::collections::BTreeSet<String>>) {
+        self.graph = Some(graph);
     }
 
     /// A new document for a function: its specification and its code in the file.
@@ -382,8 +408,10 @@ impl Project {
             helpers: Vec::new(),
             arguments: 1,
             file: String::new(),
+            usable: Vec::new(),
         });
         binding.file = self.content(&namespace);
+        binding.usable = self.usable(&namespace);
         let mut result = Ok(());
         if let Some(source) = doc.implementation.as_ref().map(|i| i.source.clone()) {
             match code::compose(&binding, &source) {

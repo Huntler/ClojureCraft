@@ -24,7 +24,7 @@ impl Applied {
     /// A one-line description of the change.
     pub fn summary(&self) -> String {
         if self.rewritten {
-            return "The model rewrote the whole namespace.".into();
+            return "The model answered with all of its code rather than only the forms it changed.".into();
         }
         let mut parts = Vec::new();
         if !self.replaced.is_empty() {

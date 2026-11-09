@@ -8,5 +8,6 @@ pub mod parse;
 
 pub use lex::{Class, Delim, Token, TokenKind, highlight, tokenize};
 pub use parse::{
-    Diagnostic, MAX_DEPTH, Node, NodeKind, Parsed, Severity, char_index, line_col, parse, parse_value,
+    Diagnostic, MAX_DEPTH, Node, NodeKind, Parsed, Severity, char_index, expected_throws, line_col, parse,
+    parse_value,
 };

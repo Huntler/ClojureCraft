@@ -416,6 +416,7 @@ fn the_argument_count_is_part_of_the_specification_and_one_keeps_old_fingerprint
         helpers: Vec::new(),
         arguments: 1,
         file: "(ns shop.orders)".into(),
+        usable: Vec::new(),
     });
     assert_eq!(doc.spec_fingerprint(), before);
     doc.project.as_mut().expect("bound").arguments = 2;

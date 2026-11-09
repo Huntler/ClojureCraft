@@ -55,6 +55,11 @@ pub struct Layout {
     /// The first `(:require …)` clause.
     require_clause: Option<Range<usize>>,
     pub requires: Vec<Require>,
+    /// The first `(:import …)` clause.
+    import_clause: Option<Range<usize>>,
+    /// Imported classes, fully qualified, and each import as written.
+    pub imports: Vec<String>,
+    import_texts: Vec<String>,
     pub definitions: Vec<Definition>,
     /// Every top-level form after the `ns` declaration.
     forms: Vec<Range<usize>>,
@@ -99,7 +104,7 @@ pub fn layout(src: &str) -> Result<Layout, String> {
 }
 
 /// The span of a form including any metadata in front of it.
-fn full_span(form: &Form) -> Range<usize> {
+pub(crate) fn full_span(form: &Form) -> Range<usize> {
     match form {
         Form::Meta { meta, target } => {
             let start = full_span(meta).start.saturating_sub(1);
@@ -109,9 +114,33 @@ fn full_span(form: &Form) -> Range<usize> {
     }
 }
 
+fn read_imports(src: &str, parts: &[Form], out: &mut Layout) {
+    for spec in parts {
+        out.import_texts.push(src[full_span(spec)].to_owned());
+        if let Some(class) = spec.symbol() {
+            out.imports.push(class.to_owned());
+        } else if let Some([package, classes @ ..]) = spec.vector().or_else(|| spec.list()) {
+            let Some(package) = package.symbol() else { continue };
+            out.imports.extend(
+                classes
+                    .iter()
+                    .filter_map(Form::symbol)
+                    .map(|c| format!("{package}.{c}")),
+            );
+        }
+    }
+}
+
 fn read_requires(src: &str, clauses: &[Form], out: &mut Layout) {
     for clause in clauses {
         let parts = clause.list().unwrap_or_default();
+        if parts.first().and_then(Form::keyword) == Some(":import") {
+            if out.import_clause.is_none() {
+                out.import_clause = Some(full_span(clause));
+            }
+            read_imports(src, &parts[1..], out);
+            continue;
+        }
         if parts.first().and_then(Form::keyword) != Some(":require") {
             continue;
         }
@@ -272,11 +301,19 @@ pub fn owned_helpers(src: &str, function: &str) -> Vec<String> {
 
 /// The `ns` declaration of a fragment: the file's namespace with all of its requirements.
 fn fragment_ns(layout: &Layout, namespace: &str) -> String {
-    if layout.requires.is_empty() {
-        return format!("(ns {namespace})");
+    let mut out = format!("(ns {namespace}");
+    if !layout.requires.is_empty() {
+        let specs: Vec<&str> = layout.requires.iter().map(|r| r.text.as_str()).collect();
+        out.push_str(&format!("\n  (:require {})", specs.join("\n            ")));
     }
-    let specs: Vec<&str> = layout.requires.iter().map(|r| r.text.as_str()).collect();
-    format!("(ns {namespace}\n  (:require {}))", specs.join("\n            "))
+    if !layout.import_texts.is_empty() {
+        out.push_str(&format!(
+            "\n  (:import {})",
+            layout.import_texts.join("\n           ")
+        ));
+    }
+    out.push(')');
+    out
 }
 
 /// The function's fragment as it is in `binding.file`: the `ns` declaration, its helpers, and
@@ -351,11 +388,126 @@ fn skip_space(src: &str, at: usize) -> usize {
     at + src[at..].len() - src[at..].trim_start().len()
 }
 
+/// `text` without whitespace and comments between its tokens.
+fn normalized(text: &str) -> String {
+    clojurecraft_edn::tokenize(text)
+        .into_iter()
+        .filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .map(|t| &text[t.span])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What a definition does: its form without the `defn`/`defn-` distinction, metadata on the
+/// name, a docstring, an attribute map, whitespace, and comments.
+fn essence(src: &str, span: Range<usize>) -> Option<String> {
+    let text = &src[span];
+    let forms = read_all(text).ok()?;
+    let items = forms.first()?.list()?;
+    let head = items.first()?.symbol()?;
+    let mut rest = items.get(2..)?;
+    if rest.len() > 1 && rest[0].is_string() {
+        rest = &rest[1..];
+    }
+    let function = matches!(head, "defn" | "defn-");
+    if function
+        && rest.len() > 1
+        && matches!(
+            rest[0].bare(),
+            Form::Seq {
+                delim: Delim::Brace,
+                ..
+            }
+        )
+    {
+        rest = &rest[1..];
+    }
+    let parts: Vec<String> = rest.iter().map(|f| normalized(&text[full_span(f)])).collect();
+    Some(format!(
+        "{} {}",
+        if function { "defn" } else { head },
+        parts.join(" ")
+    ))
+}
+
+/// Copies of definitions the rest of the file already has, which [`drop_copies`] left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Copies {
+    /// Same as in the file, apart from `defn`/`defn-`, metadata on the name, and docstring.
+    pub unchanged: Vec<String>,
+    /// Changed: the file's version is kept, since only the function and its helpers may change.
+    pub changed: Vec<String>,
+}
+
+impl Copies {
+    pub fn is_empty(&self) -> bool {
+        self.unchanged.is_empty() && self.changed.is_empty()
+    }
+
+    /// A note on what was left out, or nothing.
+    pub fn note(&self, binding: &ProjectBinding) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !self.unchanged.is_empty() {
+            parts.push(format!("unchanged copies of {}", self.unchanged.join(", ")));
+        }
+        if !self.changed.is_empty() {
+            parts.push(format!("changed copies of {}", self.changed.join(", ")));
+        }
+        Some(format!(
+            "Removed {}, which {} already defines; only {} and its helpers change.",
+            parts.join(" and "),
+            binding.namespace,
+            binding.function
+        ))
+    }
+}
+
+/// `fragment` without the definitions the rest of the file already has: models that rewrite
+/// the whole namespace copy definitions they were only shown, often made private, without their
+/// docstring, or changed. The file's own versions are kept.
+pub fn drop_copies(binding: &ProjectBinding, fragment: &str) -> (String, Copies) {
+    let (Ok(file), Ok(fr)) = (layout(&binding.file), layout(fragment)) else {
+        return (fragment.to_owned(), Copies::default());
+    };
+    let owned = owned_names(binding);
+    let mut copies: Vec<&Definition> = Vec::new();
+    let mut found = Copies::default();
+    for d in fr.definitions.iter().filter(|d| !owned.contains(d.name.as_str())) {
+        let Some(original) = file.definitions.iter().find(|f| f.name == d.name) else {
+            continue;
+        };
+        let copy = essence(fragment, d.span.clone());
+        let list = if copy.is_some() && copy == essence(&binding.file, original.span.clone()) {
+            &mut found.unchanged
+        } else {
+            &mut found.changed
+        };
+        if !list.contains(&d.name) {
+            list.push(d.name.clone());
+        }
+        copies.push(d);
+    }
+    let mut out = fragment.to_owned();
+    for d in copies.iter().rev() {
+        out.replace_range(d.span.start..skip_space(fragment, d.span.end), "");
+    }
+    (out, found)
+}
+
 /// `binding.file` with the function's definitions replaced by those of `fragment`, and any
-/// requirement the fragment adds merged into the file's `ns` declaration. The rest of the file is
+/// requirement or import the fragment adds merged into the file's `ns` declaration. The rest of the file is
 /// kept byte for byte.
 pub fn compose(binding: &ProjectBinding, fragment: &str) -> Result<Composed, String> {
     let file = binding.file.as_str();
+    if file.trim().is_empty() {
+        return Err(format!(
+            "the file of {} is empty or no longer exists (was the branch switched?)",
+            binding.namespace
+        ));
+    }
     let fl = layout(file).map_err(|e| format!("the namespace file cannot be read: {e}"))?;
     let fr = layout(fragment)?;
     let ns_span = fl
@@ -368,13 +520,22 @@ pub fn compose(binding: &ProjectBinding, fragment: &str) -> Result<Composed, Str
     let body_range = first.start..last.end;
     let body = &fragment[body_range.clone()];
     let owned = owned_names(binding);
-    for d in &fr.definitions {
-        if !owned.contains(d.name.as_str()) && fl.definitions.iter().any(|f| f.name == d.name) {
-            return Err(format!(
-                "{} is already defined elsewhere in {}; give the new definition another name",
-                d.name, binding.namespace
-            ));
-        }
+    let clashes: Vec<&str> = fr
+        .definitions
+        .iter()
+        .filter(|d| !owned.contains(d.name.as_str()) && fl.definitions.iter().any(|f| f.name == d.name))
+        .map(|d| d.name.as_str())
+        .collect();
+    if !clashes.is_empty() {
+        let (names, verb) = match clashes.as_slice() {
+            [one] => ((*one).to_owned(), "is"),
+            many => (many.join(", "), "are"),
+        };
+        return Err(format!(
+            "{names} {verb} already defined elsewhere in {}; write only {} and its own helpers \
+             (the rest of the namespace is kept as it is), and give a new helper a name of its own",
+            binding.namespace, binding.function
+        ));
     }
 
     // (span to replace, replacement, whether the body goes here)
@@ -398,6 +559,32 @@ pub fn compose(binding: &ProjectBinding, fragment: &str) -> Result<Composed, Str
                 edits.push((
                     at..at,
                     format!("\n  (:require {})", added.join("\n            ")),
+                    false,
+                ));
+            }
+        }
+    }
+    let imported: Vec<String> = fr
+        .imports
+        .iter()
+        .filter(|c| !fl.imports.contains(c))
+        .map(|c| match c.rsplit_once('.') {
+            Some((package, class)) => format!("[{package} {class}]"),
+            None => c.clone(),
+        })
+        .collect();
+    if !imported.is_empty() {
+        match &fl.import_clause {
+            Some(clause) => {
+                let at = clause.end - 1;
+                let text: String = imported.iter().map(|t| format!("\n           {t}")).collect();
+                edits.push((at..at, text, false));
+            }
+            None => {
+                let at = ns_span.end - 1;
+                edits.push((
+                    at..at,
+                    format!("\n  (:import {})", imported.join("\n           ")),
                     false,
                 ));
             }
@@ -462,21 +649,26 @@ pub fn compose(binding: &ProjectBinding, fragment: &str) -> Result<Composed, Str
 }
 
 /// A top-level definition as the model is told about it.
-struct Summary {
-    head: String,
-    name: String,
+pub(crate) struct Summary {
+    pub head: String,
+    pub name: String,
     /// The docstring as written, quotes included.
-    doc: Option<String>,
+    pub doc: Option<String>,
     /// For functions: each parameter vector as written.
-    arglists: Vec<String>,
+    pub arglists: Vec<String>,
     /// For `def`: the value as written, shortened.
-    value: Option<String>,
+    pub value: Option<String>,
+    /// The whole definition as written.
+    pub source: String,
 }
 
 /// Longest `def` value shown in full.
 const MAX_VALUE_CHARS: usize = 200;
+/// Functions of the namespace up to this long are shown whole, so the model sees what they
+/// return (a string or a keyword, say) and not only their parameters.
+const SHORT_FUNCTION_CHARS: usize = 300;
 
-fn summarize(file: &str, form: &Form) -> Option<Summary> {
+pub(crate) fn summarize(file: &str, form: &Form) -> Option<Summary> {
     let items = form.list()?;
     let head = items.first().and_then(Form::symbol)?;
     let name = items.get(1).and_then(Form::symbol)?;
@@ -537,6 +729,7 @@ fn summarize(file: &str, form: &Form) -> Option<Summary> {
         doc,
         arglists,
         value,
+        source: file[full_span(form)].to_owned(),
     })
 }
 
@@ -554,8 +747,8 @@ fn top_level(binding: &ProjectBinding) -> Vec<Summary> {
         .collect()
 }
 
-/// The rest of the namespace, as the model may use it: each other definition's signature (or a
-/// def's value) and docstring.
+/// The rest of the namespace, as the model may use it: each short function as written, and each
+/// other definition's signature (or a def's value) and docstring.
 pub fn context(binding: &ProjectBinding) -> String {
     let owned = owned_names(binding);
     let mut out = Vec::new();
@@ -563,6 +756,11 @@ pub fn context(binding: &ProjectBinding) -> String {
         .into_iter()
         .filter(|d| !owned.contains(d.name.as_str()))
     {
+        let short = d.source.chars().count() <= SHORT_FUNCTION_CHARS;
+        if matches!(d.head.as_str(), "defn" | "defn-") && short {
+            out.push(d.source.clone());
+            continue;
+        }
         let mut line = format!("({} {}", d.head, d.name);
         if !d.arglists.is_empty() {
             line.push(' ');
@@ -583,6 +781,50 @@ pub fn context(binding: &ProjectBinding) -> String {
     out.join("\n")
 }
 
+/// The rest of the namespace as a reference list for writing code, one line per definition:
+/// its name, parameters (or a def's value), and docstring, and for a short function its source on
+/// one line. Unlike [`context`] nothing reads as a top-level form, so the model does not copy the
+/// namespace into its answer.
+pub fn reference(binding: &ProjectBinding) -> String {
+    let owned = owned_names(binding);
+    let mut out = Vec::new();
+    for d in top_level(binding)
+        .into_iter()
+        .filter(|d| !owned.contains(d.name.as_str()))
+    {
+        let function = matches!(d.head.as_str(), "defn" | "defn-");
+        let mut line = format!("- {}", d.name);
+        if function {
+            line.push_str(&format!(
+                " ({}function{})",
+                if d.head == "defn-" { "private " } else { "" },
+                if d.arglists.is_empty() {
+                    String::new()
+                } else {
+                    format!(" of {}", d.arglists.join(" or "))
+                }
+            ));
+        } else if let Some(v) = &d.value {
+            line.push_str(&format!(" = {}", one_line(v)));
+        } else {
+            line.push_str(&format!(" ({})", d.head));
+        }
+        if let Some(doc) = &d.doc {
+            line.push_str(&format!(": {}", one_line(doc.trim_matches('"'))));
+        }
+        if function && d.source.chars().count() <= SHORT_FUNCTION_CHARS {
+            let stop = if line.ends_with('.') { "" } else { "." };
+            line.push_str(&format!("{stop} Defined as `{}`", one_line(&d.source)));
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The head of the function's current definition: its docstring and parameter vectors as
 /// written, for the model to keep. `None` when the file does not define it yet.
 pub fn signature(binding: &ProjectBinding) -> Option<String> {
@@ -598,6 +840,27 @@ pub fn signature(binding: &ProjectBinding) -> Option<String> {
     }
     out.push_str("\n  …)");
     Some(out)
+}
+
+/// The definitions of the namespace and of other namespaces that the `current` fragment uses and
+/// the `new` one does not: new code that passes the same examples may have written a constant's
+/// value or a helper's body in place of the definition.
+pub fn dropped_references(binding: &ProjectBinding, current: &str, new: &str) -> Vec<String> {
+    let file_defs: BTreeSet<String> = layout(&binding.file)
+        .map(|l| l.definitions.into_iter().map(|d| d.name).collect())
+        .unwrap_or_default();
+    let uses = |fragment: &str| -> BTreeSet<String> {
+        let own: BTreeSet<String> = layout(fragment)
+            .map(|l| l.definitions.into_iter().map(|d| d.name).collect())
+            .unwrap_or_default();
+        let mut out: BTreeSet<String> = crate::locals::free_symbols(fragment)
+            .into_iter()
+            .filter(|s| file_defs.contains(s) && !own.contains(s))
+            .collect();
+        out.extend(crate::project_index::external_calls(&binding.file, fragment));
+        out
+    };
+    uses(current).difference(&uses(new)).cloned().collect()
 }
 
 /// Turns a request for `doc`'s fragment into one for its whole file. Returns where the
@@ -654,7 +917,35 @@ mod tests {
             helpers: helpers.iter().map(|h| (*h).to_owned()).collect(),
             arguments: 1,
             file: FILE.into(),
+            usable: Vec::new(),
         }
+    }
+
+    #[test]
+    fn definitions_the_current_code_uses_and_the_new_code_does_not_are_named() {
+        let b = binding("total", &[]);
+        let current =
+            "(ns shop.orders)\n\n(defn total [order discount]\n  (- (only-total order) (* tax discount)))\n";
+        let new =
+            "(ns shop.orders)\n\n(defn total [order discount]\n  (- (:total order) (* 0.2 discount)))\n";
+        assert_eq!(dropped_references(&b, current, new), ["only-total", "tax"]);
+        assert!(dropped_references(&b, current, current).is_empty());
+        let helper = "(ns shop.orders)\n\n(defn- tax [] 1)\n\n(defn total [o d]\n  (* (tax) d))\n";
+        assert!(
+            dropped_references(&b, helper, new).is_empty(),
+            "the fragment's own definitions do not count"
+        );
+        let shadowed = "(ns shop.orders)\n\n(defn total [order discount]\n  (let [tax 0.2]\n    (- (only-total order) (* tax discount))))\n";
+        assert_eq!(
+            dropped_references(&b, current, shadowed),
+            ["tax"],
+            "a local named like the def"
+        );
+        let called_then_shadowed = "(ns shop.orders)\n\n(defn total [order discount]\n  (let [only-total (only-total order)\n        tax tax]\n    (- only-total (* tax discount))))\n";
+        assert!(
+            dropped_references(&b, current, called_then_shadowed).is_empty(),
+            "a binding's value is read before its name is bound"
+        );
     }
 
     #[test]
@@ -792,6 +1083,117 @@ mod tests {
     }
 
     #[test]
+    fn imports_are_shown_in_the_fragment_and_new_ones_merged_into_the_file() {
+        let file = "(ns shop.time\n  (:require [clojure.string :as str])\n  (:import [java.time Instant]))\n\n\
+                    (defn stamp [ms] (str (Instant/ofEpochMilli ms)))\n";
+        let b = ProjectBinding {
+            namespace: "shop.time".into(),
+            function: "stamp".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: file.into(),
+            usable: Vec::new(),
+        };
+        let f = fragment(&b).expect("defined");
+        assert!(
+            f.starts_with(
+                "(ns shop.time\n  (:require [clojure.string :as str])\n  (:import [java.time Instant]))"
+            ),
+            "{f}"
+        );
+        let new = "(ns shop.time\n  (:require [clojure.string :as str])\n  (:import [java.time Instant Duration] java.util.UUID))\n\n\
+                   (defn stamp [ms] (str (.minus (Instant/ofEpochMilli ms) (Duration/ofMillis 1)) (UUID/randomUUID)))\n";
+        let c = compose(&b, new).expect("composes");
+        assert!(
+            c.code.starts_with(
+                "(ns shop.time\n  (:require [clojure.string :as str])\n  (:import [java.time Instant]\n           [java.time Duration]\n           [java.util UUID]))"
+            ),
+            "{}",
+            c.code
+        );
+        assert_eq!(
+            compose(
+                &ProjectBinding {
+                    file: c.code.clone(),
+                    ..b.clone()
+                },
+                new
+            )
+            .unwrap()
+            .code,
+            c.code
+        );
+
+        let bare = ProjectBinding {
+            file: "(ns shop.time)\n\n(defn stamp [ms] ms)\n".into(),
+            ..b
+        };
+        let c = compose(&bare, new).expect("composes");
+        assert!(
+            c.code.starts_with("(ns shop.time\n  (:require [clojure.string :as str])\n  (:import [java.time Instant]\n           [java.time Duration]\n           [java.util UUID]))"),
+            "{}",
+            c.code
+        );
+    }
+
+    #[test]
+    fn unchanged_copies_of_other_definitions_are_dropped_from_an_answer() {
+        let b = binding("label", &["clean"]);
+        let answer = "(ns shop.orders\n  (:require [clojure.string :as str]))\n\n(def tax 0.2)\n\n\
+                      (defn total [order discount]\n  (- (only-total order)   discount))\n\n\
+                      (defn label [order] (str/upper-case (:name order)))\n";
+        let (code, dropped) = drop_copies(&b, answer);
+        assert_eq!(dropped.unchanged, ["tax".to_owned(), "total".to_owned()]);
+        assert_eq!(
+            code,
+            "(ns shop.orders\n  (:require [clojure.string :as str]))\n\n(defn label [order] (str/upper-case (:name order)))\n"
+        );
+        assert!(compose(&b, &code).is_ok());
+
+        // A changed copy is dropped too: the file keeps its own version.
+        let changed = answer.replace("(def tax 0.2)", "(def tax 0.3)");
+        let (code, dropped) = drop_copies(&b, &changed);
+        assert_eq!(dropped.unchanged, ["total".to_owned()]);
+        assert_eq!(dropped.changed, ["tax".to_owned()]);
+        assert!(!code.contains("tax"));
+        assert!(compose(&b, &code).is_ok());
+        let note = dropped.note(&b).unwrap();
+        assert!(note.contains("changed copies of tax"), "{note}");
+    }
+
+    #[test]
+    fn copies_differing_only_in_visibility_metadata_or_docstring_are_dropped() {
+        let b = binding("total", &["only-total"]);
+        let answer = "(ns shop.orders)\n\n(def ^:private tax 0.2)\n\n\
+                      (defn- label \"Names it.\" [order]\n  (clean (:name order)))\n\n\
+                      (defn- only-total [o] (:total o))\n\n\
+                      (defn total [order discount] (- (only-total order) discount))\n";
+        let (code, dropped) = drop_copies(&b, answer);
+        assert_eq!(dropped.unchanged, ["tax".to_owned(), "label".to_owned()]);
+        assert!(dropped.changed.is_empty());
+        assert!(compose(&b, &code).is_ok(), "{code}");
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_as_missing() {
+        let mut b = binding("label", &[]);
+        b.file = String::new();
+        let e = compose(&b, "(ns shop.orders)\n(defn label [o] o)\n").unwrap_err();
+        assert!(e.contains("no longer exists"), "{e}");
+    }
+
+    #[test]
+    fn the_reference_shows_parameters_behind_a_return_type_hint() {
+        let mut b = binding("label", &[]);
+        b.file = "(ns shop.orders)\n\n(defn- longer ^Duration [^Duration a ^Duration b]\n  (if (pos? (.compareTo a b)) a b))\n\n(defn label [o] o)\n".into();
+        let r = reference(&b);
+        assert!(
+            r.contains("- longer (private function of ^Duration [^Duration a ^Duration b])"),
+            "{r}"
+        );
+    }
+
+    #[test]
     fn a_helper_may_not_redefine_another_definition_of_the_file() {
         let b = binding("label", &["clean"]);
         let f = "(ns shop.orders)\n(defn- only-total [o] 0)\n(defn label [o] o)\n";
@@ -800,17 +1202,31 @@ mod tests {
     }
 
     #[test]
-    fn the_context_lists_the_other_definitions() {
+    fn the_context_lists_the_other_definitions_with_the_source_of_short_functions() {
         let c = context(&binding("label", &["clean"]));
         assert_eq!(
             c,
-            "(def tax 0.2)\n(defn- only-total [o])\n(defn total [order discount])\n(defmulti kind)"
+            "(def tax 0.2)\n(defn- only-total [o] (:total o))\n\
+             (defn total [order discount]\n  (- (only-total order) discount))\n(defmulti kind)"
         );
         let c = context(&binding("total", &["only-total"]));
         assert!(
-            c.contains("(defn label [order])\n  ;; A label for an order."),
+            c.contains("(defn label\n  \"A label for an order.\"\n  [order]\n  (clean (:name order)))"),
             "{c}"
         );
+        let long = format!(
+            "(ns a)\n(defn big\n  \"Does much.\"\n  [x]\n  (+ x {}))\n(defn f [x] x)\n",
+            "1 ".repeat(200)
+        );
+        let b = ProjectBinding {
+            namespace: "a".into(),
+            function: "f".into(),
+            helpers: Vec::new(),
+            arguments: 1,
+            file: long,
+            usable: Vec::new(),
+        };
+        assert_eq!(context(&b), "(defn big [x])\n  ;; Does much.");
     }
 
     #[test]
@@ -823,6 +1239,7 @@ mod tests {
             helpers: Vec::new(),
             arguments: 1,
             file: file.into(),
+            usable: Vec::new(),
         };
         assert_eq!(
             context(&b),

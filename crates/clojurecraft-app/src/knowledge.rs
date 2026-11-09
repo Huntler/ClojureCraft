@@ -5,9 +5,10 @@
 //! the collection has vectors, an embedding server on the CPU, started on the first search and
 //! stopped after a few idle minutes or when the application exits. Every search carries a request
 //! number, and only the newest request of each search field is applied. The same thread gathers
-//! the documentation given to the model when generating code.
+//! the documentation given to the model when generating code, together with the open project's
+//! code from the project index, which is built on a thread of its own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -26,6 +27,7 @@ use clojurecraft_runtime::models::{FileProblem, ModelRecord};
 use clojurecraft_runtime::{Cancel, DataDirs, Manifest, Progress, components, platform_key};
 
 use crate::jobs::Event;
+use crate::project_index::{self, Indexed};
 use clojurecraft_workflow::assistant::{self, Gather, Gathered};
 
 /// The query-time embedding server is stopped after this long without searches.
@@ -49,6 +51,7 @@ pub enum KnowledgeEvent {
         request: u64,
         result: Box<Result<Gathered, String>>,
     },
+    ProjectIndexed(Box<Result<Indexed, String>>),
 }
 
 /// What a running build is doing.
@@ -114,6 +117,42 @@ pub struct BuildJob {
     handle: Option<JoinHandle<()>>,
 }
 
+struct ProjectBuild {
+    root: PathBuf,
+    /// The sources and classpath of a newer request.
+    again: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
+    cancel: Cancel,
+}
+
+/// Indexes a project, with embeddings on the CPU when the embedding model is installed.
+fn build_project(
+    env: &Env,
+    root: &std::path::Path,
+    sources: &[PathBuf],
+    classpath: &[PathBuf],
+    cancel: &Cancel,
+) -> Result<Indexed, String> {
+    let dir = project_index::index_dir(&env.kdirs(), root);
+    let mut embedder = env.embedder_config(true, false).and_then(|cfg| {
+        match LlamaEmbedder::start(&cfg, &|| cancel.is_cancelled()) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(error = %e, "embedding model for the project index; indexing text only");
+                None
+            }
+        }
+    });
+    project_index::build(
+        root,
+        sources,
+        classpath,
+        &dir,
+        embedder.as_mut().map(|e| e as &mut dyn Embedder),
+        &env.runtime.clojure.version,
+        &|| cancel.is_cancelled(),
+    )
+}
+
 pub struct ModelTask {
     pub progress: Option<Progress>,
     cancel: Cancel,
@@ -131,6 +170,12 @@ enum Command {
     },
     /// The active collection or the embedding model changed.
     Reload,
+    /// Search the project index in `dir` too, with its namespace graph.
+    LoadProject {
+        dir: PathBuf,
+        graph: BTreeMap<String, BTreeSet<String>>,
+    },
+    UnloadProject,
     Shutdown,
 }
 
@@ -187,6 +232,12 @@ pub struct KnowledgeState {
     next_request: u64,
     /// Finished documentation lookups for the assistant.
     pub gathered: Vec<(u64, Result<Gathered, String>)>,
+    /// The project being indexed, and the classpath to index again with once it is done.
+    project_build: Option<ProjectBuild>,
+    /// The last project index built, or why it failed.
+    pub project_index: Option<Result<Indexed, String>>,
+    /// The namespace graph of a newly built index, for the open project to take.
+    project_graph: Option<(PathBuf, BTreeMap<String, BTreeSet<String>>)>,
     worker: Sender<Command>,
     worker_handle: Option<JoinHandle<()>>,
 }
@@ -227,6 +278,9 @@ impl KnowledgeState {
             searches: HashMap::new(),
             next_request: 0,
             gathered: Vec::new(),
+            project_build: None,
+            project_index: None,
+            project_graph: None,
             worker,
             worker_handle,
         };
@@ -367,12 +421,94 @@ impl KnowledgeState {
                 }
             }
             KnowledgeEvent::Gathered { request, result } => self.gathered.push((request, *result)),
+            KnowledgeEvent::ProjectIndexed(result) => {
+                let again = self
+                    .project_build
+                    .take()
+                    .and_then(|b| b.again.map(|a| (b.root, a)));
+                match &*result {
+                    Ok(indexed) => {
+                        tracing::info!(
+                            chunks = indexed.chunks,
+                            embedded = indexed.embedded,
+                            "project indexed"
+                        );
+                        let _ = self.worker.send(Command::LoadProject {
+                            dir: indexed.dir.clone(),
+                            graph: indexed.graph.clone(),
+                        });
+                        self.project_graph = Some((indexed.root.clone(), indexed.graph.clone()));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "project index"),
+                }
+                self.project_index = Some(*result);
+                if let Some((root, (sources, classpath))) = again {
+                    self.index_project(&root, sources, classpath);
+                }
+            }
+        }
+    }
+
+    /// Indexes the project at `root` in the background; while a build runs, the newest request
+    /// waits for it to finish.
+    pub fn index_project(&mut self, root: &std::path::Path, sources: Vec<PathBuf>, classpath: Vec<PathBuf>) {
+        if let Some(b) = &mut self.project_build {
+            if b.root == root {
+                b.again = Some((sources, classpath));
+                return;
+            }
+            b.cancel.cancel();
+        }
+        let Ok(env) = self.env.clone() else { return };
+        let cancel = Cancel::default();
+        let c = cancel.clone();
+        let emit = self.emit();
+        let root = root.to_owned();
+        let r = root.clone();
+        thread::spawn(move || {
+            let result = build_project(&env, &r, &sources, &classpath, &c);
+            emit(KnowledgeEvent::ProjectIndexed(Box::new(result)));
+        });
+        self.project_build = Some(ProjectBuild {
+            root,
+            again: None,
+            cancel,
+        });
+    }
+
+    /// Stops searching the project index, for example when the project is closed.
+    pub fn unload_project(&mut self) {
+        if let Some(b) = self.project_build.take() {
+            b.cancel.cancel();
+        }
+        self.project_index = None;
+        self.project_graph = None;
+        let _ = self.worker.send(Command::UnloadProject);
+    }
+
+    /// Whether the project at `root` is being indexed.
+    pub fn indexing(&self, root: &std::path::Path) -> bool {
+        self.project_build.as_ref().is_some_and(|b| b.root == root)
+    }
+
+    /// The namespace graph of a newly built index of the project at `root`, once.
+    pub fn take_project_graph(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Option<BTreeMap<String, BTreeSet<String>>> {
+        match &self.project_graph {
+            Some((r, _)) if r == root => self.project_graph.take().map(|(_, g)| g),
+            _ => None,
         }
     }
 
     /// Starts gathering documentation for a generation; `None` when none is installed.
     pub fn gather(&mut self, gather: Gather) -> Option<u64> {
-        self.active()?;
+        let project =
+            gather.project_namespace.is_some() && self.project_index.as_ref().is_some_and(Result::is_ok);
+        if self.active().is_none() && !project {
+            return None;
+        }
         self.next_request += 1;
         let request = self.next_request;
         self.worker.send(Command::Gather { request, gather }).ok()?;
@@ -629,6 +765,8 @@ fn run_build(
 struct Worker<'a> {
     env: &'a Env,
     retriever: Option<Retriever>,
+    /// The open project's index and namespace graph.
+    project: Option<(Retriever, BTreeMap<String, BTreeSet<String>>)>,
     /// Version of the collection `retriever` reads.
     version: String,
     embedder: Option<LlamaEmbedder>,
@@ -655,9 +793,9 @@ impl Worker<'_> {
     fn ensure_embedder(&mut self) {
         let wants = self
             .retriever
-            .as_ref()
-            .and_then(|r| r.info().embedding.as_ref())
-            .is_some();
+            .iter()
+            .chain(self.project.as_ref().map(|(r, _)| r))
+            .any(|r| r.info().embedding.is_some());
         let recently_failed = self
             .embedder_failed
             .as_ref()
@@ -708,11 +846,18 @@ impl Worker<'_> {
 impl Worker<'_> {
     fn gather(&mut self, g: &Gather) -> Result<Gathered, String> {
         self.last_search = Instant::now();
-        self.ensure_retriever()?;
+        let docs_error = self.ensure_retriever().err();
+        if docs_error.is_some() && self.project.is_none() {
+            return Err(docs_error.unwrap_or_default());
+        }
         self.ensure_embedder();
-        let retriever = self.retriever.as_mut().ok_or("unavailable")?;
+        let docs = self.retriever.as_mut().map(|r| (r, self.version.as_str()));
+        let project = self
+            .project
+            .as_mut()
+            .map(|(retriever, graph)| assistant::ProjectSearch { retriever, graph });
         let embedder = self.embedder.as_mut().map(|e| e as &mut dyn Embedder);
-        let (found, semantic_failed) = assistant::gather(retriever, embedder, g, &self.version)?;
+        let (found, semantic_failed) = assistant::gather(docs, project, embedder, g)?;
         if semantic_failed {
             // A server that stopped answering is replaced on the next search.
             self.embedder = None;
@@ -728,6 +873,7 @@ fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEven
     let mut w = Worker {
         env,
         retriever: None,
+        project: None,
         version: String::new(),
         embedder: None,
         embedder_failed: None,
@@ -758,6 +904,14 @@ fn search_worker(env: &Env, rx: &Receiver<Command>, emit: &impl Fn(KnowledgeEven
                     w.embedder = None;
                     w.embedder_failed = None;
                 }
+                Command::LoadProject { dir, graph } => match Retriever::open(&dir) {
+                    Ok(r) => w.project = Some((r, graph)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "project index could not be opened");
+                        w.project = None;
+                    }
+                },
+                Command::UnloadProject => w.project = None,
                 Command::Search { slot, request, query } => {
                     latest.insert(slot, (request, query));
                 }

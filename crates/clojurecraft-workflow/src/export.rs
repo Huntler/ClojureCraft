@@ -17,6 +17,11 @@ use crate::{Names, deps, validation};
 /// The comparison namespace shipped with every exported project.
 pub const CHECK_SOURCE: &str = include_str!("../../../resources/clojure/export-check.clj");
 pub const CHECK_NAMESPACE: &str = "clojurecraft.check";
+/// Readers for the `#time/…` tags, provided by the comparison namespace.
+const DATA_READERS: &str = "{time/duration clojurecraft.check/duration\n \
+                            time/date clojurecraft.check/date\n \
+                            time/date-time clojurecraft.check/date-time\n \
+                            time/time clojurecraft.check/time}\n";
 
 /// Version of `io.github.cognitect-labs/test-runner` referenced by the `:test` alias.
 const TEST_RUNNER: &str = r#"{:git/tag "v0.5.1" :git/sha "dfb30dd"}"#;
@@ -133,6 +138,14 @@ pub fn project(docs: &[&FunctionDocument], clojure_version: &str) -> Result<Proj
             test_namespace,
             assertions,
             left_out,
+        });
+    }
+    // java.time values are written as the harness prints them; the tests read them back
+    // through the comparison namespace.
+    if files.iter().any(|f| f.content.contains("#time/")) {
+        files.push(File {
+            path: "test/data_readers.clj".into(),
+            content: DATA_READERS.to_owned(),
         });
     }
     files.push(File {
@@ -270,13 +283,23 @@ fn test_file(doc: &FunctionDocument, n: &Names, test_namespace: &str) -> (String
         }
         out.push_str(&format!("\n(deftest {name}"));
         for a in items {
-            out.push_str(&format!(
-                "\n  (is (nil? (check/difference {}\n                              (subject/{} {}){opts}))\n      {})",
-                quoted(&a.expected),
-                n.function,
-                quoted(&a.input),
-                string(&a.label),
-            ));
+            let call = if n.arguments == 1 {
+                format!("(subject/{} {})", n.function, quoted(&a.input))
+            } else {
+                format!("(apply subject/{} {})", n.function, quoted(&a.input))
+            };
+            match clojurecraft_edn::expected_throws(&a.expected) {
+                Some(class) => out.push_str(&format!(
+                    "\n  (is (check/throws? {} #(do {call}))\n      {})",
+                    string(&class),
+                    string(&a.label),
+                )),
+                None => out.push_str(&format!(
+                    "\n  (is (nil? (check/difference {}\n                              {call}{opts}))\n      {})",
+                    quoted(&a.expected),
+                    string(&a.label),
+                )),
+            }
         }
         out.push_str(")\n");
     };
@@ -313,6 +336,36 @@ mod tests {
     }
 
     #[test]
+    fn expected_exceptions_assert_the_throw_and_several_arguments_are_applied() {
+        let mut d = doc("Kind", "(ns kind.core)\n\n(defn kind [a b] (case a :x b))");
+        d.project = Some(clojurecraft_domain::ProjectBinding {
+            namespace: "kind.core".into(),
+            function: "kind".into(),
+            helpers: Vec::new(),
+            arguments: 2,
+            file: String::new(),
+            usable: Vec::new(),
+        });
+        d.examples = vec![
+            Example::direct("x", Edn::new("[:x 1]"), Edn::new("1")),
+            Example::direct(
+                "other",
+                Edn::new("[:y 1]"),
+                Edn::new("#throws IllegalArgumentException"),
+            ),
+        ];
+        let p = project(&[&d], "1.12.6").unwrap();
+        let test = &p.files[1].content;
+        assert!(test.contains("(apply subject/kind '[:x 1])"), "{test}");
+        assert!(
+            test.contains(
+                "(is (check/throws? \"IllegalArgumentException\" #(do (apply subject/kind '[:y 1])))"
+            ),
+            "{test}"
+        );
+    }
+
+    #[test]
     fn functions_become_source_and_test_files() {
         let d = doc(
             "Sum numbers",
@@ -339,6 +392,29 @@ mod tests {
         assert!(p.files[3].content.contains("{:mvn/version \"1.12.6\"}"));
         assert_eq!(p.functions[0].assertions, 1);
         assert_eq!(p.test_namespaces(), ["sum-numbers.core-test"]);
+    }
+
+    #[test]
+    fn java_time_values_bring_their_data_readers() {
+        let mut d = doc("Later", "(ns later.core)\n\n(defn later [d] d)");
+        let plain = project(&[&d], "1.12.6").unwrap();
+        assert!(!plain.files.iter().any(|f| f.path == "test/data_readers.clj"));
+        d.examples = vec![Example::direct(
+            "d",
+            Edn::new("#time/duration \"PT1M\""),
+            Edn::new("#time/duration \"PT1M\""),
+        )];
+        let p = project(&[&d], "1.12.6").unwrap();
+        let readers = p
+            .files
+            .iter()
+            .find(|f| f.path == "test/data_readers.clj")
+            .unwrap();
+        assert!(
+            readers
+                .content
+                .contains("time/duration clojurecraft.check/duration")
+        );
     }
 
     #[test]

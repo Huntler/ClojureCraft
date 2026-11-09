@@ -84,9 +84,10 @@ impl Role {
                 timeout: Duration::from_secs(120),
             },
             Self::Generation => RoleProfile {
-                instructions: "Write one public, pure Clojure function in its own namespace that satisfies \
-                    the specification, the contract, and every example. Use only the allowed namespaces. \
-                    Prefer clear, idiomatic core functions over clever code.",
+                instructions: "Write one public, pure Clojure function, with the ns declaration and private \
+                    helpers it needs and nothing else, that satisfies the specification, the contract, and \
+                    every example. Use only the allowed namespaces. Prefer clear, idiomatic core functions \
+                    over clever code.",
                 temperature: 0.2,
                 top_p: TOP_P,
                 max_output_tokens: 1800,

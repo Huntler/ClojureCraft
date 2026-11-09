@@ -241,6 +241,23 @@ fn kind(v: &Value) -> &'static str {
 mod tests {
     use super::*;
 
+    /// llama.cpp writes properties in the schema's order, so the order the fields are declared in
+    /// (for example a name before the value it names) must survive.
+    #[test]
+    fn properties_keep_the_declared_order() {
+        let s = Schema::object(vec![
+            Field::required("name", Schema::string()),
+            Field::required("input", Schema::string()),
+        ]);
+        let keys: Vec<String> = s.to_json()["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys, ["name", "input"]);
+    }
+
     fn answer() -> Schema {
         Schema::object(vec![
             Field::required("code", Schema::bounded_string(20)),

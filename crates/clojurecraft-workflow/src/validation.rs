@@ -179,6 +179,13 @@ pub fn equality(doc: &FunctionDocument) -> Equality {
     }
 }
 
+/// Whether `source` is `doc`'s current code and was written or edited by hand.
+fn is_own_code(doc: &FunctionDocument, source: &str) -> bool {
+    doc.implementation
+        .as_ref()
+        .is_some_and(|i| i.source == source && i.is_manually_edited())
+}
+
 /// Plans checking `source` against `doc`'s specification. `names` are the namespace and
 /// function the code is expected to define; a different name is only a warning. When `source`
 /// is the explained implementation, failing calls show the values of its steps.
@@ -213,6 +220,21 @@ pub fn plan_with_steps(
             arguments: names.arguments,
         },
     );
+    // The purity rules say what the model may write. Code the user wrote is theirs to decide;
+    // the OS sandbox still confines what it can do when it runs.
+    let own = is_own_code(doc, source);
+    if own {
+        let (purity, rest): (Vec<crate::Problem>, Vec<crate::Problem>) =
+            std::mem::take(&mut structure.problems)
+                .into_iter()
+                .partition(|p| matches!(p.kind, ProblemKind::Forbidden | ProblemKind::Unsupported));
+        structure.problems = rest;
+        structure.warnings.extend(
+            purity
+                .iter()
+                .map(|p| format!("{p} in generated code; your own code may do it")),
+        );
+    }
     let mut lines = None;
     let calls = planned_calls(doc);
     let output_rules = output_rules(doc);
@@ -233,6 +255,7 @@ pub fn plan_with_steps(
                     .collect(),
             );
             r.output_rules.clone_from(&output_rules);
+            r.static_checks = !own;
             r.equality = equality;
             r.call_timeout = CALL_TIMEOUT;
             r.max_elements = MAX_ELEMENTS;
@@ -508,6 +531,9 @@ pub fn report(plan: &Plan, cx: ReportContext<'_>) -> ValidationReport {
     }
 }
 
+/// Marks an error at a line of the namespace file outside the function's fragment.
+pub const OUTSIDE_FUNCTION: &str = "outside this function";
+
 /// `outcome` with the namespace file's line numbers turned into the fragment's. A position
 /// outside the fragment is named in the message instead.
 fn to_fragment_lines(outcome: &EvalOutcome, map: &crate::project::LineMap) -> EvalOutcome {
@@ -517,7 +543,7 @@ fn to_fragment_lines(outcome: &EvalOutcome, map: &crate::project::LineMap) -> Ev
             e.line = map.to_fragment(line);
             if e.line.is_none() {
                 e.message = format!(
-                    "{} (line {line} of the namespace file, outside this function)",
+                    "{} (line {line} of the namespace file, {OUTSIDE_FUNCTION})",
                     e.message
                 );
             }
@@ -1046,6 +1072,75 @@ mod tests {
                 r#""the output: expected 3 but got 4""#.to_owned()
             }
         )
+    }
+
+    #[test]
+    fn the_users_own_code_may_be_impure_but_generated_code_may_not() {
+        const IMPURE: &str = "(ns totals.core)\n(defn totals [path]\n  (with-open [r (java.io.StringReader. path)] (.read r)))\n";
+        let mut d = doc();
+        d.implementation = Some(clojurecraft_domain::Implementation::manual(IMPURE));
+        let own = plan(&d, IMPURE, &names());
+        let req = own.request.as_ref().expect("the user's own code is run");
+        assert!(!req.static_checks && req.lint);
+        assert!(own.structure.problems.is_empty(), "{:?}", own.structure.problems);
+        assert!(
+            own.structure
+                .warnings
+                .iter()
+                .any(|w| w.contains("with-open is not allowed")),
+            "{:?}",
+            own.structure.warnings
+        );
+
+        // A candidate that differs from the current code is the model's, and held to the rules.
+        let candidate = plan(&d, &IMPURE.replace("path", "p"), &names());
+        assert!(candidate.request.is_none());
+        assert!(
+            candidate
+                .structure
+                .problems
+                .iter()
+                .any(|p| p.kind == ProblemKind::Forbidden)
+        );
+
+        // So is unedited generated code.
+        let mut generated = d.clone();
+        let i = generated.implementation.as_mut().unwrap();
+        i.generation = Some(clojurecraft_domain::GenerationRecord {
+            generated_source: IMPURE.into(),
+            model: clojurecraft_domain::ModelIdentity {
+                display_name: "Qwen".into(),
+                repository: String::new(),
+                revision: String::new(),
+                file: String::new(),
+                sha256: String::new(),
+                quantization: String::new(),
+                architecture: String::new(),
+            },
+            runtime: clojurecraft_domain::InferenceRuntime {
+                llama_cpp_release: String::new(),
+                backend: String::new(),
+            },
+            settings: clojurecraft_domain::GenerationSettings {
+                temperature: 0.2,
+                top_p: 0.9,
+                seed: None,
+                context_length: 8192,
+                max_output_tokens: 1800,
+            },
+            documentation: Vec::new(),
+            spec_basis: d.spec_fingerprint(),
+            attempts: 1,
+            created_at: clojurecraft_domain::Timestamp::now(),
+            namespace: "totals.core".into(),
+            function_name: "totals".into(),
+            requires: Vec::new(),
+            assumptions: Vec::new(),
+            omitted_context: Vec::new(),
+            explanation: None,
+            prompt: Vec::new(),
+        });
+        assert!(plan(&generated, IMPURE, &names()).request.is_none());
     }
 
     #[test]

@@ -16,9 +16,26 @@ pub struct Policy {
     /// ranges, so heap limits are usually enforced by runtime flags instead.
     pub address_space_bytes: Option<u64>,
     pub max_open_files: u64,
+    /// Directory trees the process may read, write, and map executable code from: a private
+    /// scratch directory, for libraries that unpack native code into the temporary directory.
+    #[serde(default)]
+    pub write: Vec<PathBuf>,
 }
 
+/// Largest file a process with a scratch directory may write; without one, nothing may be
+/// written at all.
+pub const MAX_SCRATCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Policy {
+    /// The file-size limit: zero unless the policy grants a scratch directory.
+    pub fn max_file_bytes(&self) -> u64 {
+        if self.write.is_empty() {
+            0
+        } else {
+            MAX_SCRATCH_FILE_BYTES
+        }
+    }
+
     /// System directories every dynamically linked program needs, filtered to those present.
     pub fn system_library_dirs() -> Vec<PathBuf> {
         let candidates: &[&str] = if cfg!(target_os = "macos") {

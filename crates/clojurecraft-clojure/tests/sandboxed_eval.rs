@@ -120,11 +120,9 @@ fn static_checks_reject_dynamic_evaluation_and_interop() {
             "var is not allowed",
         ),
         (
-            "(ns t.i)\n(defn f [_] (System/getenv \"HOME\"))",
-            "System is not allowed",
+            "(ns t.u)\n(defn f [_] (slurp \"/etc/hosts\"))",
+            "slurp is not allowed",
         ),
-        ("(ns t.c)\n(defn f [_] (java.io.File. \"/\"))", "not allowed"),
-        ("(ns t.m)\n(defn f [s] (.toUpperCase s))", "interop"),
         (
             "(ns t.q (:require [clojure.java.shell :as sh]))\n(defn f [_] 1)",
             "requiring clojure.java.shell",
@@ -144,6 +142,167 @@ fn static_checks_reject_dynamic_evaluation_and_interop() {
             "{code}: {e:?}"
         );
     }
+}
+
+#[test]
+fn instants_are_printed_as_inst_and_match_an_inst_expectation() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.inst (:import [java.time Instant]))\n\
+                (defn f [d] [(Instant/ofEpochMilli (+ (inst-ms d) 1800000))])";
+    let out = run(
+        &rt,
+        &EvalRequest::new(
+            code,
+            "f",
+            vec![
+                call(
+                    "#inst \"2023-01-01T00:00:00Z\"",
+                    Some("[#inst \"2023-01-01T00:30:00Z\"]"),
+                ),
+                call(
+                    "#inst \"2023-01-01T00:00:00Z\"",
+                    Some("[#inst \"2023-01-01T01:00:00Z\"]"),
+                ),
+            ],
+        ),
+        quick(),
+    );
+    let r = first(&out);
+    assert_eq!(r.actual.as_deref(), Some("[#inst \"2023-01-01T00:30:00Z\"]"));
+    assert_eq!(r.matches, Some(true), "{:?}", out.report);
+    assert_eq!(out.report.results[1].matches, Some(false));
+}
+
+#[test]
+fn an_expected_exception_matches_its_class_and_subclasses_only() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.throws)\n\
+                (defn f [x] (case x :a 1 :n (Long/parseLong \"x\") :i (throw (ex-info \"no\" {})) nil (inc x)))";
+    let req = EvalRequest::new(
+        code,
+        "f",
+        vec![
+            call(":b", Some("#throws IllegalArgumentException")),
+            call(":n", Some("#throws java.lang.IllegalArgumentException")),
+            call(":i", Some("#throws ExceptionInfo")),
+            call(":a", Some("#throws IllegalArgumentException")),
+            call("nil", Some("#throws IllegalArgumentException")),
+        ],
+    );
+    let out = run(&rt, &req, quick());
+    let r = &out.report.results;
+    assert_eq!(out.status, EvalStatus::Completed, "{}", out.stderr);
+    for (i, c) in r.iter().take(3).enumerate() {
+        assert_eq!((c.status, c.matches), (CallStatus::Ok, Some(true)), "{i}: {c:?}");
+    }
+    assert_eq!(
+        r[0].actual.as_deref(),
+        Some("#throws java.lang.IllegalArgumentException")
+    );
+    assert_eq!(
+        r[1].actual.as_deref(),
+        Some("#throws java.lang.NumberFormatException"),
+        "a subclass"
+    );
+    assert_eq!(r[3].matches, Some(false), "returned instead");
+    assert!(
+        r[3].difference
+            .as_deref()
+            .unwrap_or_default()
+            .contains("returned 1"),
+        "{:?}",
+        r[3]
+    );
+    assert_eq!(r[4].status, CallStatus::Error, "another exception is an error");
+    assert!(
+        r[4].error
+            .as_ref()
+            .unwrap()
+            .class
+            .ends_with("NullPointerException")
+    );
+}
+
+#[test]
+fn java_time_values_are_printed_and_read_as_tagged_literals() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.dur (:import [java.time Duration LocalDate]))\n\
+                (defn f [[d day]] [(.plus ^Duration d (Duration/ofMinutes 1)) (.plusDays ^LocalDate day 1)])";
+    let mut req = EvalRequest::new(
+        code,
+        "f",
+        vec![call(
+            "[#time/duration \"PT30M\" #time/date \"2024-02-28\"]",
+            Some("[#time/duration \"PT31M\" #time/date \"2024-02-29\"]"),
+        )],
+    );
+    req.output_chars = Some(10_000);
+    let out = run(&rt, &req, quick());
+    let r = first(&out);
+    assert_eq!(
+        r.actual.as_deref(),
+        Some("[#time/duration \"PT31M\" #time/date \"2024-02-29\"]"),
+        "{:?}",
+        out.report
+    );
+    assert_eq!(r.matches, Some(true), "{:?}", out.report);
+}
+
+#[test]
+fn locals_named_like_denied_functions_are_allowed() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.locals)\n\
+                (defn f [{:keys [read]}]\n  \
+                  (let [alias (inc read) binding [alias]]\n    \
+                    (vec (for [x binding :let [future (* 2 x)]] ((fn [send] send) future)))))";
+    let mut req = EvalRequest::new(code, "f", vec![call("{:read 1}", Some("[4]"))]);
+    req.static_checks = true;
+    let out = run(&rt, &req, quick());
+    assert_eq!(out.report.check, Some(Ok(())), "{:?}", out.report);
+    assert_eq!(first(&out).matches, Some(true), "{:?}", out.report);
+    // The functions themselves stay denied where nothing binds their names.
+    let out = eval(&rt, "(ns t.unbound)\n(defn f [x] (read x))", true, quick());
+    assert!(
+        failure(&out).message.contains("read is not allowed"),
+        "{:?}",
+        out.report
+    );
+    let out = eval(&rt, "(ns t.special)\n(defn f [var] (var inc))", true, quick());
+    assert!(
+        failure(&out).message.contains("var is not allowed"),
+        "{:?}",
+        out.report
+    );
+}
+
+#[test]
+fn java_interop_with_imports_runs() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.time (:import [java.time Instant Duration]))\n\
+                (defn f [ms]\n  (when (.isAfter (Instant/ofEpochMilli ms) Instant/EPOCH)\n\
+                    (str (.minus (Instant/ofEpochMilli ms) (Duration/ofMillis 1)) (.toUpperCase \"z\") (count (java.util.ArrayList.)))))";
+    let mut req = EvalRequest::new(
+        code,
+        "f",
+        vec![call("1000", Some("\"1970-01-01T00:00:00.999ZZ0\""))],
+    );
+    req.lint = true;
+    let out = run(&rt, &req, quick());
+    assert_eq!(out.report.check, Some(Ok(())), "{:?}", out.report);
+    assert_eq!(first(&out).matches, Some(true), "{:?}", out.report);
+    // Exceptions are ordinary classes too.
+    let out = eval(
+        &rt,
+        "(ns t.x)\n(defn f [xs] (throw (IllegalArgumentException. (str (count xs)))))",
+        true,
+        quick(),
+    );
+    assert!(
+        first(&out)
+            .error
+            .as_ref()
+            .is_some_and(|e| e.class.ends_with("IllegalArgumentException"))
+    );
 }
 
 /// With static checks disabled, the OS sandbox alone must stop each attempt.
@@ -437,6 +596,27 @@ fn lint_reports_errors_and_warnings_with_lines_before_loading() {
         panic!("{:?}", out.report)
     };
     assert_eq!(load.line, Some(6));
+}
+
+#[test]
+fn a_local_that_hides_a_definition_of_the_namespace_is_a_lint_warning() {
+    let Some(rt) = runtime() else { return };
+    let code = "(ns t.hide)\n(def tag-value \"x\")\n(defn kind [s] (first s))\n\
+                (defn f [s]\n  (let [kind (kind s)\n        tag-value (str kind)]\n    tag-value))";
+    let req = EvalRequest::new(code, "f", vec![call("\"ab\"", Some("\"a\""))]);
+    let out = run(&rt, &req, Limits::for_request(&req));
+    let lint = out.report.lint.clone().unwrap_or_default();
+    // Symbols carry no position, so both are reported at the let.
+    for name in ["kind", "tag-value"] {
+        assert!(
+            lint.iter().any(|f| f.level == LintLevel::Warning
+                && f.line == Some(5)
+                && f.message
+                    .contains(&format!("{name} hides {name} of this namespace"))),
+            "{name}: {lint:?}"
+        );
+    }
+    assert_eq!(first(&out).matches, Some(true));
 }
 
 #[test]

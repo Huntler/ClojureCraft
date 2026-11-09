@@ -6,8 +6,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -75,7 +75,7 @@ impl Server {
                         let handler = handler.clone();
                         let spawned = thread::Builder::new()
                             .name("mcp-client".into())
-                            .spawn(move || serve(stream, &*handler));
+                            .spawn(move || serve(stream, handler));
                         if let Err(e) = spawned {
                             tracing::warn!(error = %e, "could not serve an MCP client");
                         }
@@ -105,30 +105,38 @@ impl Handler for Channel {
         (self.wake)();
         rx.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| {
             Err(
-                "ClojureCraft did not respond in time. Its window must be open (not minimized) to \
-                 handle requests."
+                "ClojureCraft did not respond in time; it may be busy or no longer running. Try \
+                 again."
                     .into(),
             )
         })
     }
 }
 
-fn serve(stream: UnixStream, handler: &dyn Handler) {
-    let Ok(mut out) = stream.try_clone() else {
+/// Answers each message on its own thread, so a `status` that waits for work does not hold back
+/// the client's other calls; responses carry their request's id and may arrive in any order.
+fn serve(stream: UnixStream, handler: Arc<Channel>) {
+    let Ok(out) = stream.try_clone() else {
         return;
     };
+    let out = Arc::new(Mutex::new(out));
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else {
             return;
         };
-        if let Some(response) = protocol::handle_line(&line, handler) {
-            let written = out
-                .write_all(response.as_bytes())
-                .and_then(|()| out.write_all(b"\n"))
-                .and_then(|()| out.flush());
-            if written.is_err() {
-                return;
+        let (handler, out) = (handler.clone(), out.clone());
+        let spawned = thread::Builder::new().name("mcp-call".into()).spawn(move || {
+            if let Some(response) = protocol::handle_line(&line, &*handler) {
+                let Ok(mut out) = out.lock() else { return };
+                // A client that went away has nobody to read the answer.
+                let _ = out
+                    .write_all(response.as_bytes())
+                    .and_then(|()| out.write_all(b"\n"))
+                    .and_then(|()| out.flush());
             }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "could not answer an MCP call");
         }
     }
 }
@@ -179,5 +187,39 @@ mod tests {
 
         drop(server);
         assert!(!path.exists(), "the socket is removed on exit");
+    }
+
+    #[test]
+    fn a_slow_call_does_not_hold_back_later_calls_of_the_same_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.sock");
+        let (tx, rx) = mpsc::channel::<Request>();
+        let _server = Server::start(&path, tx, || {}).unwrap();
+        // The application: holds the first call (export) until the second (list) is answered.
+        thread::spawn(move || {
+            let slow = rx.recv().unwrap();
+            let fast = rx.recv().unwrap();
+            fast.respond(Ok(json!({"functions": []})));
+            thread::sleep(Duration::from_millis(200));
+            slow.respond(Err("late".into()));
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        let slow = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "export_project", "arguments":
+                                     {"function_ids": [clojurecraft_domain::FunctionId::generate().to_string()], "directory": "/tmp/x"}}});
+        let fast = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": "list_functions"}});
+        writeln!(client, "{slow}").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        writeln!(client, "{fast}").unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            ids.push(v["id"].as_i64().unwrap());
+        }
+        assert_eq!(ids, [2, 1], "the fast answer comes first");
     }
 }

@@ -16,6 +16,8 @@
 //!   tests, contract) and its report;
 //! - [`edge_cases`]: proposing edge-case tests from the specification, reviewing them, and
 //!   fixing code that fails accepted cases;
+//! - [`compare`]: new code compared with the code it would replace, on variants of the
+//!   examples;
 //! - [`describe`]: the specification of existing code, written by the model, with example
 //!   outputs recorded by running the code;
 //! - [`dataset`]: a fine-tuning dataset of generation prompts and validated code;
@@ -28,6 +30,8 @@
 //!   instrumented copy of the code;
 //! - [`project`]: functions inside a project's namespace files: the fragment the model edits,
 //!   and the whole file it is checked in;
+//! - [`project_index`]: the project's code (and its dependencies' sources) as searchable
+//!   chunks, which of them are pure, and which namespaces may be required without a cycle;
 //! - [`assistant`]: the sequence of requests for interpreting, proposing a contract, and
 //!   generating, reaching inference and documentation only through [`assistant::Ports`].
 
@@ -35,6 +39,7 @@ pub mod answers;
 pub mod assistant;
 pub mod candidate;
 pub mod cleanup;
+pub mod compare;
 pub mod dataset;
 pub mod delimiters;
 pub mod deps;
@@ -52,6 +57,7 @@ pub mod locals;
 pub mod locate;
 pub mod naming;
 pub mod project;
+pub mod project_index;
 pub mod references;
 pub mod requests;
 pub mod spec;

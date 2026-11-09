@@ -75,6 +75,10 @@ pub struct ProjectBinding {
     /// The namespace's source file as last read: the code around the function.
     #[serde(default)]
     pub file: String,
+    /// Other namespaces of the project and its dependencies the function may require: every
+    /// indexed one that does not depend on this namespace, so no requirement is circular.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usable: Vec<String>,
 }
 
 fn one_argument() -> u32 {

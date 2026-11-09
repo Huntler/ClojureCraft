@@ -78,12 +78,33 @@ impl ClojureCraftApp {
         }
         let id = match call {
             Call::ListFunctions => {
-                let list: Vec<Value> = self
-                    .functions
-                    .iter()
-                    .map(|f| mcp_views::summary(f.id, &f.name, &f.description))
-                    .collect();
-                return Step::Done(Ok(json!({ "functions": list })));
+                let project = self.project.as_ref();
+                let mut list: Vec<Value> = Vec::new();
+                if let Some(p) = project {
+                    for (ns, _, spec) in p.specs() {
+                        let description = self
+                            .docs
+                            .get(&spec.id)
+                            .map_or(spec.description.as_str(), |o| o.doc.description.as_str());
+                        let mut v = mcp_views::summary(spec.id, &spec.name, description);
+                        v["namespace"] = json!(ns);
+                        list.push(v);
+                    }
+                }
+                // With a project open, only its functions are offered: the others would be
+                // checked against this project's classpath.
+                if project.is_none() {
+                    list.extend(
+                        self.functions
+                            .iter()
+                            .map(|f| mcp_views::summary(f.id, &f.name, &f.description)),
+                    );
+                }
+                let mut reply = json!({ "functions": list });
+                if let Some(p) = project {
+                    reply["project"] = json!(p.root().display().to_string());
+                }
+                return Step::Done(Ok(reply));
             }
             Call::Cancel => {
                 let was = self.assistant.job().map(|j| j.function);
@@ -106,6 +127,9 @@ impl ClojureCraftApp {
                     }
                 }
                 return Step::Done(self.mcp_export(args));
+            }
+            Call::CreateFunction(_) | Call::CreateFunctions(_) if self.project.is_some() => {
+                return Step::Done(Err(outside_project(self.project.as_ref())));
             }
             Call::CreateFunction(spec) => {
                 // Answer once the new function is open.
@@ -193,6 +217,7 @@ impl ClojureCraftApp {
             | Call::GenerateTestCases(id, _)
             | Call::ReviewTestCases { function: id, .. }
             | Call::RunTests(id)
+            | Call::Describe(id)
             | Call::Generate(id, _)
             | Call::Status(id, _)
             | Call::Result(id, _)
@@ -203,7 +228,7 @@ impl ClojureCraftApp {
         // not scanned yet, and a model job would be refused as if nothing were installed.
         if matches!(
             call,
-            Call::GenerateTestCases(..) | Call::Generate(..) | Call::GenerateMany(..)
+            Call::GenerateTestCases(..) | Call::Describe(_) | Call::Generate(..) | Call::GenerateMany(..)
         ) && self.inference.snapshot.is_none()
         {
             return Step::Wait;
@@ -217,6 +242,11 @@ impl ClojureCraftApp {
     /// `None` when the function is open; otherwise starts opening it (quietly, without switching
     /// the view) and waits, or reports why it cannot be opened.
     fn mcp_open(&mut self, id: FunctionId) -> Option<Step> {
+        if let Some(p) = &self.project
+            && p.locate(id).is_none()
+        {
+            return Some(Step::Done(Err(outside_project(Some(p)))));
+        }
         if self.docs.contains_key(&id) {
             return None;
         }
@@ -224,6 +254,16 @@ impl ClojureCraftApp {
             return Some(Step::Done(Err(format!(
                 "The function could not be opened: {error}"
             ))));
+        }
+        if !self.loading.contains(&id)
+            && let Some(doc) = self
+                .project
+                .as_ref()
+                .and_then(|p| p.locate(id).and_then(|(ns, f)| p.document(ns, f)))
+        {
+            self.loading.insert(id);
+            self.quiet_open.insert(id);
+            self.library.send(Command::OpenOrInsert(Box::new(doc)));
         }
         if !self.loading.contains(&id) {
             if !self.functions.iter().any(|f| f.id == id) {
@@ -395,6 +435,10 @@ impl ClojureCraftApp {
                     "next": "Call status with wait_seconds for the outcome.",
                 }))
             }
+            Call::Describe(_) => {
+                self.try_start_job(id, JobKind::Describe)?;
+                self.started(id)
+            }
             Call::Generate(_, mode) => self.mcp_generate(id, *mode),
             Call::Status(_, detail) => Ok(self.mcp_status(id, *detail)),
             Call::Result(_, detail) => {
@@ -524,4 +568,15 @@ impl ClojureCraftApp {
 fn readiness(doc: &FunctionDocument) -> Value {
     let r = clojurecraft_workflow::readiness(doc);
     json!({ "ready": r.is_ready(), "blocking": r.blocking, "notes": r.notes })
+}
+
+/// Why a function outside the open project cannot be used.
+fn outside_project(project: Option<&Project>) -> String {
+    let root = project
+        .map(|p| p.root().display().to_string())
+        .unwrap_or_default();
+    format!(
+        "Only the functions of the open project {root} can be used while it is open (see \
+         list_functions). Close the project in ClojureCraft to work on functions of the library."
+    )
 }

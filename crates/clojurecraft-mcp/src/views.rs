@@ -495,6 +495,7 @@ pub fn last_job(doc: &FunctionDocument, r: &Report, detail: Detail) -> Value {
                 "passed": p.passed(),
                 "why_waiting": why,
                 "needs_namespaces": p.needs_approval,
+                "differs_from_current_code": p.differences,
                 "attempts": p.attempts.len(),
                 "notes": notes(&p.notes),
             })

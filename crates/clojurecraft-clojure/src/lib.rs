@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 pub mod policy;
 pub mod probe;
 
-pub use policy::{HarnessPolicy, harness_policy};
+pub use policy::{HarnessPolicy, harness_policy, is_class_name};
 pub use probe::{LocalValue, ProbeCall, ProbeCapture, ProbeStatus, ProbeValue, ValueKind};
 
 pub const HARNESS_SOURCE: &str = include_str!("../../../resources/clojure/harness.clj");
@@ -573,7 +573,7 @@ impl ClojureRuntime {
         Ok(path)
     }
 
-    fn policy(&self, harness: &Path, limits: &Limits, project: bool) -> Policy {
+    fn policy(&self, harness: &Path, limits: &Limits, project: bool, scratch: Option<&Path>) -> Policy {
         let mut exec = Policy::system_library_dirs();
         exec.push(self.java_home.clone());
         let mut read = Policy::system_read_files();
@@ -587,11 +587,34 @@ impl ClojureRuntime {
             exec,
             cpu_seconds: limits.cpu_seconds,
             address_space_bytes: None,
-            max_open_files: 256,
+            // The JVM keeps every classpath jar open while loading a project's dependencies.
+            max_open_files: 256
+                + if project {
+                    2 * self.project_classpath.len() as u64
+                } else {
+                    0
+                },
+            write: scratch.map(Path::to_owned).into_iter().collect(),
         }
     }
 
-    fn jvm_args(&self, harness: &Path, limits: &Limits, project: bool) -> Vec<String> {
+    /// A fresh, empty directory for one run of project code, which may write and load native
+    /// code there (libraries such as ONNX Runtime unpack their native library into the
+    /// temporary directory). It is removed after the run.
+    fn scratch_dir(&self) -> Option<PathBuf> {
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = self.work_dir.join(format!("scratch-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok().map(|()| dir)
+    }
+
+    fn jvm_args(
+        &self,
+        harness: &Path,
+        limits: &Limits,
+        project: bool,
+        scratch: Option<&Path>,
+    ) -> Vec<String> {
         let sep = if cfg!(windows) { ";" } else { ":" };
         // The runtime's own Clojure comes first, so a project's Clojure jar never replaces it.
         let extra = if project { &self.project_classpath[..] } else { &[] };
@@ -601,7 +624,8 @@ impl ClojureRuntime {
             .chain(extra)
             .map(|j| j.display().to_string())
             .collect();
-        vec![
+        let tmpdir = scratch.map(|d| format!("-Djava.io.tmpdir={}", d.display()));
+        let mut args = vec![
             format!("-Xmx{}m", limits.heap_mb),
             "-Xss8m".into(),
             "-XX:+UseSerialGC".into(),
@@ -616,11 +640,15 @@ impl ClojureRuntime {
             "-Djava.awt.headless=true".into(),
             "-Dstdout.encoding=UTF-8".into(),
             "-Dclojure.main.report=stderr".into(),
+        ];
+        args.extend(tmpdir);
+        args.extend([
             "-cp".into(),
             cp.join(sep),
             "clojure.main".into(),
             harness.display().to_string(),
-        ]
+        ]);
+        args
     }
 
     /// Runs one of the application's own scripts (`source`) in the same sandbox and with the same
@@ -652,18 +680,23 @@ impl ClojureRuntime {
         project: bool,
         completed: impl Fn(&str) -> bool,
     ) -> Result<(EvalStatus, String, String, Duration), EvalError> {
-        let outcome: Outcome = run(&RunRequest {
+        let scratch = project.then(|| self.scratch_dir()).flatten();
+        let result = run(&RunRequest {
             helper: self.sandbox_helper.clone(),
-            policy: self.policy(script, limits, project),
+            policy: self.policy(script, limits, project, scratch.as_deref()),
             program: self.java.clone(),
-            args: self.jvm_args(script, limits, project),
+            args: self.jvm_args(script, limits, project, scratch.as_deref()),
             env: vec![("LANG".into(), "C.UTF-8".into())],
             stdin: stdin.to_vec(),
             wall_timeout: limits.wall,
             max_stdout: limits.max_output_bytes,
             max_stderr: 64 * 1024,
             cancel,
-        })?;
+        });
+        if let Some(dir) = &scratch {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let outcome: Outcome = result?;
         let stdout = String::from_utf8_lossy(&outcome.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
         let status = match outcome.termination {
@@ -710,6 +743,25 @@ impl ClojureRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_project_classpath_gets_enough_open_files() {
+        let cp: Vec<PathBuf> = (0..247)
+            .map(|i| PathBuf::from(format!("/m2/lib-{i}.jar")))
+            .collect();
+        let rt = ClojureRuntime {
+            java: PathBuf::from("/java"),
+            java_home: PathBuf::from("/jre"),
+            jars: vec![PathBuf::from("/clojure.jar")],
+            sandbox_helper: PathBuf::from("/helper"),
+            work_dir: PathBuf::from("/work"),
+            project_classpath: cp,
+        };
+        let limits = Limits::default();
+        let harness = Path::new("/harness.clj");
+        assert_eq!(rt.policy(harness, &limits, false, None).max_open_files, 256);
+        assert!(rt.policy(harness, &limits, true, None).max_open_files >= 256 + 2 * 247);
+    }
 
     #[test]
     fn edn_strings_escape_quotes_and_backslashes() {

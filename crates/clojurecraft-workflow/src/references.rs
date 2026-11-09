@@ -337,6 +337,11 @@ pub fn plan(
             reason: format!("its input is not valid EDN ({}).", d.message),
         });
     }
+    if let Some(class) = clojurecraft_edn::expected_throws(up_example.expected.as_str()) {
+        return Err(ReferenceError::UpstreamFailed(format!(
+            "{upstream_label} expects the call to throw {class}, so it has no output to use."
+        )));
+    }
     let Some(code) = up.implementation.as_ref().map(|i| i.source.as_str()) else {
         return Err(ReferenceError::NoImplementation {
             revision_number: upstream.number,

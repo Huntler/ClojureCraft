@@ -128,6 +128,129 @@ fn map_problems(
     out
 }
 
+/// The type of an EDN value, as a contract states it.
+fn type_of(node: &clojurecraft_edn::Node) -> ValueType {
+    use clojurecraft_edn::NodeKind as K;
+    match &node.kind {
+        K::Nil => ValueType::Nil,
+        K::Boolean(_) => ValueType::Boolean,
+        K::Integer => ValueType::Integer,
+        K::Float | K::Ratio => ValueType::Number,
+        K::String(_) => ValueType::String,
+        K::Keyword => ValueType::Keyword,
+        K::Symbol => ValueType::Symbol,
+        K::Map(_) => ValueType::Map,
+        K::Vector(_) => ValueType::Vector,
+        K::List(_) => ValueType::List,
+        K::Set(_) => ValueType::Set,
+        K::Char(_) => ValueType::Other("character".into()),
+        K::Tagged { tag, .. } => ValueType::Other(match tag.as_str() {
+            "uuid" => "UUID".into(),
+            "inst" => "instant".into(),
+            t => format!("#{t}"),
+        }),
+    }
+}
+
+/// `shape` made to agree with `values`, the example inputs or outputs it describes: a type that
+/// some value contradicts becomes the values' common type (or "any"), and keys of a value that
+/// is no map or collection are left out. Returns what was changed.
+fn fit_shape(shape: &mut Shape, values: &[&str], side: &str) -> Vec<String> {
+    let nodes: Vec<_> = values
+        .iter()
+        .filter_map(|v| {
+            let p = parse_value(v);
+            (!p.has_errors()).then(|| p.values.into_iter().next()).flatten()
+        })
+        .filter(|n| !matches!(n.kind, clojurecraft_edn::NodeKind::Nil))
+        .collect();
+    let Some(first) = nodes.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if nodes
+        .iter()
+        .any(|n| type_matches(&shape.value_type, n) == Some(false))
+    {
+        let common = type_of(first);
+        let common = if nodes.iter().all(|n| type_of(n) == common) {
+            common
+        } else {
+            ValueType::Any
+        };
+        out.push(format!(
+            "the {side} type was corrected from {} to {}, as the examples show",
+            type_text(&shape.value_type),
+            type_text(&common)
+        ));
+        shape.value_type = common;
+    }
+    let holds_maps = nodes.iter().any(|n| {
+        use clojurecraft_edn::NodeKind as K;
+        matches!(n.kind, K::Map(_) | K::Vector(_) | K::List(_) | K::Set(_))
+    });
+    if !holds_maps && !shape.keys.is_empty() {
+        shape.keys.clear();
+        out.push(format!(
+            "the {side} keys were left out: no example {side} is a map or collection"
+        ));
+    }
+    // A required key that no map of the examples has is contradicted by them. The maps are the
+    // values themselves, or the elements of collections.
+    let mut seen: Vec<String> = Vec::new();
+    let mut maps = 0;
+    for v in values {
+        use clojurecraft_edn::NodeKind as K;
+        let p = parse_value(v);
+        let Some(node) = p.values.first().filter(|_| !p.has_errors()) else {
+            continue;
+        };
+        let elements: Vec<&clojurecraft_edn::Node> = match &node.kind {
+            K::Map(_) => vec![node],
+            K::Vector(items) | K::List(items) | K::Set(items) => items.iter().collect(),
+            _ => Vec::new(),
+        };
+        for e in elements {
+            if let K::Map(entries) = &e.kind {
+                maps += 1;
+                seen.extend(entries.iter().map(|(k, _)| k.text(v).trim().to_owned()));
+            }
+        }
+    }
+    if maps > 0 {
+        let (kept, dropped): (Vec<KeySpec>, Vec<KeySpec>) = std::mem::take(&mut shape.keys)
+            .into_iter()
+            .partition(|k| !k.required || seen.iter().any(|s| s == k.key.as_str().trim()));
+        shape.keys = kept;
+        if !dropped.is_empty() {
+            let names: Vec<&str> = dropped.iter().map(|k| k.key.as_str().trim()).collect();
+            out.push(format!(
+                "the required {side} key{} {} {} left out: no example {side} has {}",
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", "),
+                if names.len() == 1 { "was" } else { "were" },
+                if names.len() == 1 { "it" } else { "them" }
+            ));
+        }
+    }
+    out
+}
+
+/// `contract` made to agree with the usable examples of `doc` (see `fit_shape`). Returns what
+/// was changed.
+pub fn fit_contract(contract: &mut Contract, doc: &FunctionDocument) -> Vec<String> {
+    let examples = usable_examples(doc);
+    let inputs: Vec<&str> = examples.iter().map(|(_, _, i)| *i).collect();
+    let outputs: Vec<&str> = examples
+        .iter()
+        .map(|(_, e, _)| e.expected.as_str())
+        .filter(|v| clojurecraft_edn::expected_throws(v).is_none())
+        .collect();
+    let mut out = fit_shape(&mut contract.input, &inputs, "input");
+    out.extend(fit_shape(&mut contract.output, &outputs, "output"));
+    out
+}
+
 /// Where an expected output contradicts the accepted output contract, so no code could pass both.
 pub fn expected_contract_problems(c: &Shape, expected: &str) -> Vec<String> {
     use clojurecraft_edn::NodeKind as K;
@@ -250,6 +373,9 @@ pub fn readiness(doc: &FunctionDocument) -> Readiness {
                 }
             }
             for (label, value) in expected {
+                if clojurecraft_edn::expected_throws(value).is_some() {
+                    continue;
+                }
                 let problems = expected_contract_problems(&c.output, value);
                 if !problems.is_empty() {
                     r.blocking.push(format!(
@@ -410,35 +536,43 @@ pub fn specification_sections(doc: &FunctionDocument) -> Vec<Section> {
             ),
         ));
     }
+    let called = if arguments == 1 {
+        "input"
+    } else {
+        "elements of the input as its arguments"
+    };
     for (label, example, input) in usable_examples(doc) {
-        out.push(Section::required(
-            &label,
-            Placement::User,
-            format!(
-                "{label}. The function is called with the {} and must return the expected output.\n\
-                 Input (EDN):\n{}\nExpected output (EDN):\n{}",
-                if arguments == 1 {
-                    "input"
-                } else {
-                    "elements of the input as its arguments"
-                },
-                input.trim(),
-                example.expected.as_str().trim()
+        let expected = example.expected.as_str().trim();
+        let text = match clojurecraft_edn::expected_throws(expected) {
+            Some(class) => format!(
+                "{label}. The function is called with the {called} and must throw {class} (or a \
+                 subclass of it) instead of returning.\nInput (EDN):\n{}",
+                input.trim()
             ),
-        ));
+            None => format!(
+                "{label}. The function is called with the {called} and must return the expected \
+                 output.\nInput (EDN):\n{}\nExpected output (EDN):\n{expected}",
+                input.trim()
+            ),
+        };
+        out.push(Section::required(&label, Placement::User, text));
     }
     for (n, t) in doc.tests.iter().filter(|t| t.is_active()).enumerate() {
         if let Expectation::Value { expected } = &t.expectation {
             let label = test_label(n, t);
-            out.push(Section::required(
-                &label,
-                Placement::User,
-                format!(
+            let text = match clojurecraft_edn::expected_throws(expected.as_str()) {
+                Some(class) => format!(
+                    "{label}, accepted by the user. The call must throw {class} (or a subclass of it) \
+                     instead of returning.\nInput (EDN):\n{}",
+                    t.input.as_str().trim()
+                ),
+                None => format!(
                     "{label}, accepted by the user.\nInput (EDN):\n{}\nExpected output (EDN):\n{}",
                     t.input.as_str().trim(),
                     expected.as_str().trim()
                 ),
-            ));
+            };
+            out.push(Section::required(&label, Placement::User, text));
         }
     }
     out
@@ -499,6 +633,95 @@ mod tests {
         assert!(
             r.blocking[0].contains("element 1: required key :sets is missing"),
             "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_proposed_contract_the_examples_contradict_takes_their_types() {
+        let mut d = FunctionDocument::new("health score id");
+        d.examples = vec![
+            Example::direct(
+                "",
+                Edn::new("#uuid \"12345678-1234-1234-1234-123456789012\""),
+                Edn::new("#uuid \"b749ede6-21af-5d10-9a45-572e36af09b8\""),
+            ),
+            Example::direct("", Edn::new("nil"), Edn::new("nil")),
+        ];
+        let mut c = Contract::empty(ContractStatus::Proposed);
+        c.input.value_type = ValueType::Map;
+        c.input.keys = vec![key(":sensor-id", true, ValueType::Any, NilBehavior::Unspecified)];
+        c.output.value_type = ValueType::Any;
+        c.output.keys = vec![key(":uuid", true, ValueType::Any, NilBehavior::Unspecified)];
+        let notes = fit_contract(&mut c, &d);
+        assert_eq!(c.input.value_type, ValueType::Other("UUID".into()));
+        assert!(c.input.keys.is_empty());
+        assert_eq!(
+            c.output.value_type,
+            ValueType::Any,
+            "an \"any\" type contradicts nothing"
+        );
+        assert!(c.output.keys.is_empty());
+        assert_eq!(notes.len(), 3, "{notes:?}");
+
+        let mut agreeing = Contract::empty(ContractStatus::Proposed);
+        agreeing.input.value_type = ValueType::Other("UUID".into());
+        assert!(fit_contract(&mut agreeing, &d).is_empty());
+    }
+
+    #[test]
+    fn an_expected_exception_is_stated_as_such_and_never_checked_against_the_contract() {
+        let mut d = doc();
+        d.examples.push(Example::direct(
+            "bad",
+            Edn::new("[{:customer nil}]"),
+            Edn::new("#throws IllegalArgumentException"),
+        ));
+        let mut c = Contract::empty(ContractStatus::Accepted);
+        c.output.value_type = ValueType::Map;
+        d.contract = Some(c.clone());
+        assert!(readiness(&d).blocking.is_empty(), "{:?}", readiness(&d));
+        let text: String = specification_sections(&d)
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("must throw IllegalArgumentException (or a subclass of it)"),
+            "{text}"
+        );
+        let mut proposed = Contract::empty(ContractStatus::Proposed);
+        proposed.output.value_type = ValueType::Map;
+        assert!(fit_contract(&mut proposed, &d).is_empty());
+    }
+
+    #[test]
+    fn contract_keys_no_example_has_are_left_out() {
+        let mut d = FunctionDocument::new("tag");
+        d.examples = vec![
+            Example::direct(
+                "",
+                Edn::new("{:id 1}"),
+                Edn::new("{:id 1 :source \"healthscore\"}"),
+            ),
+            Example::direct("", Edn::new("{}"), Edn::new("{:source \"healthscore\"}")),
+        ];
+        let mut c = Contract::empty(ContractStatus::Proposed);
+        c.output.value_type = ValueType::Map;
+        c.output.keys = vec![
+            key(":tag", true, ValueType::Any, NilBehavior::Unspecified),
+            key(":source", true, ValueType::String, NilBehavior::Unspecified),
+        ];
+        let notes = fit_contract(&mut c, &d);
+        let keys: Vec<&str> = c.output.keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(keys, [":source"]);
+        assert_eq!(
+            notes,
+            ["the required output key :tag was left out: no example output has it"]
+        );
+        c.output.keys = vec![key(":note", false, ValueType::Any, NilBehavior::Unspecified)];
+        assert!(
+            fit_contract(&mut c, &d).is_empty(),
+            "an optional key may be missing"
         );
     }
 

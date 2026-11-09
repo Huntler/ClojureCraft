@@ -232,20 +232,30 @@ proves unworkable, the fallback is the `sandbox_init` C API from the helper.
 ### Java interop and dynamic evaluation
 
 The OS sandbox is the security boundary. The harness (`resources/clojure/harness.clj`) adds
-checks that give users and the repair loop clear diagnostics:
+checks that give users and the repair loop clear diagnostics. They say what the model may write:
+the user's own code (the function's current code, when it was written or edited by hand) is
+checked without them, and its purity findings are shown as warnings; the OS sandbox
+still confines it. Project runs get a private scratch directory (`java.io.tmpdir`), the only place
+they may write (files up to 256 MB) and load native code from, for libraries such as ONNX Runtime
+that unpack their native library there; it is removed after the run. Network access stays denied.
 
 - source is read with `*read-eval*` false (no `#=`), and unknown tagged literals are rejected;
 - the first form must be `ns` with only `:require` of an allowlist (`clojure.core`, `clojure.string`,
-  `clojure.set`, `clojure.walk`, `clojure.edn`, `clojure.zip`, `clojure.data`), aliases only;
+  `clojure.set`, `clojure.walk`, `clojure.edn`, `clojure.zip`, `clojure.data`), aliases only, and
+  `:import` of any Java classes;
 - top-level forms are limited to `defn`, `defn-`, `def`, `declare`;
 - every symbol outside quoted data is checked: dynamic evaluation (`eval`, `load-*`, `read-string`,
   `resolve`, `var`, `intern`, `ns-publics`, …), state and concurrency (`binding`, `set!`, `future`,
-  `agent`, …), class generation (`proxy`, `reify`, `deftype`, …), I/O (`slurp`, `spit`, …),
-  `.method`/`Class.` interop, fully qualified class names, and static members of classes other
-  than `Math`, `StrictMath`, `Long`, `Integer`, `Double`, `Character`, `Boolean` are rejected.
+  `agent`, …), class generation (`proxy`, `reify`, `deftype`, …), and I/O (`slurp`, `spit`, …) are
+  rejected.
 
-Allowing more interop (for example selected `String` methods) is a deliberate future change made
-by extending the allowlist, with tests.
+Java interop is allowed in generated code (constructors, instance and static members, class
+names; `ns/name` whose namespace part is capitalized counts as a class), because Clojure has no
+equivalent for much of the JDK, `java.time` above all. Generated functions are therefore no longer
+guaranteed free of side effects or deterministic by the static checks; the OS sandbox (no network,
+no writes outside the scratch directory) is what confines them, and the prompt asks for functions
+without side effects that avoid randomness and the current time. In a project, imports a fragment
+adds are merged into the file's `:import` clause, and the fragment shows the file's imports.
 
 **Lint.** Before the code is evaluated, the harness interns the names the code defines (with the
 parameter lists of `defn` forms) and analyses every top-level form after macroexpansion. Only
@@ -254,8 +264,9 @@ candidate code runs during linting. Errors (which fail validation): unresolved s
 `clojure.*` functions or the code's own functions with a number of arguments no parameter list
 accepts, macro calls rejected by `clojure.core.specs` (for example malformed `let` bindings), and
 `def` inside a function. Warnings (reported, not failures): unused local bindings and parameters
-(names starting with `_` and generated names are ignored), unused private functions, and
-top-level names that shadow `clojure.core`. Findings carry line numbers; at most 40 are reported.
+(names starting with `_` and generated names are ignored), unused private functions, top-level
+names that shadow `clojure.core`, and locals or parameters that hide a definition of the
+namespace. Findings carry line numbers; at most 40 are reported.
 An external linter (clj-kondo) was not adopted: it would be another downloaded native binary per
 platform to pin, verify, and sandbox, and these rules cover what generated code most often gets
 wrong.
@@ -440,6 +451,35 @@ with progress, cancel, resume, repair, remove), and a search browser whose resul
 full text with link, license, revision, and attribution. The right column's Sources tab lists the
 documentation recorded for the implementation and searches documentation related to the
 specification (description and steps).
+
+### Project code retrieval
+
+An open project is indexed like a documentation collection, so generation finds and reuses code
+that already exists instead of writing it again (`clojurecraft-workflow/src/project_index.rs`,
+`clojurecraft-knowledge/src/project.rs`, `clojurecraft-app/src/project_index.rs`).
+
+- **Sources.** The project's source paths, then the Clojure sources of its classpath (jars and
+  directories from `clojure -Spath` / `lein classpath`). The Clojure, spec, and core.specs jars are
+  skipped (the documentation collection covers them); files without an `ns` form are skipped.
+- **Chunks.** One per public `defn` or `def`: `namespace/name`, its parameter vectors (or the
+  def's value), and its docstring, or its source (up to 1500 characters) when it has none.
+- **Purity.** The harness rules applied to each definition, then a fixed point over calls: a
+  definition is restricted when it does something impure itself or calls an impure or unknown
+  definition (a namespace without sources). Java interop does not restrict a definition, since
+  generated code may use it too. Restricted chunks are never offered to
+  generation but are used when describing code.
+- **Requirements.** The namespace graph decides what a function may require: every indexed
+  namespace that does not depend (transitively) on its own, so no requirement is circular. These
+  are stored on the function (`ProjectBinding::usable`) and allowed without approval.
+- **Build.** On a thread of its own when the classpath is resolved, and again a few seconds after
+  the project's files were written; with the embedding model (CPU) when it is installed. Vectors
+  of unchanged chunks are taken from the previous index, which is replaced only once the new one
+  is complete (`knowledge/projects/<name>-<hash>/`).
+- **Use.** A generation searches the project index with the same queries as the documentation,
+  leaving out its own namespace and the ones depending on it, and adds up to six definitions as an
+  optional "Project code" section (dropped after the documentation) that asks the model to call
+  them instead of writing the same logic, requiring their namespace as needed. Describing code
+  looks up the definitions its code calls in other namespaces (restricted ones included).
 
 ### Specification assistant and generation
 
@@ -824,7 +864,12 @@ The parser accepts what `clojure.edn/read` accepts without custom readers (inclu
 `#_`, `#inst`, `#uuid`, `##Inf`, ratios, radix and octal integers) and reports Clojure code syntax
 (`'`, `#(`, `@`, `^`, regex literals, `::kw`, `#=`), unknown tags, duplicate map keys and set
 elements (using Clojure equality: `1` = `1N`, `[1]` = `(1)`), odd map forms, and more than one
-top-level value. Nesting deeper than 256 levels is reported instead of parsed. A tree inspector
+top-level value. Besides the `#time/…` tags of java.time values, an expected output may be
+`#throws ClassName`: the call must throw an instance of that class (simple or full name, a
+subclass included) instead of returning. The harness checks it, exported tests assert it with
+`clojurecraft.check/throws?`, and Describe records it for inputs the code rejects on purpose
+(`IllegalArgumentException`, `ExceptionInfo`, `IllegalStateException`,
+`UnsupportedOperationException`). Nesting deeper than 256 levels is reported instead of parsed. A tree inspector
 shows the parsed value with children paged 100 at a time; an expanded editor shows text and
 inspector side by side. In a release build, a 3 MB example with 30 000 maps renders at the display
 frame rate in both text and tree views; each keystroke in such a value costs roughly 50–100 ms
@@ -913,8 +958,9 @@ services' events through the same operations as the interface's buttons (the job
 their refusal as text instead of a notification), so the agent's work is autosaved, recorded in
 the history, and shown. A call about a function that is not open waits until the library opens it,
 without switching the view; a created function is shown. The connection waits at most 60 s for
-the frame loop, which must keep running: a minimized window that the platform stops redrawing
-delays calls until it is shown.
+the frame loop. Everything that does not draw (service events, MCP calls, project saving) runs in
+`App::logic`, which eframe also calls while the window is minimized, hidden, or covered and gets
+no redraws, so calls do not wait for the window to be shown.
 
 - Verified: the stdio bridge, application start-up from the bridge, and every tool on Linux/X11
   with a scratch data directory, including a generation with Qwen2.5-Coder 7B.

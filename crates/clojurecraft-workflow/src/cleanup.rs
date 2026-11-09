@@ -179,6 +179,8 @@ pub fn tidy(code: &str) -> Tidied {
         ));
     }
 
+    edits.extend(dangling_closers(code));
+
     if edits.is_empty() {
         return unchanged();
     }
@@ -188,6 +190,37 @@ pub fn tidy(code: &str) -> Tidied {
         out.replace_range(range, &text);
     }
     Tidied { code: out, notes }
+}
+
+/// The line breaks in front of closing delimiters that stand alone on their line, so that they
+/// join the line before, as Clojure is written. Not after a comment, which would swallow them.
+fn dangling_closers(code: &str) -> Vec<(Range<usize>, String)> {
+    let tokens = tokenize(code);
+    let breaks = |i: usize| {
+        tokens
+            .get(i)
+            .is_none_or(|t| t.kind == TokenKind::Whitespace && code[t.span.clone()].contains('\n'))
+    };
+    let mut out = Vec::new();
+    for (i, t) in tokens.iter().enumerate().skip(1) {
+        if i + 1 >= tokens.len() || !breaks(i) || tokens[i - 1].kind == TokenKind::Comment {
+            continue;
+        }
+        let mut j = i + 1;
+        let mut closers = 0;
+        while let Some(n) = tokens.get(j) {
+            match n.kind {
+                TokenKind::Close(_) => closers += 1,
+                TokenKind::Whitespace if !code[n.span.clone()].contains('\n') => {}
+                _ => break,
+            }
+            j += 1;
+        }
+        if closers > 0 && breaks(j) {
+            out.push((t.span.clone(), String::new()));
+        }
+    }
+    out
 }
 
 /// Prefixes of qualified symbols and the require each one needs.
@@ -367,6 +400,17 @@ fn leading_space(code: &str, span: Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_delimiters_alone_on_a_line_join_the_line_before() {
+        let t = tidy("(ns a)\n\n(defn f [x]\n  (-> x\n      inc)\n  )\n(def m {:a 1 ; one\n})\n");
+        assert_eq!(
+            t.code,
+            "(ns a)\n\n(defn f [x]\n  (-> x\n      inc))\n(def m {:a 1 ; one\n})\n"
+        );
+        let s = "(def s \"a\n)\")\n";
+        assert_eq!(tidy(s).code, s, "not inside strings");
+    }
 
     #[test]
     fn top_level_comment_forms_are_removed() {

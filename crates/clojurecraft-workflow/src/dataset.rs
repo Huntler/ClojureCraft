@@ -87,6 +87,7 @@ fn rebuilt_prompt(doc: &FunctionDocument, names: &Names, clojure_version: &str) 
         allowed: &allowed,
         clojure_version,
         documentation: None,
+        project_code: None,
         seed: 0,
     });
     requests::prompt_messages(&request, None)

@@ -96,10 +96,10 @@ impl Ports for DevPorts<'_> {
         let (retriever, embedder, version) = self.docs.as_mut()?;
         let t = Instant::now();
         let result = assistant::gather(
-            retriever,
+            Some((retriever, version.as_str())),
+            None,
             embedder.as_mut().map(|e| e as &mut dyn Embedder),
             &g,
-            version,
         )
         .map(|(found, _)| found);
         if let Ok(found) = &result {

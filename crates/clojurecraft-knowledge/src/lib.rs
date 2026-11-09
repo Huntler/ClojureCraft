@@ -21,6 +21,7 @@ pub mod collection;
 pub mod embed;
 pub mod index;
 pub mod manifest;
+pub mod project;
 pub mod prompt;
 pub mod search;
 

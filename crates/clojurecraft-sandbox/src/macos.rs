@@ -34,7 +34,12 @@ fn limit(resource: Resource, name: &'static str, cur: u64, max: u64) -> Result<(
 pub fn apply_rlimits(policy: &Policy) -> Result<(), SetupError> {
     limit(Resource::Cpu, "CPU", policy.cpu_seconds, policy.cpu_seconds + 1)?;
     limit(Resource::Core, "CORE", 0, 0)?;
-    limit(Resource::Fsize, "FSIZE", 0, 0)?;
+    limit(
+        Resource::Fsize,
+        "FSIZE",
+        policy.max_file_bytes(),
+        policy.max_file_bytes(),
+    )?;
     limit(
         Resource::Nofile,
         "NOFILE",
@@ -76,6 +81,13 @@ pub fn profile(policy: &Policy) -> String {
     for path in &policy.read {
         let kind = if path.is_dir() { "subpath" } else { "literal" };
         let _ = writeln!(p, "(allow file-read* ({kind} {}))", quote(path));
+    }
+    for dir in &policy.write {
+        let _ = writeln!(
+            p,
+            "(allow file-read* file-write* file-map-executable (subpath {}))",
+            quote(dir)
+        );
     }
     // The JVM needs to look up a few system services to start.
     p.push_str("(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n");

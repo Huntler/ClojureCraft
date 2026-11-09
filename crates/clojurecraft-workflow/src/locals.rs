@@ -136,6 +136,126 @@ fn names_of<'f>(patterns: impl Iterator<Item = &'f Form>) -> Vec<String> {
     out
 }
 
+/// The symbols `src` uses outside a local binding of the same name: what it refers to in its
+/// namespace and elsewhere. Binding names, quoted forms, and the `ns` form do not count; a
+/// binding's value is read before its own name is bound.
+pub(crate) fn free_symbols(src: &str) -> std::collections::BTreeSet<String> {
+    struct Free {
+        bound: Vec<String>,
+        out: std::collections::BTreeSet<String>,
+    }
+    impl Free {
+        fn body(&mut self, forms: &[Form]) {
+            forms.iter().for_each(|f| self.walk(f));
+        }
+        /// Walks `body` with the names of `patterns` bound.
+        fn scoped(&mut self, patterns: &[Form], body: &[Form]) {
+            let before = self.bound.len();
+            patterns.iter().for_each(|p| pattern_names(p, &mut self.bound));
+            self.body(body);
+            self.bound.truncate(before);
+        }
+        fn arities(&mut self, rest: &[Form]) {
+            match rest.iter().position(|f| f.bare().vector().is_some()) {
+                Some(i) if rest[..i].iter().all(|f| f.bare().list().is_none()) => {
+                    let params = rest[i].bare().vector().unwrap_or_default();
+                    self.scoped(params, &rest[i + 1..]);
+                }
+                _ => {
+                    for arity in rest {
+                        if let Some([params, body @ ..]) = arity.bare().list()
+                            && let Some(params) = params.vector()
+                        {
+                            self.scoped(params, body);
+                        }
+                    }
+                }
+            }
+        }
+        /// `[pattern value …] body…`, each value read with the names bound before it.
+        fn bindings(&mut self, pairs: &[Form], body: &[Form]) {
+            let before = self.bound.len();
+            for pair in pairs.chunks(2) {
+                match pair {
+                    [k, v] if k.keyword() == Some(":let") => {
+                        let inner = v.vector().unwrap_or_default();
+                        for p in inner.chunks(2) {
+                            if let [pat, val] = p {
+                                self.walk(val);
+                                pattern_names(pat, &mut self.bound);
+                            }
+                        }
+                    }
+                    [k, v] if k.keyword().is_some() => self.walk(v),
+                    [pat, val] => {
+                        self.walk(val);
+                        pattern_names(pat, &mut self.bound);
+                    }
+                    _ => {}
+                }
+            }
+            self.body(body);
+            self.bound.truncate(before);
+        }
+        fn walk(&mut self, form: &Form) {
+            match form {
+                Form::Prefixed { prefix, inner, .. } => {
+                    if prefix != "'" {
+                        self.walk(inner);
+                    }
+                    return;
+                }
+                Form::Meta { target, .. } => return self.walk(target),
+                Form::Atom { kind, text, .. } => {
+                    if *kind == TokenKind::Symbol && !self.bound.contains(text) {
+                        self.out.insert(text.clone());
+                    }
+                    return;
+                }
+                Form::Seq { .. } => {}
+            }
+            let Some(items) = form.list() else {
+                if let Form::Seq { items, .. } = form {
+                    self.body(items);
+                }
+                return;
+            };
+            match items.first().and_then(Form::symbol) {
+                Some("quote" | "ns") => {}
+                Some("defn" | "defn-" | "defmacro") => self.arities(items.get(2..).unwrap_or_default()),
+                Some("fn") => {
+                    let rest = &items[1..];
+                    match rest.first().and_then(Form::symbol) {
+                        Some(name) => {
+                            self.bound.push(name.to_owned());
+                            self.arities(&rest[1..]);
+                            self.bound.pop();
+                        }
+                        None => self.arities(rest),
+                    }
+                }
+                Some("def") => self.body(items.get(2..).unwrap_or_default()),
+                Some(
+                    "let" | "loop" | "when-let" | "if-let" | "when-some" | "if-some" | "binding" | "for"
+                    | "doseq" | "with-open",
+                ) => match items.get(1).and_then(Form::vector) {
+                    Some(pairs) => self.bindings(pairs, &items[2..]),
+                    None => self.body(&items[1..]),
+                },
+                _ => self.body(items),
+            }
+        }
+    }
+    let mut free = Free {
+        bound: Vec::new(),
+        out: std::collections::BTreeSet::new(),
+    };
+    for f in read_all(src).unwrap_or_default() {
+        free.walk(&f);
+    }
+    free.out
+}
+
 impl Walker<'_> {
     fn lines(&self, span: &Range<usize>) -> (usize, usize) {
         (line_col(self.src, span.start).0, line_col(self.src, span.end).0)
@@ -423,6 +543,17 @@ mod tests {
     use clojurecraft_clojure::{LocalValue, ProbeCapture, ProbeStatus, ProbeValue};
 
     use super::*;
+
+    #[test]
+    fn free_symbols_leave_out_locals_in_their_scope_only() {
+        let src = "(ns a (:require [b :as c]))\n\
+                   (defn f ([x] (f x 1)) ([x {:keys [k] :or {k rate}}] (g x k)))\n\
+                   (defn h [xs]\n\
+                     (let [rate (rate xs) y rate] (for [x xs :let [z (inc x)] :when (pos? z)] [z y]))\n\
+                     (fn self [n] (self n)) '(quoted q) x)\n";
+        let free: Vec<String> = free_symbols(src).into_iter().collect();
+        assert_eq!(free, ["f", "g", "inc", "pos?", "rate", "x"]);
+    }
 
     const CODE: &str = "(ns w.core\n  (:require [clojure.string :as str]))\n\n(defn- parse-weight [weight]\n  (if (str/ends-with? weight \"kg\") 1 2))\n\n(defn w [input]\n  (->> (str/split-lines input)\n       (map #(str/split % #\", \"))\n       (mapv (fn [[date exercise sets-reps weight]]\n               (let [{:keys [a b] :as m} {:a 1}]\n                 {:date date :weight (parse-weight weight)})))))\n";
 

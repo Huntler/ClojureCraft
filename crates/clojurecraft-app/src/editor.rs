@@ -398,7 +398,7 @@ fn expected_ui(ui: &mut Ui, function: FunctionId, example: &mut Example, cx: &mu
         ui,
         field_id(example.id, ExampleField::Expected),
         "Expected output",
-        "{1 10}",
+        "{1 10}  or  #throws IllegalArgumentException",
         &mut example.expected.0,
         cx.cache,
         260.0,

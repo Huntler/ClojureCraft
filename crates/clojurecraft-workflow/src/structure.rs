@@ -4,7 +4,7 @@
 //! against the rules of the evaluation harness (read from the harness itself): one `ns` form with
 //! only `:require` clauses of supported namespaces, top-level forms limited to definitions,
 //! exactly one public function that accepts one argument, and no symbols the harness refuses
-//! (dynamic evaluation, state, concurrency, I/O, Java interop outside a few numeric classes).
+//! (dynamic evaluation, state, concurrency, I/O); Java interop is allowed.
 //!
 //! These checks give fast, precise feedback. They are not a security boundary: the harness repeats
 //! them inside the operating-system sandbox, which is what actually contains the code.
@@ -160,7 +160,7 @@ impl Form {
         }
     }
 
-    fn is_string(&self) -> bool {
+    pub(crate) fn is_string(&self) -> bool {
         matches!(
             self.bare(),
             Self::Atom {
@@ -388,9 +388,10 @@ impl Checker<'_> {
                         self.require_spec(spec);
                     }
                 }
+                Some(":import") => {}
                 Some(other) => self.problem(
                     ProblemKind::Forbidden,
-                    format!("only :require is allowed in the ns declaration, not {other}"),
+                    format!("only :require and :import are allowed in the ns declaration, not {other}"),
                     at,
                 ),
                 None => self.problem(
@@ -576,24 +577,13 @@ impl Checker<'_> {
             _ => (None, sym),
         };
         let Some(ns) = ns else {
+            // Java interop (`.method`, `Class.`, class names) is allowed; the OS sandbox confines it.
             if policy.denied_core.contains(sym) {
                 self.problem(ProblemKind::Forbidden, format!("{sym} is not allowed"), at);
-            } else if sym != "." && (sym.starts_with('.') || sym.ends_with('.')) {
-                self.problem(
-                    ProblemKind::Forbidden,
-                    format!("Java interop ({sym}) is not allowed"),
-                    at,
-                );
-            } else if sym.contains('.') && sym != "." {
-                self.problem(
-                    ProblemKind::Forbidden,
-                    format!("class or namespace reference {sym} is not allowed"),
-                    at,
-                );
             }
             return;
         };
-        if policy.allowed_classes.contains(ns) {
+        if !self.aliases.contains_key(ns) && clojurecraft_clojure::is_class_name(ns) {
             return;
         }
         let target = self.aliases.get(ns).cloned().unwrap_or_else(|| ns.to_owned());
@@ -833,14 +823,12 @@ mod tests {
                 "(defn totals [x] (clojure.core/eval x))",
                 "clojure.core/eval is not allowed",
             ),
-            ("(defn totals [x] (.toUpperCase x))", "Java interop"),
-            (
-                "(defn totals [x] (java.util.UUID/randomUUID))",
-                "java.util.UUID is not available",
-            ),
-            ("(defn totals [x] (System/exit 1))", "System is not available"),
-            ("(defn totals [x] (String. x))", "Java interop"),
             ("(defn totals [x] #'inc)", "var references"),
+            ("(defn totals [x] (proxy [Object] []))", "proxy is not allowed"),
+            (
+                "(defn totals [x] (shop.util/clean x))",
+                "shop.util is not available",
+            ),
             ("(defn totals [x] (future x))", "future is not allowed"),
             ("(println 1)", "only defn, defn-, def and declare"),
             (
@@ -856,6 +844,24 @@ mod tests {
                 s.problems
             );
         }
+        // Java interop is allowed: constructors, instance and static members, class names.
+        for code in [
+            "(defn totals [x] (throw (IllegalArgumentException. (str \"bad \" x))))",
+            "(defn totals [x] (new String x))",
+            "(defn totals [x] (.toUpperCase ^String x))",
+            "(defn totals [x] (. x (toString)))",
+            "(defn totals [x] (.. x (toString) (trim)))",
+            "(defn totals [x] (.minus (java.time.Instant/ofEpochMilli x) (Duration/ofMinutes 5)))",
+            "(defn totals [x] (instance? java.time.Instant x))",
+            "(defn totals [x] (map (memfn toUpperCase) x))",
+        ] {
+            let s = run(&format!(
+                "(ns totals.core (:import [java.time Duration]))\n{code}"
+            ));
+            assert!(s.is_acceptable(), "{code}: {:?}", s.problems);
+        }
+        let s = run("(ns totals.core)\n(defn totals [x] (IllegalArgumentException. (slurp x)))");
+        assert!(messages(&s).iter().any(|m| m.contains("slurp is not allowed")));
         let s = run("(ns totals.core)\n(defn totals [x] (if x 'eval '(slurp \"f\")))");
         assert!(s.is_acceptable(), "quoted data is not code: {:?}", s.problems);
         let s = run("(ns totals.core)\n(defn totals [x] (Math/abs (Long/parseLong x)))");
@@ -875,7 +881,11 @@ mod tests {
         let s = run("(ns totals.core (:require [clojure.java.io :as io]))\n(defn totals [x] x)");
         assert_eq!(s.problems[0].kind, ProblemKind::Unsupported);
         let s = run("(ns totals.core (:use clojure.string))\n(defn totals [x] x)");
-        assert!(messages(&s)[0].contains("only :require"));
+        assert!(messages(&s)[0].contains("only :require and :import"));
+        let s = run(
+            "(ns totals.core (:import java.time.Instant [java.util UUID]))\n(defn totals [x] (UUID/fromString x))",
+        );
+        assert!(s.is_acceptable(), "{:?}", s.problems);
         let s = run("(ns totals.core (:require [clojure.string :refer :all]))\n(defn totals [x] x)");
         assert!(messages(&s)[0].contains(":refer :all"));
         let s = run("(ns totals.core (:require clojure.string))\n(defn totals [x] (clojure.string/trim x))");

@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::spec;
+use clojurecraft_clojure::{CallStatus, EvalOutcome, EvalRequest};
 
 /// Cases asked for in one proposal.
 pub const MAX_CASES: usize = 10;
@@ -111,10 +112,12 @@ pub fn proposal_schema() -> Schema {
             Schema::object(vec![
                 Field::required("name", Schema::bounded_string(80)),
                 Field::required("category", Schema::one_of(&CATEGORIES)),
-                Field::required("input", Schema::string()).describe("one EDN value"),
+                Field::required("input", Schema::string())
+                    .describe("one EDN value; a string in double quotes, such as \"abc\""),
                 Field::required("outcome", Schema::one_of(&["defined", "ambiguous"])),
-                Field::required("expected", Schema::string())
-                    .describe("one EDN value when the outcome is defined, otherwise empty"),
+                Field::required("expected", Schema::string()).describe(
+                    "one EDN value when the outcome is defined (#throws ClassName when the call must throw), otherwise empty",
+                ),
                 Field::required("question", Schema::bounded_string(300))
                     .describe("what the user must decide when the outcome is ambiguous, otherwise empty"),
                 Field::required("why", Schema::bounded_string(300)),
@@ -138,8 +141,9 @@ pub fn proposal_request(doc: &FunctionDocument) -> GenerateRequest {
              Derive each expected output only from the description, steps, contract, answers, \
              examples, and accepted tests. Never guess what an implementation would happen to \
              return. When the specification determines the output, set \"outcome\" to \"defined\" and \
-             write it in \"expected\" as a single EDN value. When it does not, set \"outcome\" to \
-             \"ambiguous\", leave \"expected\" empty, and write in \"question\" what the user must \
+             write it in \"expected\" as a single EDN value; when it says the call throws, write \
+             #throws and the exception class, for example #throws IllegalArgumentException. When it \
+             does not, set \"outcome\" to \"ambiguous\", leave \"expected\" empty, and write in \"question\" what the user must \
              decide. In \"why\", say which part of the specification decides the result or what is \
              unclear.\n\
              Do not repeat the examples, the accepted tests, or the cases listed as already \
@@ -193,8 +197,9 @@ pub fn example_proposal_request(doc: &FunctionDocument) -> GenerateRequest {
              Derive each expected output only from the title, the description, and the examples. \
              Never guess what an implementation would happen to return. When they determine the \
              output, set \"outcome\" to \"defined\" and write it in \"expected\" as a single EDN value \
-             in the same shape as the example outputs. When they do not, set \"outcome\" to \
-             \"ambiguous\", leave \"expected\" empty, and write in \"question\" what the user must \
+             in the same shape as the example outputs; when they say the call throws, write #throws \
+             and the exception class, for example #throws IllegalArgumentException. When they do \
+             not, set \"outcome\" to \"ambiguous\", leave \"expected\" empty, and write in \"question\" what the user must \
              decide. In \"why\", say which example or which part of the description decides the \
              result, or what is unclear.\n\
              Do not repeat the examples or the cases listed as already considered. Answer with JSON \
@@ -221,16 +226,20 @@ pub fn example_proposal_request(doc: &FunctionDocument) -> GenerateRequest {
         ),
     ));
     for (label, example, input) in spec::usable_examples(doc) {
-        sections.push(Section::required(
-            &label,
-            Placement::User,
-            format!(
-                "{label}. The function is called with the input and must return the expected output.\n\
-                 Input (EDN):\n{}\nExpected output (EDN):\n{}",
-                input.trim(),
-                example.expected.as_str().trim()
+        let expected = example.expected.as_str().trim();
+        let text = match clojurecraft_edn::expected_throws(expected) {
+            Some(class) => format!(
+                "{label}. The function is called with the input and must throw {class}.\n\
+                 Input (EDN):\n{}\nExpected output (EDN):\n{expected}",
+                input.trim()
             ),
-        ));
+            None => format!(
+                "{label}. The function is called with the input and must return the expected output.\n\
+                 Input (EDN):\n{}\nExpected output (EDN):\n{expected}",
+                input.trim()
+            ),
+        };
+        sections.push(Section::required(&label, Placement::User, text));
     }
     // Every existing case is listed by input only, so nothing is repeated while no expectation
     // other than the examples' informs the new ones.
@@ -346,11 +355,20 @@ pub fn parse_proposals(v: &Value, doc: &FunctionDocument) -> Result<Proposals, S
     let mut known = known_inputs(doc);
     let mut out = Proposals::default();
     let mut repeated = 0;
-    for (i, c) in raw.cases.into_iter().take(MAX_CASES).enumerate() {
+    let mut quoted = 0;
+    for (i, mut c) in raw.cases.into_iter().take(MAX_CASES).enumerate() {
         let name = match shorten(&c.name, 80) {
             n if n.is_empty() => format!("{} {}", category_label(&c.category), i + 1),
             n => n,
         };
+        if let Some(edn) = crate::describe::json_as_edn(&c.input) {
+            c.input = edn;
+        } else if let Some(q) = crate::describe::unquoted_text(&c.input) {
+            c.input = q;
+            quoted += 1;
+        } else if let Some((edn, _)) = crate::describe::unwrapped(&c.input, doc.arguments()) {
+            c.input = edn;
+        }
         if let Err(e) = single_value(&c.input) {
             out.notes.push(format!(
                 "“{name}” was left out: its input is not valid EDN ({e})."
@@ -363,6 +381,12 @@ pub fn parse_proposals(v: &Value, doc: &FunctionDocument) -> Result<Proposals, S
             continue;
         }
         let expectation = if c.outcome == "defined" {
+            if let Some(edn) = crate::describe::json_as_edn(&c.expected) {
+                c.expected = edn;
+            } else if let Some(q) = crate::describe::unquoted_text(&c.expected) {
+                c.expected = q;
+                quoted += 1;
+            }
             if let Err(e) = single_value(&c.expected) {
                 out.notes.push(format!(
                     "“{name}” was left out: its expected output is not valid EDN ({e})."
@@ -395,6 +419,15 @@ pub fn parse_proposals(v: &Value, doc: &FunctionDocument) -> Result<Proposals, S
             },
         });
     }
+    if quoted > 0 {
+        out.notes.push(format!(
+            "{quoted} input{} or expected output{} written without quotes {} read as {}.",
+            if quoted == 1 { "" } else { "s" },
+            if quoted == 1 { "" } else { "s" },
+            if quoted == 1 { "was" } else { "were" },
+            if quoted == 1 { "a string" } else { "strings" }
+        ));
+    }
     if repeated > 0 {
         out.notes.push(format!(
             "{repeated} proposed case{} repeated an existing example or case and {} left out.",
@@ -403,6 +436,92 @@ pub fn parse_proposals(v: &Value, doc: &FunctionDocument) -> Result<Proposals, S
         ));
     }
     Ok(out)
+}
+
+/// A run of the current code on the cases `ids`, expecting each defined case's output, so the
+/// reviewer sees where the code and a proposal disagree. `None` without code to run.
+pub fn current_code_run(doc: &FunctionDocument, ids: &[TestCaseId]) -> Option<EvalRequest> {
+    let code = doc.implementation.as_ref()?.source.clone();
+    let cases: Vec<&TestCase> = ids.iter().filter_map(|id| doc.test(*id)).collect();
+    if cases.is_empty() || code.trim().is_empty() {
+        return None;
+    }
+    let inputs: Vec<(String, String)> = cases
+        .iter()
+        .map(|c| (c.name.clone(), c.input.as_str().to_owned()))
+        .collect();
+    let mut r = crate::describe::run_request(doc, &code, &inputs).ok()?;
+    for (call, case) in r.calls.iter_mut().zip(&cases) {
+        if let Expectation::Value { expected } = &case.expectation {
+            call.expected = Some(expected.as_str().to_owned());
+        }
+    }
+    Some(r)
+}
+
+/// Adds to each case's notes what the current code does with it, and returns a summary of the
+/// cases it disagrees with.
+pub fn annotate(
+    doc: &mut FunctionDocument,
+    ids: &[TestCaseId],
+    outcome: Option<&EvalOutcome>,
+) -> Option<String> {
+    let outcome = outcome?;
+    let mut disagree = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let Some(result) = outcome.report.result(i) else {
+            continue;
+        };
+        let Some(case) = doc.tests.iter_mut().find(|t| t.id == *id) else {
+            continue;
+        };
+        let shown = |s: &str| {
+            let s = s.trim();
+            match s.char_indices().nth(200) {
+                Some((i, _)) => format!("{}…", &s[..i]),
+                None => s.to_owned(),
+            }
+        };
+        let note = match (result.status, result.matches) {
+            (CallStatus::Ok, Some(true)) => "The current code agrees.".to_owned(),
+            (CallStatus::Ok, Some(false)) => {
+                disagree.push(case.name.clone());
+                format!(
+                    "The current code returns {}, not the expected output.",
+                    shown(result.actual.as_deref().unwrap_or_default())
+                )
+            }
+            (CallStatus::Ok, None) => format!(
+                "The current code returns {}.",
+                shown(result.actual.as_deref().unwrap_or_default())
+            ),
+            (CallStatus::Error, _) => {
+                let class = result
+                    .error
+                    .as_ref()
+                    .map_or("", |e| e.class.rsplit('.').next().unwrap_or_default());
+                if matches!(case.expectation, Expectation::Value { .. }) {
+                    disagree.push(case.name.clone());
+                }
+                format!("The current code throws {class}.")
+            }
+            _ => continue,
+        };
+        case.notes = if case.notes.trim().is_empty() {
+            note
+        } else {
+            format!("{} {note}", case.notes.trim_end())
+        };
+    }
+    (!disagree.is_empty()).then(|| {
+        format!(
+            "The current code disagrees with {} proposed case{} ({}); check those expected outputs \
+             before accepting them.",
+            disagree.len(),
+            if disagree.len() == 1 { "" } else { "s" },
+            disagree.join(", ")
+        )
+    })
 }
 
 // ---- review ------------------------------------------------------------------------------------
@@ -731,6 +850,45 @@ mod tests {
         assert_eq!(examples_blocker(&d), None);
         d.examples.clear();
         assert!(examples_blocker(&d).is_some());
+    }
+
+    #[test]
+    fn text_written_without_quotes_becomes_a_string_and_may_expect_an_exception() {
+        let d = doc();
+        let v = proposal(json!([
+            case(
+                "bare",
+                "machine-123_",
+                "defined",
+                "#throws IllegalArgumentException",
+                ""
+            ),
+            case("quoted", "\"a_model\"", "defined", "0", ""),
+            case("bare expected", "\"a_b\"", "defined", "b", ""),
+            case("empty expected", "\"_\"", "defined", "", ""),
+        ]));
+        let p = parse_proposals(&v, &d).unwrap();
+        let inputs: Vec<&str> = p.cases.iter().map(|c| c.input.as_str()).collect();
+        assert_eq!(inputs, ["\"machine-123_\"", "\"a_model\"", "\"a_b\"", "\"_\""]);
+        let expected: Vec<&str> = p
+            .cases
+            .iter()
+            .filter_map(|c| match &c.expectation {
+                Expectation::Value { expected } => Some(expected.as_str()),
+                Expectation::NeedsClarification { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            expected,
+            ["#throws IllegalArgumentException", "0", "\"b\"", "\"\""]
+        );
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n == "3 inputs or expected outputs written without quotes were read as strings."),
+            "{:?}",
+            p.notes
+        );
     }
 
     #[test]

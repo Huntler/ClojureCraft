@@ -25,6 +25,8 @@ pub enum ChunkKind {
     SpecialForm,
     Reference,
     Guide,
+    /// A definition in the open project or one of its dependencies.
+    Project,
 }
 
 impl ChunkKind {
@@ -34,6 +36,7 @@ impl ChunkKind {
             Self::SpecialForm => "special-form",
             Self::Reference => "reference",
             Self::Guide => "guide",
+            Self::Project => "project",
         }
     }
 
@@ -43,6 +46,7 @@ impl ChunkKind {
             "special-form" => Self::SpecialForm,
             "reference" => Self::Reference,
             "guide" => Self::Guide,
+            "project" => Self::Project,
             _ => return None,
         })
     }
@@ -53,6 +57,7 @@ impl ChunkKind {
             Self::SpecialForm => "Special form",
             Self::Reference => "Reference",
             Self::Guide => "Guide",
+            Self::Project => "Project code",
         }
     }
 }
@@ -63,6 +68,10 @@ impl ChunkKind {
 pub enum SourceKey {
     Api,
     Site,
+    /// The open project's own source files.
+    Project,
+    /// Clojure sources inside the project's dependency jars.
+    Library,
 }
 
 impl SourceKey {
@@ -70,6 +79,17 @@ impl SourceKey {
         match self {
             Self::Api => "api",
             Self::Site => "site",
+            Self::Project => "project",
+            Self::Library => "library",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "api" => Self::Api,
+            "project" => Self::Project,
+            "library" => Self::Library,
+            _ => Self::Site,
         }
     }
 }

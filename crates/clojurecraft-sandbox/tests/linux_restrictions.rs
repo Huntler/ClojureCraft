@@ -24,6 +24,7 @@ fn policy(read: Vec<PathBuf>) -> Policy {
         cpu_seconds: 5,
         address_space_bytes: None,
         max_open_files: 64,
+        write: Vec::new(),
     }
 }
 

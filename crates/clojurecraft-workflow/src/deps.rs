@@ -43,7 +43,8 @@ pub fn is_supported(namespace: &str) -> bool {
 }
 
 /// Namespaces this function may require besides `clojure.core`. A project function may also use
-/// every namespace its file requires.
+/// every namespace its file requires, and the project's other namespaces that do not depend on
+/// its own.
 pub fn allowed(doc: &FunctionDocument) -> BTreeSet<String> {
     let mut allowed = contract_allowed(doc);
     if let Some(p) = &doc.project {
@@ -52,6 +53,7 @@ pub fn allowed(doc: &FunctionDocument) -> BTreeSet<String> {
                 .into_iter()
                 .filter(|n| n != CORE),
         );
+        allowed.extend(p.usable.iter().cloned());
     }
     allowed
 }

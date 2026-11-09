@@ -176,6 +176,8 @@ pub enum Call {
         add: Vec<NewCase>,
     },
     RunTests(FunctionId),
+    /// Fill the empty parts of the specification from the function's code.
+    Describe(FunctionId),
     Generate(FunctionId, GenerateMode),
     GenerateMany(Vec<FunctionId>, GenerateMode),
     Status(FunctionId, Detail),
@@ -276,6 +278,7 @@ impl Call {
                 }
             }
             "run_tests" => Self::RunTests(id()?),
+            "describe" => Self::Describe(id()?),
             "generate" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -502,7 +505,7 @@ fn spec_properties() -> serde_json::Map<String, Value> {
                 "properties": {
                     "name": {"type": "string"},
                     "input": {"type": "string", "description": "EDN, e.g. \"[{:id 1 :n 2}]\""},
-                    "expected": {"type": "string", "description": "EDN"}
+                    "expected": {"type": "string", "description": "EDN, or #throws ExceptionClass when the call must throw (e.g. #throws IllegalArgumentException)"}
                 }
             }
         },
@@ -553,14 +556,15 @@ pub fn catalogue() -> Value {
     json!([
         tool(
             "list_functions",
-            "List saved functions (id, name, description).",
+            "List saved functions (id, name, description). While a project is open, only its \
+             functions (with their namespace) and the project root; others cannot be used then.",
             json!({}),
             &[],
         ),
         tool(
             "create_function",
             "Create a function from a specification. Returns its id and readiness (what still \
-             blocks generation).",
+             blocks generation). Not available while a project is open.",
             Value::Object(create.clone()),
             &["name"],
         ),
@@ -633,7 +637,7 @@ pub fn catalogue() -> Value {
                         "properties": {
                             "name": {"type": "string"},
                             "input": {"type": "string", "description": "EDN"},
-                            "expected": {"type": "string", "description": "EDN"},
+                            "expected": {"type": "string", "description": "EDN, or #throws ExceptionClass when the call must throw"},
                             "accept": {"type": "boolean", "description": "Default true."}
                         }
                     }
@@ -645,6 +649,16 @@ pub fn catalogue() -> Value {
             "run_tests",
             "Run the current code against every example and accepted test case in the sandbox \
              (background; read the outcome with status).",
+            only_id.clone(),
+            &["function_id"],
+        ),
+        tool(
+            "describe",
+            "Let the local model describe the function's existing code (for example code from an \
+             opened project): it fills the description and steps when they are empty, and adds up to \
+             five examples whose expected values are recorded by running the code (background; then \
+             call status with wait_seconds, and get_function). Proposes a contract unless one is \
+             accepted.",
             only_id.clone(),
             &["function_id"],
         ),

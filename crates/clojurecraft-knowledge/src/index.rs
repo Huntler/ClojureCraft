@@ -198,11 +198,7 @@ fn row_to_chunk(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChunk> {
         chunk: Chunk {
             id: r.get(1)?,
             kind: ChunkKind::parse(&kind).unwrap_or(ChunkKind::Reference),
-            source: if source == "api" {
-                SourceKey::Api
-            } else {
-                SourceKey::Site
-            },
+            source: SourceKey::parse(&source),
             title: r.get(4)?,
             namespace: r.get(5)?,
             symbol: r.get(6)?,
@@ -268,11 +264,7 @@ impl IndexReader {
         let rows = st.query_map([], |r| {
             let key: String = r.get(0)?;
             Ok(Provenance {
-                source: if key == "api" {
-                    SourceKey::Api
-                } else {
-                    SourceKey::Site
-                },
+                source: SourceKey::parse(&key),
                 name: r.get(1)?,
                 license: r.get(2)?,
                 attribution: r.get(3)?,

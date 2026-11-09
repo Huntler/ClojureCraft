@@ -38,6 +38,14 @@ fn harness_set(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether the namespace part of `ns/name` names a Java class (`Instant`, `java.time.Instant`)
+/// rather than a Clojure namespace: by convention its last segment is capitalized.
+pub fn is_class_name(s: &str) -> bool {
+    s.rsplit('.')
+        .next()
+        .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_uppercase()))
+}
+
 /// The harness's rules, parsed once.
 pub fn harness_policy() -> &'static HarnessPolicy {
     static POLICY: OnceLock<HarnessPolicy> = OnceLock::new();
@@ -54,15 +62,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn class_names_are_told_from_namespaces() {
+        assert!(is_class_name("Instant") && is_class_name("java.time.Instant"));
+        assert!(!is_class_name("str") && !is_class_name("clojure.string"));
+    }
+
+    #[test]
     fn every_list_is_read_from_the_harness() {
         let p = harness_policy();
         assert!(p.allowed_namespaces.contains("clojure.core"));
         assert!(p.allowed_namespaces.contains("clojure.string"));
         assert!(!p.allowed_namespaces.contains("clojure.java.io"));
-        for denied in ["eval", "slurp", "future", ".", "new", "with-redefs"] {
+        for denied in ["eval", "slurp", "future", "proxy", "with-redefs"] {
             assert!(p.denied_core.contains(denied), "{denied}");
         }
         assert!(!p.denied_core.contains("map"));
+        for interop in [".", "..", "new", "memfn"] {
+            assert!(!p.denied_core.contains(interop), "{interop}");
+        }
         assert!(p.allowed_classes.contains("Math"));
         assert_eq!(
             p.allowed_top_level,

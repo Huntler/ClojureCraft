@@ -1,10 +1,24 @@
 (ns clojurecraft.check
   "Compares values the way ClojureCraft checked them: like `=`, except that floating-point numbers
    may differ by a relative tolerance, numbers of different kinds (integer, float, BigDecimal,
-   ratio) never match, and with `:unordered` a sequential output is compared as a multiset.
-   Written by ClojureCraft's project export.")
+   ratio) never match, instants (java.util.Date, java.time.Instant) match by their milliseconds,
+   and with `:unordered` a sequential output is compared as a multiset.
+   Written by ClojureCraft's project export."
+  (:refer-clojure :exclude [time]))
 
 (def default-opts {:float-tolerance 1e-9 :unordered false})
+
+;; Readers for the #time/... tags of java.time values (see data_readers.clj).
+(defn duration [s] (java.time.Duration/parse s))
+(defn date [s] (java.time.LocalDate/parse s))
+(defn date-time [s] (java.time.LocalDateTime/parse s))
+(defn time [s] (java.time.LocalTime/parse s))
+
+;; Read values are constants in the compiled tests, which the compiler embeds with print-dup.
+(doseq [^Class c [java.time.Duration java.time.LocalDate java.time.LocalDateTime java.time.LocalTime]]
+  (.addMethod ^clojure.lang.MultiFn print-dup c
+              (fn [v ^java.io.Writer w]
+                (.write w (str "#=(" (.getName c) "/parse \"" v "\")")))))
 
 (defn- num-kind [x]
   (cond
@@ -84,6 +98,10 @@
       (unordered-difference expected actual path opts)
       (seq-difference expected actual path opts))
 
+    (and (inst? expected) (inst? actual))
+    (when-not (= (inst-ms expected) (inst-ms actual))
+      (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual)))
+
     (= expected actual) nil
 
     :else (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual))))
@@ -92,3 +110,17 @@
   "nil when `actual` matches `expected`, otherwise a description of the first difference."
   ([expected actual] (difference expected actual {}))
   ([expected actual opts] (difference* expected actual [] (merge default-opts opts))))
+
+(defn throws?
+  "Whether calling `f` (and realizing its result) throws an instance of the class named
+  `class-name`, by simple or full name, a subclass included."
+  [class-name f]
+  (try
+    (pr-str (f))
+    false
+    (catch Throwable t
+      (loop [^Class c (class t)]
+        (cond
+          (nil? c) false
+          (or (= class-name (.getName c)) (= class-name (.getSimpleName c))) true
+          :else (recur (.getSuperclass c)))))))

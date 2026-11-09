@@ -142,6 +142,7 @@ fn doc() -> FunctionDocument {
         helpers: Vec::new(),
         arguments: 2,
         file: FILE.into(),
+        usable: Vec::new(),
     });
     d
 }
@@ -210,7 +211,10 @@ fn a_generated_fragment_is_checked_in_its_whole_file_and_kept_as_a_fragment() {
     let mut a = Assistant::default();
     a.generate(&d, model(), false, &mut p);
     let prompt: String = p.sent[0].sections.iter().map(|s| s.text.as_str()).collect();
-    assert!(prompt.contains("(defn other [x])"), "{prompt}");
+    assert!(
+        prompt.contains("(defn other [x] (shared (.toUpperCase ^String x)))"),
+        "{prompt}"
+    );
     let updates = answer(&mut a, &mut p, &mut docs, json!({ "code": RIGHT }));
 
     let request = p.requests.first().expect("validated");

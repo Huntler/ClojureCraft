@@ -34,7 +34,8 @@ generate with mode=fix; after repeated failures, write the code yourself and che
 submit_code. For several functions use create_functions, then generate and status with \
 function_ids (generations queue and run one after another). To use the functions in a project, \
 export_project writes their code, clojure.test files from the examples and accepted tests, and \
-deps.edn.";
+deps.edn. For a function that already has code (for example from an opened project), describe \
+fills its empty description and steps and records examples by running the code.";
 
 /// Carries out tool calls.
 pub trait Handler {

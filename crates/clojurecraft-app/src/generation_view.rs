@@ -180,6 +180,18 @@ fn pending(ui: &mut Ui, doc: &FunctionDocument, p: &Pending, actions: &mut Optio
                 .color(theme::WARN),
             );
         }
+        if !p.differences.is_empty() {
+            ui.label(
+                RichText::new(
+                    "It behaves differently from the current code on inputs the examples and tests \
+                     do not cover:",
+                )
+                .color(theme::WARN),
+            );
+            for d in &p.differences {
+                ui.label(format!("• {d}"));
+            }
+        }
         notes(ui, &p.notes);
         if !p.attempts.is_empty() {
             validation_view::attempts(ui, doc, &p.attempts, "pending");

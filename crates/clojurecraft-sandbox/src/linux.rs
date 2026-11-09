@@ -71,8 +71,8 @@ fn set_rlimits(policy: &Policy) -> Result<(), SetupError> {
     )
     .map_err(|e| SetupError::Rlimit("CPU", e))?;
     limit(Resource::Core, "CORE", 0)?;
-    // No regular file may be written or grown, even if a path were writable.
-    limit(Resource::Fsize, "FSIZE", 0)?;
+    // No regular file may be written or grown, except in a granted scratch directory.
+    limit(Resource::Fsize, "FSIZE", policy.max_file_bytes())?;
     limit(Resource::Nofile, "NOFILE", policy.max_open_files)?;
     if let Some(bytes) = policy.address_space_bytes {
         limit(Resource::As, "AS", bytes)?;
@@ -115,6 +115,11 @@ fn apply_landlock(policy: &Policy) -> Result<&'static str, SetupError> {
             AccessFs::ReadFile.into()
         };
         ruleset = ruleset.add_rule(PathBeneath::new(open(p)?, access)).map_err(ll)?;
+    }
+    for p in existing(&policy.write) {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(open(p)?, AccessFs::from_all(abi)))
+            .map_err(ll)?;
     }
     let dev_null = Path::new("/dev/null");
     ruleset = ruleset

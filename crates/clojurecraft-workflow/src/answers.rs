@@ -327,8 +327,25 @@ fn single_edn_value(s: &str) -> bool {
 }
 
 fn shape(raw: &RawShape, side: &str, dropped: &mut Vec<String>) -> Shape {
+    let whole = value_type(&raw.value_type);
+    let scalar = matches!(
+        whole,
+        ValueType::Nil
+            | ValueType::Boolean
+            | ValueType::Integer
+            | ValueType::Number
+            | ValueType::String
+            | ValueType::Keyword
+            | ValueType::Symbol
+    );
+    if scalar && !raw.keys.is_empty() {
+        dropped.push(format!(
+            "the {side} keys were left out: the {side} is not a map or collection"
+        ));
+    }
     let mut keys: Vec<KeySpec> = Vec::new();
-    for k in &raw.keys {
+    let raw_keys = if scalar { &[][..] } else { &raw.keys[..] };
+    for k in raw_keys {
         let key = k.key.trim();
         if !single_edn_value(key) {
             dropped.push(format!(
@@ -343,6 +360,12 @@ fn shape(raw: &RawShape, side: &str, dropped: &mut Vec<String>) -> Shape {
             "disallowed" => NilBehavior::Disallowed,
             "treat_as_missing" => NilBehavior::TreatAsMissing,
             "pass_through" => NilBehavior::PassThrough,
+            "default" if k.default.trim() == key => {
+                dropped.push(format!(
+                    "the default for {side} key {key} only repeated the key and was left out"
+                ));
+                NilBehavior::Unspecified
+            }
             "default" if single_edn_value(k.default.trim()) => {
                 NilBehavior::Default(Edn::new(k.default.trim()))
             }
@@ -364,19 +387,31 @@ fn shape(raw: &RawShape, side: &str, dropped: &mut Vec<String>) -> Shape {
     }
     Shape {
         description: text(&raw.description, MAX_ITEM),
-        value_type: value_type(&raw.value_type),
+        value_type: whole,
         keys,
     }
 }
 
 /// A proposed contract. `allowed_dependencies` is carried over unchanged: a proposal never
 /// widens what the implementation may use. Returns notes about parts that were left out.
+/// A proposed contract for a function of `arguments` arguments. With several, the input is the
+/// vector of the arguments, which has no keys, whatever the model listed.
 pub fn parse_contract(
     v: &Value,
     allowed_dependencies: Vec<String>,
+    arguments: u32,
 ) -> Result<(Contract, Vec<String>), String> {
-    let raw: RawContract = decode(v)?;
+    let mut raw: RawContract = decode(v)?;
     let mut dropped = Vec::new();
+    if arguments > 1 {
+        raw.input.value_type = "vector".into();
+        if !raw.input.keys.is_empty() {
+            raw.input.keys.clear();
+            dropped.push(format!(
+                "the input keys were left out: the input is the vector of the {arguments} arguments"
+            ));
+        }
+    }
     let ordering = match raw.ordering.as_str() {
         "preserve_input" => OrderingRequirement::PreserveInput,
         "unordered" => OrderingRequirement::Unordered,
@@ -686,7 +721,7 @@ mod tests {
                 {"key": ":id", "required": true, "value_type": "integer", "nil": "default", "default": "{", "notes": ""}]},
             "output": {"description": "", "value_type": "map", "keys": []},
             "ordering": "sorted", "sorted_by": "total", "notes": "n"});
-        let (c, dropped) = parse_contract(&v, vec!["clojure.string".into()]).unwrap();
+        let (c, dropped) = parse_contract(&v, vec!["clojure.string".into()], 1).unwrap();
         assert_eq!(c.status, ContractStatus::Proposed);
         assert_eq!(c.allowed_dependencies, ["clojure.string"]);
         assert_eq!(c.input.value_type, ValueType::Vector);
@@ -695,6 +730,49 @@ mod tests {
         assert_eq!(c.input.keys[1].nil, NilBehavior::Unspecified);
         assert_eq!(c.ordering, OrderingRequirement::Sorted("total".into()));
         assert_eq!(dropped.len(), 2);
+    }
+
+    #[test]
+    fn a_contract_for_several_arguments_has_no_input_keys() {
+        let v = json!({
+            "input": {"description": "", "value_type": "any", "keys": [
+                {"key": "0", "required": true, "value_type": "any", "nil": "unspecified", "default": "", "notes": ""}]},
+            "output": {"description": "", "value_type": "map", "keys": [
+                {"key": ":a", "required": true, "value_type": "any", "nil": "unspecified", "default": "", "notes": ""}]},
+            "ordering": "unspecified", "sorted_by": "", "notes": ""});
+        let (c, dropped) = parse_contract(&v, Vec::new(), 2).unwrap();
+        assert!(c.input.keys.is_empty());
+        assert_eq!(c.input.value_type, ValueType::Vector);
+        assert_eq!(c.output.keys.len(), 1);
+        assert_eq!(dropped.len(), 1);
+        let (c, _) = parse_contract(&v, Vec::new(), 1).unwrap();
+        assert_eq!(c.input.keys.len(), 1);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_collection_has_no_keys() {
+        let v = json!({
+            "input": {"description": "", "value_type": "string", "keys": [
+                {"key": "input", "required": true, "value_type": "string", "nil": "unspecified", "default": "", "notes": ""}]},
+            "output": {"description": "", "value_type": "any", "keys": [
+                {"key": ":a", "required": true, "value_type": "any", "nil": "unspecified", "default": "", "notes": ""}]},
+            "ordering": "unspecified", "sorted_by": "", "notes": ""});
+        let (c, dropped) = parse_contract(&v, Vec::new(), 1).unwrap();
+        assert!(c.input.keys.is_empty());
+        assert_eq!(c.output.keys.len(), 1, "any may be a map");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+    }
+
+    #[test]
+    fn a_default_that_only_repeats_its_key_is_left_out() {
+        let v = json!({
+            "input": {"description": "", "value_type": "map", "keys": [
+                {"key": ":machine-id", "required": true, "value_type": "any", "nil": "default", "default": ":machine-id", "notes": ""}]},
+            "output": {"description": "", "value_type": "map", "keys": []},
+            "ordering": "unspecified", "sorted_by": "", "notes": ""});
+        let (c, dropped) = parse_contract(&v, Vec::new(), 1).unwrap();
+        assert_eq!(c.input.keys[0].nil, NilBehavior::Unspecified);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
     }
 
     #[test]

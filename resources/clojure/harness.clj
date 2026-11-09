@@ -2,7 +2,8 @@
 ;;
 ;; Reads one EDN request from stdin:
 ;;   {:code "<source>" :fn "<public fn name>"
-;;    :calls [{:input "<edn>" :expected "<edn>"} ...]   ; :expected is optional
+;;    :calls [{:input "<edn>" :expected "<edn>"} ...]   ; :expected is optional; #throws Class
+;;                                                       ; expects an exception of that class
 ;;    :checks true :lint true
 ;;    :contract {:output {:type :map :keys [{:key "<edn>" :required true :type :integer :nil :disallowed}]}}
 ;;    :equality {:float-tolerance 1e-9 :unordered false}
@@ -36,7 +37,7 @@
   '#{clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.zip clojure.data})
 
 ;; Evaluation, reflection over namespaces and vars, state that escapes the call, concurrency,
-;; class generation, and I/O.
+;; class generation, and I/O. Java interop is allowed; the OS sandbox confines it.
 (def denied-core
   '#{eval load load-file load-string load-reader read read-string read+string
      resolve ns-resolve requiring-resolve find-var intern var var-get var-set alter-var-root
@@ -47,10 +48,11 @@
      add-watch set-agent-send-executor! set-agent-send-off-executor! thread-bound?
      slurp spit file-seq line-seq with-open
      gen-class gen-interface proxy proxy-super reify deftype defrecord definterface
-     extend extend-type extend-protocol memfn monitor-enter monitor-exit locking
-     . .. new set-validator! add-tap tap>  *in* with-in-str})
+     extend extend-type extend-protocol monitor-enter monitor-exit locking
+     set-validator! add-tap tap>  *in* with-in-str})
 
 (def allowed-classes '#{Math StrictMath Long Integer Double Character Boolean})
+
 
 (def allowed-top-level '#{defn defn- def declare})
 
@@ -96,6 +98,47 @@
   (.write raw-out (str (json m) "\n"))
   (.flush raw-out))
 
+;; java.time values without an EDN form print as tagged literals that read back to equal values,
+;; so they can be recorded, shown, and written as inputs and expectations.
+;; An expected exception: the call must throw an instance of the named class (simple or full
+;; name, a subclass included) instead of returning.
+(defrecord Throws [class-name])
+
+(defmethod print-method Throws [t ^Writer w]
+  (.write w (str "#throws " (:class-name t))))
+
+(def time-readers
+  {'time/duration #(java.time.Duration/parse %)
+   'time/date #(java.time.LocalDate/parse %)
+   'time/date-time #(java.time.LocalDateTime/parse %)
+   'time/time #(java.time.LocalTime/parse %)})
+
+(defn read-value
+  "One EDN value, with the java.time tags and #throws."
+  [s]
+  (edn/read-string {:readers (assoc time-readers 'throws #(->Throws (str %)))} s))
+
+(defn- throws-match?
+  "Whether `t` is an instance of the class named `class-name`."
+  [class-name ^Throwable t]
+  (loop [^Class c (class t)]
+    (cond
+      (nil? c) false
+      (or (= class-name (.getName c)) (= class-name (.getSimpleName c))) true
+      :else (recur (.getSuperclass c)))))
+
+(doseq [[^Class c tag] [[java.time.Duration "time/duration"]
+                        [java.time.LocalDate "time/date"]
+                        [java.time.LocalDateTime "time/date-time"]
+                        [java.time.LocalTime "time/time"]]]
+  (.addMethod ^clojure.lang.MultiFn print-method c
+              (fn [v ^Writer w] (.write w (str "#" tag " \"" v "\"")))))
+
+;; java.time.Instant prints as #inst, so its values are recorded and shown as EDN; read back, an
+;; #inst is a java.util.Date, which `difference` compares with an Instant by its milliseconds.
+(defmethod print-method java.time.Instant [^java.time.Instant i ^Writer w]
+  (.write w (str "#inst \"" i "\"")))
+
 (defn- bounded-str
   "Prints `x` readably with collection lengths and nesting bounded, then at most `limit` chars."
   [x length level limit]
@@ -111,22 +154,72 @@
 (defn- violation [msg form]
   (throw (ex-info msg {:phase :check :form (pr-str form) :line (:line (meta form))})))
 
+(defn- class-name?
+  "A Java class (`Instant`, `java.time.Instant`) rather than a namespace: its last segment is
+  capitalized."
+  [s]
+  (Character/isUpperCase (char (first (peek (string/split s #"\."))))))
+
+(def ^:private let-heads
+  '#{let let* loop loop* when-let if-let when-some if-some when-first for doseq dotimes with-open
+     with-local-vars})
+
+(def ^:private fn-heads '#{fn fn* defn defn- defmacro})
+
+(defn- target-names
+  "The symbols a binding target binds, destructuring included."
+  [target]
+  (->> (tree-seq coll? seq target)
+       (filter #(and (symbol? %) (nil? (namespace %)) (not= '& %)))))
+
+(defn- bound-names
+  "Every name `form` binds as a local somewhere: function parameters and let-style bindings. Such
+   a local may be called like a denied function (`read`, `send`, `var`) without being one."
+  [form]
+  (let [found (volatile! #{})
+        bind! (fn [targets] (vswap! found into (mapcat target-names targets)))]
+    (walk/prewalk
+     (fn [x]
+       (when (seq? x)
+         (let [head (first x)]
+           (cond
+             (and (contains? let-heads head) (vector? (second x)))
+             (doseq [[target value] (partition 2 (second x))]
+               (if (= :let target)
+                 (when (vector? value) (bind! (take-nth 2 value)))
+                 (bind! [target])))
+
+             (contains? fn-heads head)
+             (doseq [part (rest x)]
+               (cond
+                 (vector? part) (bind! [part])
+                 (and (seq? part) (vector? (first part))) (bind! [(first part)])))
+
+             (and (= 'letfn head) (vector? (second x)))
+             (doseq [spec (second x) :when (seq? spec)]
+               (bind! [(first spec)])
+               (doseq [part (rest spec)]
+                 (cond
+                   (vector? part) (bind! [part])
+                   (and (seq? part) (vector? (first part))) (bind! [(first part)])))))))
+       x)
+     form)
+    @found))
+
+(def ^:dynamic ^:private *locals* #{})
+
 (defn- check-symbol [aliases sym]
   (let [ns-part (namespace sym)
         name-part (name sym)]
     (cond
-      (and (nil? ns-part) (contains? denied-core sym))
+      ;; A special form stays one even where a local has its name.
+      (and (nil? ns-part) (contains? denied-core sym)
+           (or (special-symbol? sym) (not (contains? *locals* sym))))
       (violation (str "use of " sym " is not allowed") sym)
-
-      (and (nil? ns-part) (or (.startsWith name-part ".") (.endsWith name-part ".")))
-      (violation (str "Java interop " sym " is not allowed") sym)
-
-      (and (nil? ns-part) (.contains name-part ".") (not= name-part "."))
-      (violation (str "class or namespace reference " sym " is not allowed") sym)
 
       (nil? ns-part) nil
 
-      (contains? allowed-classes (symbol ns-part)) nil
+      (and (not (contains? aliases (symbol ns-part))) (class-name? ns-part)) nil
 
       :else
       (let [target (get aliases (symbol ns-part) (symbol ns-part))]
@@ -137,7 +230,7 @@
           (and (= target 'clojure.core) (contains? denied-core (symbol name-part)))
           (violation (str "use of " sym " is not allowed") sym))))))
 
-(defn- check-body [aliases form]
+(defn- check-body* [aliases form]
   (walk/prewalk
    (fn [x]
      (cond
@@ -145,6 +238,10 @@
        (symbol? x) (do (check-symbol aliases x) x)
        :else x))
    form))
+
+(defn- check-body [aliases form]
+  (binding [*locals* (bound-names form)]
+    (check-body* aliases form)))
 
 (defn- ns-aliases-of
   "Validates the ns form and returns {alias namespace}."
@@ -165,7 +262,8 @@
                      (violation ":refer :all is not allowed; use an alias or a vector of names" spec))
                    (cond-> acc (:as opts) (assoc (:as opts) lib))))
                aliases (rest clause))
-       :else (violation "only :require clauses are allowed in ns" clause)))
+       (and (seq? clause) (= :import (first clause))) aliases
+       :else (violation "only :require and :import clauses are allowed in ns" clause)))
    {} (drop 2 form)))
 
 (defn read-all [code]
@@ -264,6 +362,14 @@
 
 (defn- new-binding [sym line] {:sym sym :line line :used (volatile! false)})
 
+(defn- warn-hidden
+  "A local named like a definition of the namespace hides it in its scope."
+  [ctx sym line]
+  (when (and (symbol? sym) (not (ignorable-name? sym))
+             (contains? (ns-interns (:ns ctx)) sym))
+    (finding! ctx :warning line
+              (str sym " hides " sym " of this namespace in this scope; give the local another name"))))
+
 (defn- check-discarded
   "Forms written in the source before the last form of a body: in pure code their value is lost."
   [ctx body line]
@@ -289,12 +395,14 @@
   (loop [pairs (partition 2 pairs) env env acc []]
     (if-let [[sym init] (first pairs)]
       (do (analyze init env ctx line)
+          (warn-hidden ctx sym (line-of sym line))
           (let [b (new-binding sym (line-of sym line))]
             (recur (rest pairs) (assoc env sym b) (conj acc b))))
       [env acc])))
 
 (defn- analyze-fn-method [[params & body] env ctx line]
   (let [bs (mapv #(new-binding % line) (remove #{'&} params))
+        _ (doseq [p (remove #{'&} params)] (warn-hidden ctx p line))
         env (into env (map (juxt :sym identity) bs))]
     (check-discarded ctx body line)
     (analyze-all body env (assoc ctx :in-fn true) line)
@@ -637,6 +745,10 @@
       (unordered-difference expected actual path opts)
       (seq-difference expected actual path opts))
 
+    (and (inst? expected) (inst? actual))
+    (when-not (= (inst-ms expected) (inst-ms actual))
+      (str (at path) ": expected " (pr-str expected) " but got " (pr-str actual)))
+
     (= expected actual) nil
 
     :else (letfn [(typed [x] (if (nil? x) "nil" (str (describe x) " " (show x))))]
@@ -769,11 +881,11 @@
         out (bounded-writer sw max-captured-chars)
         started (System/nanoTime)
         expected-value (when expected
-                         (try {:value (edn/read-string expected)}
+                         (try {:value (read-value expected)}
                               (catch Throwable t {:error t})))
         run (in-thread
              (fn []
-               (let [in (edn/read-string input)
+               (let [in (read-value input)
                      v (binding [*out* out] (invoke f in (:spread opts)))]
                  ;; Lazy results are realized inside the time limit, so their errors and cost
                  ;; belong to this call.
@@ -781,10 +893,15 @@
                  v))
              call-ms)
         elapsed (- (System/nanoTime) started)
-        base {:out (str sw) :elapsed-ns elapsed}]
+        base {:out (str sw) :elapsed-ns elapsed}
+        throws (let [e (:value expected-value)] (when (instance? Throws e) (:class-name e)))]
     (cond
       (= run ::timeout)
       (assoc base :status "timeout")
+
+      (and throws (:error run) (throws-match? throws (:error run)))
+      (assoc base :status "ok" :truncated false :match true
+             :actual (str "#throws " (.getName (class (:error run)))))
 
       (:error run)
       (let [t (:error run)]
@@ -814,7 +931,11 @@
           (assoc :status "error"
                  :error {:phase "expected" :class "" :message (str "the expected value is not valid EDN: "
                                                                     (.getMessage ^Throwable (:error expected-value)))})
-          (contains? expected-value :value)
+          throws
+          (assoc :match false
+                 :difference (str "expected " throws " to be thrown, but the call returned " shown))
+
+          (and (contains? expected-value :value) (not throws))
           (merge (let [d (guarded #(difference (:value expected-value) v [] equality))]
                    {:match (nil? d) :difference d}))
           contract
@@ -982,7 +1103,7 @@
           (reset! probe-state {})
           (let [run (in-thread
                      (fn []
-                       (let [v (invoke (:fn setup) (edn/read-string (:input call)) (:spread opts))]
+                       (let [v (invoke (:fn setup) (read-value (:input call)) (:spread opts))]
                          (realize! v (long-array [max-elements]) 0)
                          v))
                      call-ms)
